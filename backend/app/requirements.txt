@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+httpx
+python-dotenv
+llama-cpp-python
+PyJWT

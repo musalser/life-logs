@@ -1,0 +1,6 @@
+*.pyc
+backend/postgres_data
+frontend/node_modules
+frontend/dist
+backend/ai_models
+
