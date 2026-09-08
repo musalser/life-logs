@@ -2,7 +2,13 @@ fastapi
 uvicorn
 sqlalchemy
 pydantic
+pydantic-settings
 httpx
 python-dotenv
+psycopg[binary]
+celery[redis]
+redis
 llama-cpp-python
 PyJWT
+transformers
+torch

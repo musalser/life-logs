@@ -1,0 +1,66 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./backend/redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: life_logs
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./backend/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # backend:
+  #   build: ./backend
+  #   restart: unless-stopped
+  #   env_file: ./backend/.env
+  #   environment:
+  #     DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/life_logs
+  #     CELERY_BROKER_URL: redis://redis:6379/0
+  #     CELERY_RESULT_BACKEND: redis://redis:6379/1
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./backend/ai_models:/app/ai_models
+
+  # celery_worker:
+  #   build: ./backend
+  #   restart: unless-stopped
+  #   command: celery -A app.celery_app.celery worker --loglevel=info -Q default
+  #   env_file: ./backend/.env
+  #   environment:
+  #     DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/life_logs
+  #     CELERY_BROKER_URL: redis://redis:6379/0
+  #     CELERY_RESULT_BACKEND: redis://redis:6379/1
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./backend/ai_models:/app/ai_models
+

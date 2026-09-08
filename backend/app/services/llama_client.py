@@ -1,6 +1,7 @@
 
 from pathlib import Path
 import asyncio
+import re
 from typing import AsyncGenerator, Mapping, Sequence
 
 from llama_cpp import Llama
@@ -35,8 +36,10 @@ class LlamaService:
         try:
             self.llm(
                 "Hi",
-                max_tokens=2,
-                temperature=0.1,
+                max_tokens=1024,
+                temperature=0.2,
+                top_p=0.7,
+                top_k=30,
             )
             print("✓ LlamaService модель прогрета")
         except Exception as e:
@@ -50,7 +53,7 @@ class LlamaService:
         # Fallback keeps endpoint working even if model output is noisy.
         fallback_title = self._fallback_title(content)
         prompt = (
-            "Create a short diary page title in Russian using 2-5 words. "
+            "/no_think Create a short diary page title in Russian using 2-5 words. "
             "Return title only, without quotes, punctuation, or explanation.\n\n"
             f"Diary page:\n{content}\n\nTitle:"
         )
@@ -79,6 +82,11 @@ class LlamaService:
         except Exception as e:
             print(f"[LLM Title] Error: {e}, using fallback")
             return fallback_title
+
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Удаляет блок <think>...</think> из ответа thinking-моделей (Qwen3 и др.)."""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     @staticmethod
     def _fallback_title(content: str) -> str:
@@ -144,13 +152,13 @@ class LlamaService:
             None,
             lambda: self.llm(
                 prompt,
-                max_tokens=2048,  # Большой лимит для свободной генерации
-                temperature=0.7,
-                top_p=0.9,
-                top_k=40,
+                max_tokens=2048,
+                temperature=0.2,
+                top_p=0.7,
+                top_k=30,
             )
         )
-        return result["choices"][0]["text"].strip()
+        return self._strip_thinking(result["choices"][0]["text"])
     
     async def stream_reply(
         self,
@@ -169,14 +177,14 @@ class LlamaService:
             lambda: self.llm(
                 prompt,
                 max_tokens=2048,
-                temperature=0.7,
-                top_p=0.9,
-                top_k=40,
-                stream=False,  # llama-cpp принимает весь контент сразу
+                temperature=0.2,
+                top_p=0.7,
+                top_k=30,
+                stream=False,
             )
         )
         
-        text = result["choices"][0]["text"].strip()
+        text = self._strip_thinking(result["choices"][0]["text"])
         # Разбиваем на куски для имитации потока
         for word in text.split():
             yield word + " "

@@ -25,6 +25,28 @@ class User(Base):
     diary_pages = relationship("DiaryPage", back_populates="user")
     entities = relationship("Entity", back_populates="user")
     facts = relationship("Fact", back_populates="user")
+    refresh_sessions = relationship("RefreshSession", back_populates="user")
+
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    username = Column(String, nullable=False, index=True)
+    family_id = Column(String(64), nullable=False, index=True)
+    token_jti = Column(String(64), nullable=False, unique=True, index=True)
+    token_hash = Column(String(128), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    issued_at = Column(DateTime(timezone=True), server_default=func.now())
+    rotated_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    reuse_detected_at = Column(DateTime(timezone=True), nullable=True)
+    replaced_by_jti = Column(String(64), nullable=True, index=True)
+    user_agent = Column(String(255), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+
+    user = relationship("User", back_populates="refresh_sessions")
 
 
 class Entry(Base):

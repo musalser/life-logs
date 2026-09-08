@@ -1,5 +1,12 @@
 export default {
-  content: ['./index.html', './src/**/*.{vue,js,ts,jsx,tsx}'],
+  content: [
+    './components/**/*.{vue,js,ts}',
+    './layouts/**/*.vue',
+    './pages/**/*.vue',
+    './app.vue',
+    './plugins/**/*.{js,ts}',
+    './nuxt.config.{js,ts}'
+  ],
   theme: {
     extend: {
       colors: {
@@ -14,11 +21,17 @@ export default {
         'app-user': '#4f46e5',
         'app-assistant': '#1e293b',
         'app-input': '#020617',
-        'app-error': '#f87171'
+        'app-error': '#f87171',
+        marble: '#EDE8DF',
+        gold: '#C9A227',
+        bronze: '#8C6A3F',
+        obsidian: '#0B0B0F'
       },
       fontFamily: {
         body: ['Inter', 'system-ui', 'sans-serif'],
-        heading: ['Space Grotesk', 'Inter', 'system-ui', 'sans-serif']
+        heading: ['Space Grotesk', 'Inter', 'system-ui', 'sans-serif'],
+        display: ['Cinzel', 'Times New Roman', 'serif'],
+        serif: ['"Cormorant Garamond"', 'Georgia', 'serif']
       }
     }
   },

@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply font-body bg-app-bg text-app-text antialiased;
+  }
+
+  h1,
+  h2,
+  h3 {
+    @apply font-heading;
+  }
+}
+
+@layer components {
+  .landing-eyebrow {
+    @apply font-display text-xs uppercase tracking-[0.45em] text-gold/80;
+  }
+
+  .btn-gold {
+    @apply inline-block border border-gold/60 bg-gold/10 px-8 py-3 font-display text-xs font-semibold uppercase tracking-[0.3em] text-gold transition-colors duration-300 hover:bg-gold hover:text-obsidian;
+  }
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

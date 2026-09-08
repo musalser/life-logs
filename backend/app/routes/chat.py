@@ -1,4 +1,5 @@
 
+import logging
 from typing import List
 from datetime import datetime
 
@@ -7,15 +8,16 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..schemas import ChatRequest, ChatResponse, Entry as EntrySchema
-from ..services.llama_client import LlamaService
+from ..adapters.ollama_adapter import OllamaAdapter
 from ..models import User, Entry
 from ..config import settings
-from ..deps import get_current_user, get_db, get_llama_service
+from ..deps import get_current_user, get_db, get_ollama_adapter
 
 
 HISTORY_LIMIT = 6
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+logger = logging.getLogger(__name__)
 
 
 
@@ -57,12 +59,14 @@ def _recent_history(db: Session, user_id: int, limit: int = HISTORY_LIMIT):
 async def chat(
     request: ChatRequest,
     db: Session = Depends(get_db),
-    llama_service: LlamaService | None = Depends(get_llama_service),
+    ai_adapter: OllamaAdapter = Depends(get_ollama_adapter),
 ):
+    logger.info("Processing chat request with stream=%s tone=%s", request.stream, request.tone)
     user = _get_or_create_user(db, request.tone)
     history_payload = _recent_history(db, user.id)
 
-    if llama_service is None:
+    if ai_adapter is None:
+        logger.warning("Chat request failed because AI adapter is unavailable")
         return ChatResponse(
             reply="Ошибка: LLM сервис недоступен",
             created_at=datetime.utcnow()
@@ -72,7 +76,7 @@ async def chat(
 
         async def event_generator():
             reply_chunks: List[str] = []
-            async for chunk in llama_service.stream_reply(request.message, request.tone, history_payload):
+            async for chunk in ai_adapter.stream_reply(request.message):
                 reply_chunks.append(chunk)
                 yield chunk
 
@@ -80,13 +84,15 @@ async def chat(
             entry = Entry(user_id=user.id, text=request.message, reply=full_reply)
             db.add(entry)
             db.commit()
+            logger.info("Completed streaming chat response for user_id=%s", user.id)
 
         return StreamingResponse(event_generator(), media_type="text/plain")
 
-    reply = await llama_service.generate_reply(request.message, request.tone, history_payload)
+    reply = await ai_adapter.generate_reply(request.message, request.tone, history_payload)
     entry = Entry(user_id=user.id, text=request.message, reply=reply)
     db.add(entry)
     db.commit()
+    logger.info("Completed chat response for user_id=%s", user.id)
     return ChatResponse(reply=reply, created_at=datetime.utcnow())
 
 
@@ -95,9 +101,10 @@ async def chat(
 def get_chat_history(
     limit: int = 50,
     db: Session = Depends(get_db),
-    _: str = Depends(get_current_user),
+    username: str = Depends(get_current_user),
 ):
-    user = db.query(User).first()
+    logger.info("Fetching chat history with limit=%s", limit)
+    user = db.query(User).filter(User.username == username).first()
     if not user:
         return []
 

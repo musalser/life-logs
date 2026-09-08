@@ -1,12 +1,13 @@
 
+import logging
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from ..deps import get_current_user, get_db, get_llama_service
+from ..deps import get_current_user, get_db, get_diary_service
 from ..models import DiaryPage, User
-from ..services.llama_client import LlamaService
+from app.services.diary_service import DiaryService
 from ..schemas import (
 	DiaryPageCreateRequest,
 	DiaryPageResponse,
@@ -15,6 +16,7 @@ from ..schemas import (
 
 
 router = APIRouter(prefix="/diary", tags=["Diary"])
+logger = logging.getLogger(__name__)
 
 
 def _get_user_by_username(db: Session, username: str) -> User:
@@ -28,16 +30,19 @@ def _get_user_by_username(db: Session, username: str) -> User:
 
 
 @router.post("/pages", response_model=DiaryPageResponse, status_code=status.HTTP_201_CREATED)
-def create_diary_page(
+async def create_diary_page(
 	request: DiaryPageCreateRequest,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
-	llama_service: LlamaService | None = Depends(get_llama_service),
+	diary_service: DiaryService = Depends(get_diary_service),
 ):
+	logger.info("Creating diary page for user %s", username)
 	user = _get_user_by_username(db, username)
 	title = "Новая запись"
-	if llama_service is not None:
-		title = llama_service.generate_diary_title(request.content)
+	try:
+		title = await diary_service.generate_diary_title(request.content)
+	except Exception as e:
+		logger.exception("Failed to generate diary title")
 
 	diary_page = DiaryPage(
 		user_id=user.id,
@@ -47,16 +52,24 @@ def create_diary_page(
 	db.add(diary_page)
 	db.commit()
 	db.refresh(diary_page)
+
+	# result = extract_entities_sync(diary_page.id, user.id, request.content)
+	result = await diary_service.extract_entities(request.content)
+	# async_result = extract_entities_task.delay(diary_page.id, user.id, request.content)
+	logger.info("Extracted diary entities for page_id=%s: %s", diary_page.id, result)
+
+
 	return diary_page
 
 
 @router.get("/pages", response_model=List[DiaryPageResponse])
-def list_diary_pages(
+async def list_diary_pages(
 	limit: int = 50,
 	offset: int = 0,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
 ):
+	logger.info("Listing diary pages for user %s with limit=%s offset=%s", username, limit, offset)
 	user = _get_user_by_username(db, username)
 
 	pages = (
@@ -71,11 +84,12 @@ def list_diary_pages(
 
 
 @router.get("/pages/{page_id}", response_model=DiaryPageResponse)
-def get_diary_page(
+async def get_diary_page(
 	page_id: int,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
 ):
+	logger.info("Fetching diary page %s for user %s", page_id, username)
 	user = _get_user_by_username(db, username)
 	diary_page = (
 		db.query(DiaryPage)
@@ -91,12 +105,13 @@ def get_diary_page(
 
 
 @router.put("/pages/{page_id}", response_model=DiaryPageResponse)
-def update_diary_page(
+async def update_diary_page(
 	page_id: int,
 	request: DiaryPageUpdateRequest,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
 ):
+	logger.info("Updating diary page %s for user %s", page_id, username)
 	user = _get_user_by_username(db, username)
 	diary_page = (
 		db.query(DiaryPage)
@@ -116,11 +131,12 @@ def update_diary_page(
 
 
 @router.delete("/pages/{page_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_diary_page(
+async def delete_diary_page(
 	page_id: int,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
 ):
+	logger.info("Deleting diary page %s for user %s", page_id, username)
 	user = _get_user_by_username(db, username)
 	diary_page = (
 		db.query(DiaryPage)

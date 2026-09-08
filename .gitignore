@@ -2,4 +2,13 @@
 backend/postgres-data
 frontend/node_modules
 frontend/dist
+frontend/.nuxt
 backend/ai_models
+node_modules
+backend/gatewaycpp
+backend/redis-data
+*.log
+archive/
+*.db
+plan.md
+*.env
