@@ -5,13 +5,15 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from ..deps import get_current_user, get_db, get_diary_service
+from ..deps import get_current_user, get_db, get_diary_service, get_knowledge_service
 from ..models import DiaryPage, User
 from app.services.diary_service import DiaryService
+from app.services.knowledge_service import KnowledgeService
 from ..schemas import (
 	DiaryPageCreateRequest,
 	DiaryPageResponse,
 	DiaryPageUpdateRequest,
+	ExtractionSummaryResponse,
 )
 
 
@@ -35,6 +37,7 @@ async def create_diary_page(
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
 	diary_service: DiaryService = Depends(get_diary_service),
+	knowledge_service: KnowledgeService = Depends(get_knowledge_service),
 ):
 	logger.info("Creating diary page for user %s", username)
 	user = _get_user_by_username(db, username)
@@ -53,13 +56,39 @@ async def create_diary_page(
 	db.commit()
 	db.refresh(diary_page)
 
-	# result = extract_entities_sync(diary_page.id, user.id, request.content)
-	result = await diary_service.extract_entities(request.content)
-	# async_result = extract_entities_task.delay(diary_page.id, user.id, request.content)
-	logger.info("Extracted diary entities for page_id=%s: %s", diary_page.id, result)
-
+	# Синхронно ради отладки; позже вынести в Celery.
+	try:
+		summary = await knowledge_service.process_diary_page(db, user.id, diary_page)
+		logger.info("Knowledge extraction for page_id=%s: %s", diary_page.id, summary)
+	except Exception:
+		logger.exception("Knowledge extraction failed for page_id=%s", diary_page.id)
 
 	return diary_page
+
+
+@router.post("/pages/{page_id}/extract", response_model=ExtractionSummaryResponse)
+async def extract_page_knowledge(
+	page_id: int,
+	db: Session = Depends(get_db),
+	username: str = Depends(get_current_user),
+	knowledge_service: KnowledgeService = Depends(get_knowledge_service),
+):
+	logger.info("Manual knowledge extraction for page %s by user %s", page_id, username)
+	user = _get_user_by_username(db, username)
+	diary_page = (
+		db.query(DiaryPage)
+		.filter(DiaryPage.id == page_id, DiaryPage.user_id == user.id)
+		.first()
+	)
+	if not diary_page:
+		raise HTTPException(
+			status_code=status.HTTP_404_NOT_FOUND,
+			detail="Diary page not found",
+		)
+
+	summary = await knowledge_service.process_diary_page(db, user.id, diary_page)
+	logger.info("Knowledge extraction for page_id=%s: %s", diary_page.id, summary)
+	return {"page_id": diary_page.id, "summary": summary}
 
 
 @router.get("/pages", response_model=List[DiaryPageResponse])

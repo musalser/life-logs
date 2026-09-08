@@ -26,6 +26,10 @@ class User(Base):
     entities = relationship("Entity", back_populates="user")
     facts = relationship("Fact", back_populates="user")
     refresh_sessions = relationship("RefreshSession", back_populates="user")
+    goals = relationship("Goal", back_populates="user")
+    events = relationship("Event", back_populates="user")
+    habits = relationship("Habit", back_populates="user")
+    entity_relations = relationship("EntityRelation", back_populates="user")
 
 
 class RefreshSession(Base):
@@ -105,6 +109,7 @@ class Entity(Base):
 
     user = relationship("User", back_populates="entities")
     mentions = relationship("EntityMention", back_populates="entity")
+    relation = relationship("EntityRelation", back_populates="entity", uselist=False)
     subject_facts = relationship(
         "Fact",
         foreign_keys="Fact.subject_entity_id",
@@ -179,3 +184,112 @@ class Fact(Base):
         foreign_keys=[object_entity_id],
         back_populates="object_facts",
     )
+
+
+class Goal(Base):
+    __tablename__ = "goals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    # active | completed | abandoned
+    status = Column(String(32), nullable=False, default="active", index=True)
+    created_from_page_id = Column(
+        Integer, ForeignKey("diary_pages.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="goals")
+    progress_notes = relationship(
+        "GoalProgress", back_populates="goal", cascade="all, delete-orphan"
+    )
+
+
+class GoalProgress(Base):
+    __tablename__ = "goal_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+    goal_id = Column(Integer, ForeignKey("goals.id", ondelete="CASCADE"), nullable=False, index=True)
+    diary_page_id = Column(
+        Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # started | progress | completed | abandoned
+    progress_kind = Column(String(32), nullable=False, default="progress")
+    note = Column(Text, nullable=True)
+    source_text = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    goal = relationship("Goal", back_populates="progress_notes")
+    diary_page = relationship("DiaryPage")
+
+
+class EntityRelation(Base):
+    __tablename__ = "entity_relations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "entity_id", name="uq_entity_relation_user_entity"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    entity_id = Column(Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False, index=True)
+    # sister, friend, colleague, mother, ...
+    relation_type = Column(String(64), nullable=False)
+    confidence = Column(Float, nullable=True)
+    evidence_text = Column(Text, nullable=True)
+    last_page_id = Column(Integer, ForeignKey("diary_pages.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="entity_relations")
+    entity = relationship("Entity", back_populates="relation")
+
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    diary_page_id = Column(
+        Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    time_text = Column(String(255), nullable=True)
+    importance = Column(Float, nullable=True)
+    source_text = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="events")
+    diary_page = relationship("DiaryPage")
+
+
+class Habit(Base):
+    __tablename__ = "habits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="habits")
+    logs = relationship("HabitLog", back_populates="habit", cascade="all, delete-orphan")
+
+
+class HabitLog(Base):
+    __tablename__ = "habit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    habit_id = Column(Integer, ForeignKey("habits.id", ondelete="CASCADE"), nullable=False, index=True)
+    diary_page_id = Column(
+        Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    note = Column(Text, nullable=True)
+    source_text = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    habit = relationship("Habit", back_populates="logs")
+    diary_page = relationship("DiaryPage")

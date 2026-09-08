@@ -45,6 +45,27 @@ class OllamaAdapter:
         )
         return response["response"]
 
+    async def generate_structured(self, prompt: str, schema: dict) -> str:
+        """Constrained generation: response is forced to match the JSON schema."""
+        # gpt-oss: /api/generate с format возвращает пустой response (конфликт
+        # грамматики с Harmony-шаблоном), поэтому используем chat API.
+        response = await self.client.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+            format=schema,
+            options={"temperature": 0.1, "top_p": 0.9, "num_predict": 2048},
+            keep_alive=KEEP_ALIVE,
+        )
+        content = response["message"]["content"]
+        if not content:
+            logger.warning(
+                "Empty structured response: done_reason=%s eval_count=%s",
+                response.get("done_reason"),
+                response.get("eval_count"),
+            )
+        return content
+
     async def stream_reply(self, prompt: str):
         async for part in await self.client.generate(
             model=MODEL,

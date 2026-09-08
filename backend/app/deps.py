@@ -10,6 +10,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import settings
 from .db import SessionLocal
 from app.services.diary_service import DiaryService
+from app.services.knowledge_service import KnowledgeService
 from app.adapters.ollama_adapter import OllamaAdapter
 
 
@@ -178,3 +179,12 @@ def get_diary_service() -> DiaryService:
     else:
         _diary_service = DiaryService(ai_adapter=get_ollama_adapter())
         return _diary_service
+
+
+_knowledge_service: KnowledgeService | None = None
+
+def get_knowledge_service() -> KnowledgeService:
+    global _knowledge_service
+    if _knowledge_service is None:
+        _knowledge_service = KnowledgeService(ai_adapter=get_ollama_adapter())
+    return _knowledge_service

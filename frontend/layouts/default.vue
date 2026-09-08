@@ -12,6 +12,7 @@
             <nav class="flex items-center gap-2">
               <NuxtLink to="/chat" class="nav-link" active-class="nav-link--active">Чат</NuxtLink>
               <NuxtLink to="/diary" class="nav-link" active-class="nav-link--active">Дневник</NuxtLink>
+              <NuxtLink to="/knowledge" class="nav-link" active-class="nav-link--active">Знания</NuxtLink>
             </nav>
           </div>
 

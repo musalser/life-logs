@@ -9,7 +9,7 @@ from app.deps import get_ollama_adapter
 from app.logging_utils import configure_logging, log_requests
 
 from .config import settings
-from .routes import auth, chat, diary
+from .routes import auth, chat, diary, knowledge
 
 
 
@@ -39,6 +39,7 @@ app.add_middleware(
 app.include_router(chat.router)
 app.include_router(auth.router)
 app.include_router(diary.router)
+app.include_router(knowledge.router)
 
 @app.get("/")
 def root():
