@@ -32,6 +32,20 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
 
+    # HTR (handwriting recognition & per-author model training)
+    htr_storage_dir: str = "htr_storage"
+    htr_default_model_id: str = "default"
+    htr_default_model_path: str = "htr_storage/models/default/default_model.mlmodel"
+    htr_device: str = "cuda:0"
+    htr_epochs: int = 50
+    htr_batch_size: int = 8
+    htr_learning_rate: float = 0.0001
+    htr_validation_split: float = 0.1
+    htr_random_seed: int = 42
+    htr_confidence_warning_threshold: float = 0.90
+    htr_confidence_critical_threshold: float = 0.70
+    htr_min_training_samples: int = 1
+
     class Config:
         env_file = ".env"
 
