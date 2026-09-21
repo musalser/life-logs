@@ -36,10 +36,15 @@ class HTRTrainer(ABC):
 
 
 class HTRRecognizer(ABC):
-    """Future integration point; not implemented in this task."""
+    """Transcribes a page image with a given model.
+
+    Implemented in app.htr.infrastructure.kraken.recognizer; the application
+    layer only sees this interface (image in, lines/words out).
+    """
 
     @abstractmethod
     def recognize(self, image_path: str, model_path: str) -> RecognitionResult:
+        """Raises RecognitionError when the backend or the model is unusable."""
         ...
 
 

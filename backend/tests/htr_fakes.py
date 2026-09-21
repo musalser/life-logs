@@ -12,13 +12,14 @@ from app.htr.domain.entities import (
     ModelVersionStatus,
     PageStatus,
     PageView,
+    RecognitionResult,
     TrainingConfig,
     TrainingDataset,
     TrainingRunResult,
     WordView,
 )
 from app.htr.domain.errors import CorruptImageError, TrainingError
-from app.htr.domain.interfaces import HTRTrainer
+from app.htr.domain.interfaces import HTRRecognizer, HTRTrainer
 
 DEFAULT_MODEL = ModelRef(id="default", path="/models/default.mlmodel")
 
@@ -212,3 +213,54 @@ class FakeDatasetBuilder:
             raise self.error
         assert self.dataset is not None
         return self.dataset
+
+
+class FakeRecognizer(HTRRecognizer):
+    """Records the (image, model) pairs it is asked to recognize."""
+
+    def __init__(
+        self,
+        result: RecognitionResult | None = None,
+        error: Exception | None = None,
+    ):
+        self.result = result
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    def recognize(self, image_path: str, model_path: str) -> RecognitionResult:
+        self.calls.append((image_path, model_path))
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+def recognition_result(width=200, height=120) -> RecognitionResult:
+    """Two lines with word geometry, as a real recognizer would return."""
+    from app.htr.domain.entities import RecognizedLine, RecognizedWord
+
+    return RecognitionResult(
+        page_width=width,
+        page_height=height,
+        lines=[
+            RecognizedLine(
+                id="l1",
+                bbox=BoundingBox(0, 0, width, 40),
+                text="Уж очень дед",
+                words=[
+                    RecognizedWord("w1", BoundingBox(0, 0, 30, 40), "Уж", 0.98),
+                    RecognizedWord("w2", BoundingBox(35, 0, 90, 40), "очень", 0.55),
+                    RecognizedWord("w3", BoundingBox(95, 0, 130, 40), "дед", 0.95),
+                ],
+            ),
+            RecognizedLine(
+                id="l2",
+                bbox=BoundingBox(0, 50, width, 90),
+                text="на еврея",
+                words=[
+                    RecognizedWord("w4", BoundingBox(0, 50, 40, 90), "на", 0.97),
+                    RecognizedWord("w5", BoundingBox(45, 50, 120, 90), "еврея", 0.75),
+                ],
+            ),
+        ],
+    )

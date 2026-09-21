@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AuthorCreateRequest(BaseModel):
@@ -27,12 +27,27 @@ class BoundingBoxSchema(BaseModel):
     y2: int
 
 
-# -- recognition result import (until a real HTRRecognizer is wired in) ------
+# -- recognition result import -------------------------------------------------
+# Only used to import results produced by an external HTR tool. The engine that
+# ships with this project is used through POST /pages/{page_id}/recognize; the
+# geometry of imported lines is validated strictly so that placeholder payloads
+# cannot be stored as if they were real predictions.
+
+
+def _require_positive_area(bbox: BoundingBoxSchema) -> None:
+    if bbox.x2 <= bbox.x1 or bbox.y2 <= bbox.y1:
+        raise ValueError("bbox must have a positive area (x2 > x1 and y2 > y1)")
+
 
 class RecognizedWordIn(BaseModel):
     bbox: BoundingBoxSchema
     text: str
     confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate_bbox(self) -> "RecognizedWordIn":
+        _require_positive_area(self.bbox)
+        return self
 
 
 class RecognizedLineIn(BaseModel):
@@ -40,11 +55,16 @@ class RecognizedLineIn(BaseModel):
     text: str
     words: list[RecognizedWordIn] = []
 
+    @model_validator(mode="after")
+    def _validate_bbox(self) -> "RecognizedLineIn":
+        _require_positive_area(self.bbox)
+        return self
+
 
 class RecognitionResultIn(BaseModel):
-    page_width: int | None = None
-    page_height: int | None = None
-    lines: list[RecognizedLineIn]
+    page_width: int | None = Field(default=None, gt=0)
+    page_height: int | None = Field(default=None, gt=0)
+    lines: list[RecognizedLineIn] = Field(min_length=1)
 
 
 # -- page views ---------------------------------------------------------------

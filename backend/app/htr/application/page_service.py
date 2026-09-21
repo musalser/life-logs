@@ -14,8 +14,9 @@ from ..domain.errors import (
     InvalidTranscriptionError,
     NotFoundError,
     PageStateError,
+    RecognitionError,
 )
-from ..domain.interfaces import ModelRepository, PageRepository
+from ..domain.interfaces import HTRRecognizer, ModelRepository, PageRepository
 from .metrics import MetricsEvaluator
 
 logger = logging.getLogger(__name__)
@@ -36,11 +37,13 @@ class HandwritingPageService:
         model_repository: ModelRepository,
         image_store: PageImageStore,
         metrics_evaluator: MetricsEvaluator | None = None,
+        recognizer: HTRRecognizer | None = None,
     ):
         self.page_repository = page_repository
         self.model_repository = model_repository
         self.image_store = image_store
         self.metrics_evaluator = metrics_evaluator or MetricsEvaluator()
+        self.recognizer = recognizer
 
     # ------------------------------------------------------------------
 
@@ -61,6 +64,35 @@ class HandwritingPageService:
             user_id, author_id, page.id,
         )
         return page
+
+    def recognize_page(self, page_id: int) -> PageView:
+        """Run the configured recognizer over the stored page image.
+
+        The active model of the author is used when one exists, otherwise the
+        configured default recognition model. The result is stored as the
+        prediction; ground truth stays untouched.
+        """
+        page = self._get_page(page_id)
+        if page.status not in (PageStatus.UPLOADED, PageStatus.RECOGNIZED):
+            raise PageStateError(
+                f"Page {page_id} is {page.status}; recognition is only possible "
+                "before the page is edited or confirmed"
+            )
+        if self.recognizer is None:
+            raise RecognitionError("No HTR recognizer is configured")
+        active = self.model_repository.get_active_model(page.author_id)
+        model_path = (
+            active.file_path if active is not None
+            else self.model_repository.get_default_model().path
+        )
+        if not model_path:
+            raise RecognitionError("No recognition model is configured")
+        result = self.recognizer.recognize(page.file_path, model_path)
+        logger.info(
+            "HTR page recognized: page_id=%s model=%s lines=%s",
+            page_id, model_path, len(result.lines),
+        )
+        return self.apply_recognition(page_id, result)
 
     def apply_recognition(self, page_id: int, result: RecognitionResult) -> PageView:
         """Store a recognition result (from a recognizer or external import)."""

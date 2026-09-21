@@ -24,3 +24,7 @@ class DatasetBuildError(HTRError):
 
 class TrainingError(HTRError):
     """Fine-tuning failed inside the HTR backend."""
+
+
+class RecognitionError(HTRError):
+    """Recognition backend is unavailable, or produced no usable output."""

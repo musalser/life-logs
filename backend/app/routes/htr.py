@@ -23,6 +23,7 @@ from ..htr.domain.errors import (
     InvalidTranscriptionError,
     NotFoundError,
     PageStateError,
+    RecognitionError,
 )
 from ..htr.schemas import (
     AuthorCreateRequest,
@@ -207,7 +208,11 @@ async def upload_page(
     return PageUploadResponse(page_id=page.id, status=page.status.value)
 
 
-@router.post("/pages/{page_id}/recognition-result", response_model=PageResponse)
+@router.post(
+    "/pages/{page_id}/recognition-result",
+    response_model=PageResponse,
+    summary="Import an externally produced recognition result (not recognition)",
+)
 def import_recognition_result(
     page_id: int,
     request: RecognitionResultIn,
@@ -215,8 +220,14 @@ def import_recognition_result(
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
 ):
-    """Stores a recognition result. Temporary import endpoint until an
-    HTRRecognizer backend is integrated (POST /pages/{page_id}/recognize)."""
+    """Stores a recognition result produced outside this service.
+
+    This endpoint does *not* run recognition: it only persists line/word data
+    (typically exported from another HTR tool). Geometry is validated, so an
+    unfilled example payload is rejected instead of being stored as a
+    prediction. To actually recognize a page use
+    ``POST /htr/pages/{page_id}/recognize``.
+    """
     user = _get_user(db, username)
     page = _get_owned_page(page_service, page_id, user)
     result = RecognitionResult(
@@ -242,6 +253,36 @@ def import_recognition_result(
     )
     try:
         page = page_service.apply_recognition(page_id, result)
+    except PageStateError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return _to_page_response(page)
+
+
+@router.post(
+    "/pages/{page_id}/recognize",
+    response_model=PageResponse,
+    summary="Recognize the page image (segmentation + handwriting recognition)",
+)
+def recognize_page(
+    page_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """Runs the HTR engine on the stored page image and stores the prediction.
+
+    Uses the author's active model when one exists, otherwise the configured
+    default recognition model. Synchronous for now: page-level recognition takes
+    seconds, and the service is HTTP-agnostic so it can move to a worker later.
+    """
+    user = _get_user(db, username)
+    _get_owned_page(page_service, page_id, user)
+    try:
+        page = page_service.recognize_page(page_id)
+    except RecognitionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        )
     except PageStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return _to_page_response(page)

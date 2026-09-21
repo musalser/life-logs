@@ -35,8 +35,24 @@ class Settings(BaseSettings):
     # HTR (handwriting recognition & per-author model training)
     htr_storage_dir: str = "htr_storage"
     htr_default_model_id: str = "default"
-    htr_default_model_path: str = "htr_storage/models/default/default_model.mlmodel"
+    # Default recognition/multi-lingual handwriting model (kraken safetensors).
+    # Fetch it with: python scripts/download_htr_model.py
+    htr_default_model_path: str = "htr_storage/models/default/ppocrv6_medium.safetensors"
     htr_device: str = "cuda:0"
+
+    # HTR recognition (inference)
+    # Device string understood by kraken/lightning: 'cpu', 'cuda:0', 'auto'.
+    htr_recognition_device: str = "cpu"
+    htr_recognition_batch_size: int = 8
+    htr_recognition_padding: int = 16
+    htr_recognition_text_direction: str = "horizontal-lr"
+    # 0 keeps line extraction inside the request process; >0 spawns workers,
+    # which needs a working multiprocessing start method (unreliable on Windows).
+    htr_recognition_num_line_workers: int = 0
+    # Segmentation of the page into text lines (classical kraken segmenter).
+    htr_segmentation_maxcolseps: int = 2
+    htr_segmentation_no_hlines: bool = True
+
     htr_epochs: int = 50
     htr_batch_size: int = 8
     htr_learning_rate: float = 0.0001

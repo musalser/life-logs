@@ -15,5 +15,7 @@ torch
 pillow
 python-multipart
 pytest
-# Optional HTR training backend; install to enable fine-tuning:
+# Optional HTR backend (recognition + fine-tuning), install to enable it.
+# Windows note: coremltools has no Windows wheels, so `pip install kraken` fails;
+# install kraken with --no-deps plus the deps listed in app/htr/README.md.
 # kraken

@@ -15,14 +15,36 @@ from ..domain.entities import BoundingBox
 from ..domain.errors import CorruptImageError
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:  # pragma: no cover
     Image = None
+    ImageOps = None
 
 
 def _require_pil():
     if Image is None:
         raise CorruptImageError("Pillow is required for HTR image handling but is not installed")
+
+
+def open_oriented_image(path: str | Path):
+    """Open an image and normalize it according to its EXIF orientation.
+
+    Phone photos of diary pages are frequently stored rotated with an EXIF
+    orientation tag. Segmenting/recognizing the raw pixels would operate on a
+    sideways page, so every consumer of a stored page image must go through
+    this helper.
+    """
+    _require_pil()
+    try:
+        img = Image.open(path)
+        img.load()
+    except Exception as exc:
+        raise CorruptImageError(f"Cannot open image {path}: {exc}") from exc
+    fixed = ImageOps.exif_transpose(img) if ImageOps is not None else None
+    if fixed is None or fixed is img:
+        return img
+    img.close()  # exif_transpose returned a rotated copy
+    return fixed
 
 
 class HTRStorage:
@@ -44,7 +66,10 @@ class HTRStorage:
         try:
             with Image.open(io.BytesIO(content)) as img:
                 img.load()
-                return img.width, img.height
+                # EXIF orientation changes the visual (and therefore the
+                # processed) dimensions of the stored image.
+                oriented = ImageOps.exif_transpose(img) if ImageOps is not None else img
+                return oriented.width, oriented.height
         except Exception as exc:
             raise CorruptImageError(f"Cannot decode image: {exc}") from exc
 
@@ -72,10 +97,8 @@ class PilLineCropper:
     """LineCropper implementation based on Pillow."""
 
     def crop_line(self, page_image_path: str, bbox: BoundingBox, output_path: str) -> str:
-        _require_pil()
         try:
-            with Image.open(page_image_path) as img:
-                img.load()
+            with open_oriented_image(page_image_path) as img:
                 x1 = max(0, min(bbox.x1, img.width))
                 y1 = max(0, min(bbox.y1, img.height))
                 x2 = max(x1 + 1, min(bbox.x2, img.width))

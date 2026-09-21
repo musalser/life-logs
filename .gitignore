@@ -12,3 +12,4 @@ archive/
 *.db
 plan.md
 *.env
+backend/htr_storage/

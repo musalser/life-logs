@@ -12,6 +12,7 @@ from .application.metrics import MetricsEvaluator
 from .application.page_service import HandwritingPageService
 from .application.training_service import HandwritingTrainingService
 from .domain.entities import ModelRef, TrainingConfig
+from .infrastructure.kraken.recognizer import KrakenRecognizer
 from .infrastructure.kraken.trainer import KrakenTrainer
 from .infrastructure.model_repository import (
     SqlAlchemyModelRepository,
@@ -49,6 +50,19 @@ def build_default_model_ref() -> ModelRef:
     return ModelRef(id=settings.htr_default_model_id, path=settings.htr_default_model_path)
 
 
+def build_recognizer() -> KrakenRecognizer:
+    """Recognition backend (kraken is imported lazily on first use)."""
+    return KrakenRecognizer(
+        device=settings.htr_recognition_device,
+        batch_size=settings.htr_recognition_batch_size,
+        padding=settings.htr_recognition_padding,
+        text_direction=settings.htr_recognition_text_direction,
+        num_line_workers=settings.htr_recognition_num_line_workers,
+        maxcolseps=settings.htr_segmentation_maxcolseps,
+        no_hlines=settings.htr_segmentation_no_hlines,
+    )
+
+
 def _environment_snapshot() -> dict:
     versions = {}
     for package in ("kraken", "torch"):
@@ -66,6 +80,7 @@ def build_page_service(db: Session) -> HandwritingPageService:
         model_repository=SqlAlchemyModelRepository(db, storage, build_default_model_ref()),
         image_store=storage,
         metrics_evaluator=MetricsEvaluator(),
+        recognizer=build_recognizer(),
     )
 
 

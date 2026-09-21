@@ -3,11 +3,13 @@
 All Kraken-specific code is confined to this module; nothing outside the
 infrastructure layer may import kraken.
 
-NOTE (spike): the exact Python training API differs between Kraken releases
-(RecognitionModel/KrakenTrainer moved and the `resize` values were renamed
-add/union in newer versions). This adapter targets the ketos-style API of
-kraken >= 4 and reads results defensively; pin the kraken version and verify
-CUDA behaviour on the target GPU before production use.
+NOTE (spike): this adapter still targets the ketos-style training API of
+kraken 4-6 (`kraken.lib.train`). kraken 7 moved training to ``kraken.train``
+with a config-object API (``VGSLRecognitionTrainingConfig`` /
+``PPOCRv6RecognitionTrainingConfig``) and writes ``safetensors`` by default;
+porting it is a separate task. Until then training fails with a TrainingError
+and the previous ACTIVE model stays in place (recognition with the default
+model keeps working).
 """
 from __future__ import annotations
 
@@ -45,8 +47,10 @@ class KrakenTrainer(HTRTrainer):
             from kraken.lib.train import KrakenTrainer as KrakenLightningTrainer
         except ImportError as exc:
             raise TrainingError(
-                "kraken is not installed; install the 'kraken' package to enable "
-                "HTR fine-tuning"
+                "the installed kraken build does not provide the training API this "
+                "adapter targets (kraken.lib.train, kraken 4-6). Install a supported "
+                "kraken version or port KrakenTrainer to the kraken.train API; "
+                "recognition is unaffected"
             ) from exc
 
         if not dataset.samples:
