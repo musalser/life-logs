@@ -12,3 +12,8 @@ llama-cpp-python
 PyJWT
 transformers
 torch
+pillow
+python-multipart
+pytest
+# Optional HTR training backend; install to enable fine-tuning:
+# kraken

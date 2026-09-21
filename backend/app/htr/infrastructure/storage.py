@@ -1,0 +1,92 @@
+"""Filesystem layout and image operations for the HTR module.
+
+Layout:
+    <root>/pages/<page_id or user/author scoped>/original.<ext>
+    <root>/crops/<page_id>/<line_id>.png
+    <root>/models/author_<author_id>/v<version>/model.mlmodel
+"""
+from __future__ import annotations
+
+import io
+import uuid
+from pathlib import Path
+
+from ..domain.entities import BoundingBox
+from ..domain.errors import CorruptImageError
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
+
+
+def _require_pil():
+    if Image is None:
+        raise CorruptImageError("Pillow is required for HTR image handling but is not installed")
+
+
+class HTRStorage:
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    # -- pages ----------------------------------------------------------
+
+    def save_page_image(self, user_id: int, author_id: int, filename: str, content: bytes) -> str:
+        ext = Path(filename).suffix.lower() or ".png"
+        page_dir = self.root / "pages" / f"author_{author_id}"
+        page_dir.mkdir(parents=True, exist_ok=True)
+        path = page_dir / f"{uuid.uuid4().hex}{ext}"
+        path.write_bytes(content)
+        return str(path)
+
+    def probe_image(self, content: bytes) -> tuple[int, int]:
+        _require_pil()
+        try:
+            with Image.open(io.BytesIO(content)) as img:
+                img.load()
+                return img.width, img.height
+        except Exception as exc:
+            raise CorruptImageError(f"Cannot decode image: {exc}") from exc
+
+    # -- line crops ------------------------------------------------------
+
+    def line_crop_path(self, page_id: int, line_id: int) -> str:
+        crop_dir = self.root / "crops" / f"page_{page_id}"
+        crop_dir.mkdir(parents=True, exist_ok=True)
+        return str(crop_dir / f"line_{line_id}.png")
+
+    # -- models ----------------------------------------------------------
+
+    def model_output_path(self, author_id: int, version: int) -> str:
+        model_dir = self.root / "models" / f"author_{author_id}" / f"v{version}"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return str(model_dir / "model.mlmodel")
+
+    def training_work_dir(self) -> str:
+        work_dir = self.root / "training_tmp"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return str(work_dir)
+
+
+class PilLineCropper:
+    """LineCropper implementation based on Pillow."""
+
+    def crop_line(self, page_image_path: str, bbox: BoundingBox, output_path: str) -> str:
+        _require_pil()
+        try:
+            with Image.open(page_image_path) as img:
+                img.load()
+                x1 = max(0, min(bbox.x1, img.width))
+                y1 = max(0, min(bbox.y1, img.height))
+                x2 = max(x1 + 1, min(bbox.x2, img.width))
+                y2 = max(y1 + 1, min(bbox.y2, img.height))
+                crop = img.crop((x1, y1, x2, y2))
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                crop.save(output_path)
+            return output_path
+        except CorruptImageError:
+            raise
+        except Exception as exc:
+            raise CorruptImageError(
+                f"Cannot crop line from {page_image_path}: {exc}"
+            ) from exc

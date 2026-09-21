@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    Boolean,
     Column,
     Integer,
     String,
@@ -293,3 +294,131 @@ class HabitLog(Base):
 
     habit = relationship("Habit", back_populates="logs")
     diary_page = relationship("DiaryPage")
+
+
+# ---------------------------------------------------------------------------
+# HTR (handwritten text recognition & per-author model training)
+# ---------------------------------------------------------------------------
+
+
+class HTRAuthor(Base):
+    __tablename__ = "htr_authors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    pages = relationship("HTRPage", back_populates="author")
+    model_versions = relationship("HTRModelVersion", back_populates="author")
+
+
+class HTRPage(Base):
+    __tablename__ = "htr_pages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_id = Column(Integer, ForeignKey("htr_authors.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_path = Column(String(1024), nullable=False)
+    # UPLOADED | RECOGNIZED | EDITING | CONFIRMED
+    status = Column(String(32), nullable=False, default="UPLOADED", index=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    recognition_model_version_id = Column(
+        Integer, ForeignKey("htr_model_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    # prediction quality vs. user ground truth, computed at confirmation
+    prediction_cer = Column(Float, nullable=True)
+    prediction_wer = Column(Float, nullable=True)
+
+    author = relationship("HTRAuthor", back_populates="pages")
+    lines = relationship(
+        "HTRLine",
+        back_populates="page",
+        cascade="all, delete-orphan",
+        order_by="HTRLine.order_index",
+    )
+
+
+class HTRLine(Base):
+    __tablename__ = "htr_lines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    page_id = Column(Integer, ForeignKey("htr_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    order_index = Column(Integer, nullable=False, default=0)
+    x1 = Column(Integer, nullable=False)
+    y1 = Column(Integer, nullable=False)
+    x2 = Column(Integer, nullable=False)
+    y2 = Column(Integer, nullable=False)
+    predicted_text = Column(Text, nullable=True)
+    corrected_text = Column(Text, nullable=True)
+    # word bboxes no longer match the tokenization of corrected_text
+    words_stale = Column(Boolean, nullable=False, default=False)
+
+    page = relationship("HTRPage", back_populates="lines")
+    words = relationship(
+        "HTRWord",
+        back_populates="line",
+        cascade="all, delete-orphan",
+        order_by="HTRWord.order_index",
+    )
+
+
+class HTRWord(Base):
+    __tablename__ = "htr_words"
+
+    id = Column(Integer, primary_key=True, index=True)
+    line_id = Column(Integer, ForeignKey("htr_lines.id", ondelete="CASCADE"), nullable=False, index=True)
+    order_index = Column(Integer, nullable=False, default=0)
+    x1 = Column(Integer, nullable=False)
+    y1 = Column(Integer, nullable=False)
+    x2 = Column(Integer, nullable=False)
+    y2 = Column(Integer, nullable=False)
+    predicted_text = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    corrected_text = Column(Text, nullable=True)
+
+    line = relationship("HTRLine", back_populates="words")
+
+
+class HTRModelVersion(Base):
+    __tablename__ = "htr_model_versions"
+    __table_args__ = (
+        UniqueConstraint("author_id", "version", name="uq_htr_model_author_version"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    author_id = Column(Integer, ForeignKey("htr_authors.id", ondelete="CASCADE"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    base_model_id = Column(String(255), nullable=False)
+    file_path = Column(String(1024), nullable=False)
+    # TRAINING | READY | ACTIVE | FAILED
+    status = Column(String(32), nullable=False, default="TRAINING", index=True)
+    dataset_hash = Column(String(64), nullable=True)
+    metrics = Column(Text, nullable=True)  # JSON
+    training_config = Column(Text, nullable=True)  # JSON
+    environment = Column(Text, nullable=True)  # JSON: package versions etc.
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+
+    author = relationship("HTRAuthor", back_populates="model_versions")
+
+
+class HTRTrainingRun(Base):
+    __tablename__ = "htr_training_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    author_id = Column(Integer, ForeignKey("htr_authors.id", ondelete="CASCADE"), nullable=False, index=True)
+    model_version_id = Column(
+        Integer, ForeignKey("htr_model_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    dataset_hash = Column(String(64), nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    # RUNNING | SUCCEEDED | FAILED | INSUFFICIENT_DATA
+    status = Column(String(32), nullable=False, default="RUNNING", index=True)
+    error = Column(Text, nullable=True)
+    metrics = Column(Text, nullable=True)  # JSON
