@@ -22,6 +22,8 @@
                 "--port", "8000"
             ],
             "cwd": "${workspaceFolder}/backend",
+            "python": "${workspaceFolder}/backend/.venv/bin/python",
+            "preLaunchTask": "wsl: refresh backend/.env",
             "jinja": true
         },
         {
