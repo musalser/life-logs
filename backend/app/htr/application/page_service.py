@@ -156,8 +156,10 @@ class HandwritingPageService:
             prediction_wer=metrics["wer"] if metrics else None,
         )
         logger.info(
-            "HTR page confirmed: page_id=%s author_id=%s prediction_cer=%s prediction_wer=%s",
-            page_id, page.author_id, page.prediction_cer, page.prediction_wer,
+            "HTR page confirmed: user_id=%s author_id=%s page_id=%s "
+            "prediction_cer=%s prediction_wer=%s",
+            page.user_id, page.author_id, page_id,
+            page.prediction_cer, page.prediction_wer,
         )
         return page
 

@@ -61,6 +61,7 @@ def api(db_session, tmp_path, user, author):
         training_run_repository=SqlAlchemyTrainingRunRepository(db_session),
         trainer=RecordingTrainer(write_artifact=True),
         config=TrainingConfig(device="cpu"),
+        min_training_lines=1,
     )
 
     app = FastAPI()
@@ -214,3 +215,6 @@ def test_full_http_flow_recognize_edit_confirm(api):
     assert body["page"]["prediction_cer"] == pytest.approx(0.0)
     # training used the confirmed page (fake trainer in the real service)
     assert body["training"]["outcome"] == "SUCCESS"
+    # regression: the response must carry the post-activation status, not the
+    # TRAINING status the version had when it was created
+    assert body["training"]["model_version"]["status"] == "ACTIVE"

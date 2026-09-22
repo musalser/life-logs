@@ -23,6 +23,9 @@ from .infrastructure.storage import HTRStorage, PilLineCropper
 
 
 def build_training_config() -> TrainingConfig:
+    normalization = settings.htr_training_normalization
+    if normalization and normalization.lower() in ("none", "null", ""):
+        normalization = None
     return TrainingConfig(
         device=settings.htr_device,
         epochs=settings.htr_epochs,
@@ -32,6 +35,24 @@ def build_training_config() -> TrainingConfig:
         confidence_warning_threshold=settings.htr_confidence_warning_threshold,
         confidence_critical_threshold=settings.htr_confidence_critical_threshold,
         random_seed=settings.htr_random_seed,
+        min_epochs=settings.htr_min_epochs,
+        # Keys below are understood by KrakenTrainer; another backend would
+        # read its own keys and ignore these.
+        backend_options={
+            "resize": settings.htr_training_resize,
+            "normalization": normalization,
+            "height": settings.htr_training_height,
+            "max_width": settings.htr_training_max_width,
+            "variant": settings.htr_training_variant,
+            "precision": settings.htr_training_precision,
+            "num_workers": settings.htr_training_num_workers,
+            "augment": settings.htr_training_augment,
+            "schedule": settings.htr_training_schedule,
+            "warmup": settings.htr_training_warmup,
+            "weight_decay": settings.htr_training_weight_decay,
+            "compile": settings.htr_training_compile,
+            "matmul_precision": settings.htr_training_matmul_precision,
+        },
     )
 
 
@@ -98,7 +119,8 @@ def build_training_service(db: Session) -> HandwritingTrainingService:
         training_run_repository=SqlAlchemyTrainingRunRepository(db),
         trainer=KrakenTrainer(work_dir=storage.training_work_dir()),
         config=build_training_config(),
-        min_training_samples=settings.htr_min_training_samples,
+        min_training_lines=settings.htr_min_training_lines,
+        min_training_words=settings.htr_min_training_words,
         environment=_environment_snapshot(),
     )
 

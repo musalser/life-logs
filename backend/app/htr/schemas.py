@@ -148,6 +148,11 @@ class TrainingResultResponse(BaseModel):
     training_run_id: int | None = None
     metrics: dict[str, Any] | None = None
     model_version: ModelVersionResponse | None = None
+    # progress towards the fine-tuning threshold (INSUFFICIENT_DATA results)
+    lines_collected: int | None = None
+    lines_required: int | None = None
+    words_collected: int | None = None
+    words_required: int | None = None
 
 
 class PageConfirmResponse(BaseModel):

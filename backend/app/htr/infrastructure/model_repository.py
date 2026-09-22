@@ -104,6 +104,30 @@ class SqlAlchemyModelRepository:
         row.error = error
         self.db.commit()
 
+    def fail_stale_training(self, author_id: int, reason: str) -> int:
+        rows = (
+            self.db.query(HTRModelVersion)
+            .filter(
+                HTRModelVersion.author_id == author_id,
+                HTRModelVersion.status == ModelVersionStatus.TRAINING.value,
+            )
+            .all()
+        )
+        for row in rows:
+            row.status = ModelVersionStatus.FAILED.value
+            row.error = reason
+        if rows:
+            self.db.commit()
+        return len(rows)
+
+    def get_version(self, model_version_id: int) -> ModelVersionInfo | None:
+        row = (
+            self.db.query(HTRModelVersion)
+            .filter(HTRModelVersion.id == model_version_id)
+            .first()
+        )
+        return _to_version_info(row) if row else None
+
     def activate_model(self, author_id: int, model_version_id: int) -> None:
         row = self._get_row(model_version_id)
         if row.author_id != author_id:
@@ -125,6 +149,18 @@ class SqlAlchemyModelRepository:
         )
         row.status = ModelVersionStatus.ACTIVE.value
         row.activated_at = datetime.now(timezone.utc)
+        self.db.commit()
+
+    def clear_active_model(self, author_id: int) -> None:
+        """Roll back to the default model: no version of the author is active."""
+        (
+            self.db.query(HTRModelVersion)
+            .filter(
+                HTRModelVersion.author_id == author_id,
+                HTRModelVersion.status == ModelVersionStatus.ACTIVE.value,
+            )
+            .update({HTRModelVersion.status: ModelVersionStatus.READY.value})
+        )
         self.db.commit()
 
     def list_versions(self, author_id: int) -> list[ModelVersionInfo]:

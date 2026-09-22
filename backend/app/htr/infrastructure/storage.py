@@ -83,9 +83,11 @@ class HTRStorage:
     # -- models ----------------------------------------------------------
 
     def model_output_path(self, author_id: int, version: int) -> str:
+        # kraken 7 writes safetensors; .mlmodel would need the CoreML loader,
+        # which is not what the recognizer uses.
         model_dir = self.root / "models" / f"author_{author_id}" / f"v{version}"
         model_dir.mkdir(parents=True, exist_ok=True)
-        return str(model_dir / "model.mlmodel")
+        return str(model_dir / "model.safetensors")
 
     def training_work_dir(self) -> str:
         work_dir = self.root / "training_tmp"

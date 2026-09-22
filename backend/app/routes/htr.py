@@ -150,6 +150,10 @@ def _to_training_response(result: TrainingResult) -> TrainingResultResponse:
         training_run_id=result.training_run_id,
         metrics=result.metrics,
         model_version=version,
+        lines_collected=result.lines_collected,
+        lines_required=result.lines_required,
+        words_collected=result.words_collected,
+        words_required=result.words_required,
     )
 
 

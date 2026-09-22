@@ -21,7 +21,7 @@ from app.htr.domain.entities import (
 from app.htr.domain.errors import CorruptImageError, TrainingError
 from app.htr.domain.interfaces import HTRRecognizer, HTRTrainer
 
-DEFAULT_MODEL = ModelRef(id="default", path="/models/default.mlmodel")
+DEFAULT_MODEL = ModelRef(id="default", path="/models/default.safetensors")
 
 
 def make_word(word_id, order=0, text="слово", confidence=0.95, corrected=None):
@@ -116,7 +116,7 @@ class FakeModelRepository:
             author_id=author_id,
             version=number,
             base_model_id=base_model_id,
-            file_path=f"/models/author_{author_id}/v{number}/model.mlmodel",
+            file_path=f"/models/author_{author_id}/v{number}/model.safetensors",
             status=ModelVersionStatus.TRAINING,
             dataset_hash=dataset_hash,
             training_config=training_config,
@@ -134,6 +134,18 @@ class FakeModelRepository:
     def mark_failed(self, model_version_id, error):
         self.versions[model_version_id].status = ModelVersionStatus.FAILED
 
+    def fail_stale_training(self, author_id, reason):
+        stale = [
+            v for v in self.versions.values()
+            if v.author_id == author_id and v.status == ModelVersionStatus.TRAINING
+        ]
+        for version in stale:
+            version.status = ModelVersionStatus.FAILED
+        return len(stale)
+
+    def get_version(self, model_version_id):
+        return self.versions.get(model_version_id)
+
     def activate_model(self, author_id, model_version_id):
         v = self.versions[model_version_id]
         assert v.status == ModelVersionStatus.READY
@@ -141,6 +153,11 @@ class FakeModelRepository:
             if other.author_id == author_id and other.status == ModelVersionStatus.ACTIVE:
                 other.status = ModelVersionStatus.READY
         v.status = ModelVersionStatus.ACTIVE
+
+    def clear_active_model(self, author_id):
+        for v in self.versions.values():
+            if v.author_id == author_id and v.status == ModelVersionStatus.ACTIVE:
+                v.status = ModelVersionStatus.READY
 
     def list_versions(self, author_id):
         return sorted(
@@ -179,10 +196,25 @@ class TrainerCall:
 
 
 class RecordingTrainer(HTRTrainer):
-    def __init__(self, fail: bool = False, write_artifact: bool = False):
+    def __init__(
+        self,
+        fail: bool = False,
+        write_artifact: bool = False,
+        validation_metrics: dict | None = None,
+        baseline_metrics: dict | None = None,
+    ):
         self.fail = fail
         self.write_artifact = write_artifact
         self.calls: list[TrainerCall] = []
+        # default: the fine-tune improves on the base model on the same split
+        self.validation_metrics = (
+            validation_metrics if validation_metrics is not None
+            else {"cer": 0.02, "wer": 0.05}
+        )
+        self.baseline_metrics = (
+            baseline_metrics if baseline_metrics is not None
+            else {"cer": 0.10, "wer": 0.20}
+        )
 
     def train(self, base_model, dataset, output_model_path, config):
         self.calls.append(TrainerCall(base_model, dataset, output_model_path, config))
@@ -196,7 +228,8 @@ class RecordingTrainer(HTRTrainer):
         return TrainingRunResult(
             model_path=output_model_path,
             training_metrics={"loss": 0.1},
-            validation_metrics={"cer": 0.02, "wer": 0.05},
+            validation_metrics=self.validation_metrics,
+            baseline_metrics=self.baseline_metrics,
             holdout_used=False,
         )
 

@@ -95,6 +95,8 @@ def env(db_session, tmp_path, user, author):
         training_run_repository=SqlAlchemyTrainingRunRepository(db_session),
         trainer=trainer,
         config=TrainingConfig(device="cpu"),
+        # the test pages are tiny; the production default threshold is 50 lines
+        min_training_lines=1,
     )
     return page_service, training_service, model_repo, trainer, user, author
 

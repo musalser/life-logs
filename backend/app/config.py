@@ -53,14 +53,47 @@ class Settings(BaseSettings):
     htr_segmentation_maxcolseps: int = 2
     htr_segmentation_no_hlines: bool = True
 
-    htr_epochs: int = 50
-    htr_batch_size: int = 8
-    htr_learning_rate: float = 0.0001
+    # HTR fine-tuning (recognition training of per-author models)
+    htr_epochs: int = 10
+    htr_min_epochs: int = 0
+    # 8 is kraken's own default and can fill a 16 GB card together with the
+    # static-width compile; 4 leaves headroom and is plenty for small corpora.
+    htr_batch_size: int = 4
+    # 1e-5 keeps a pretrained model from forgetting it while adapting to a
+    # small corpus (1e-4 destroyed accuracy on a 59-line first run)
+    htr_learning_rate: float = 0.00001
     htr_validation_split: float = 0.1
     htr_random_seed: int = 42
     htr_confidence_warning_threshold: float = 0.90
     htr_confidence_critical_threshold: float = 0.70
-    htr_min_training_samples: int = 1
+    # Fine-tuning starts only once the confirmed corpus reaches this size.
+    # One page is usually ~30 lines, so the default waits for a second page.
+    htr_min_training_lines: int = 50
+    # Optional second threshold; 0 disables it (lines alone decide).
+    htr_min_training_words: int = 0
+    # Backend knobs handed to the trainer (kraken reads these keys).
+    htr_training_resize: str = "union"          # fail | union | new
+    # The recognizer stores NFC text, while the default model's codec uses
+    # decomposed sequences ('и' + U+0306 for 'й'). Training must therefore be
+    # normalized to NFD, otherwise 'й'/'ӗ' look like brand-new code points and
+    # kraken resizes the output layer with random weights.
+    htr_training_normalization: str = "NFD"     # NFD | NFKD | NFC | NFKC | none
+    htr_training_height: int = 96               # line height (overridden by the loaded model)
+    htr_training_max_width: int = 2560          # max line width after height normalization
+    htr_training_variant: str = "medium"        # ppocrv6: tiny | small | medium
+    htr_training_precision: str = "32-true"
+    htr_training_num_workers: int = 0           # 0 keeps dataloading in-process
+    htr_training_augment: bool = True
+    htr_training_schedule: str = "cosine"
+    # a short linear warmup stabilises the first steps on a tiny corpus
+    htr_training_warmup: int = 10
+    htr_training_weight_decay: float = 0.01
+    # torch.compile (inductor) codegen can take many minutes on a small corpus
+    # and then dominates the run; eager mode is faster overall here. Enable it
+    # only for large training sets.
+    htr_training_compile: bool = False
+    # TF32 matmuls on Tensor Core GPUs (meaningless/ignored on CPU).
+    htr_training_matmul_precision: str = "high"
 
     class Config:
         env_file = ".env"

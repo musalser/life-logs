@@ -67,6 +67,42 @@ def test_failed_version_does_not_disturb_active(repo, author):
     assert repo.get_active_model(author.id).id == v1.id
 
 
+def test_fail_stale_training_closes_interrupted_versions(repo, author):
+    stale = repo.create_version(author.id, "default", {}, "h1")  # TRAINING
+    ready = repo.create_version(author.id, "default", {}, "h2")
+    repo.mark_ready(ready.id, ready.file_path, {})
+    repo.activate_model(author.id, ready.id)
+
+    assert repo.fail_stale_training(author.id, "interrupted") == 1
+
+    versions = {v.version: v.status for v in repo.list_versions(author.id)}
+    assert versions == {1: ModelVersionStatus.FAILED, 2: ModelVersionStatus.ACTIVE}
+    assert repo.fail_stale_training(author.id, "interrupted") == 0
+
+
+def test_clear_active_model_falls_back_to_default(repo, author):
+    v1 = repo.create_version(author.id, "default", {}, "h1")
+    repo.mark_ready(v1.id, v1.file_path, {})
+    repo.activate_model(author.id, v1.id)
+
+    repo.clear_active_model(author.id)
+
+    assert repo.get_active_model(author.id) is None
+    assert repo.get_active_model_ref(author.id) == DEFAULT
+    assert repo.list_versions(author.id)[0].status == ModelVersionStatus.READY
+
+
+def test_get_version_returns_current_state(repo, author):
+    v1 = repo.create_version(author.id, "default", {}, "h1")
+    assert repo.get_version(v1.id).status == ModelVersionStatus.TRAINING
+    repo.mark_ready(v1.id, v1.file_path, {"cer": 0.1})
+    repo.activate_model(author.id, v1.id)
+    fresh = repo.get_version(v1.id)
+    assert fresh.status == ModelVersionStatus.ACTIVE
+    assert fresh.metrics == {"cer": 0.1}
+    assert repo.get_version(9999) is None
+
+
 def test_metadata_round_trip(repo, author):
     config = {"epochs": 10, "learning_rate": 0.0001}
     v = repo.create_version(author.id, "default", config, "deadbeef",

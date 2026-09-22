@@ -35,6 +35,11 @@ class TrainingOutcome(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    # another training run for the same author is already in progress
+    BUSY = "BUSY"
+    # training finished but the result is not better than the base model, so it
+    # was not activated (previous active model stays)
+    NO_IMPROVEMENT = "NO_IMPROVEMENT"
 
 
 class ConfidenceLevel(str, Enum):
@@ -179,14 +184,24 @@ class TrainingDataset:
 
 @dataclass
 class TrainingConfig:
+    """Framework-independent fine-tuning parameters.
+
+    ``backend_options`` carries knobs only a concrete HTR backend understands
+    (kraken: resize policy, line height, max line width, ...). Keeping them in
+    an opaque mapping stops backend-specific types from leaking into the
+    application layer: another backend reads its own keys and ignores the rest.
+    """
+
     device: str = "cuda:0"
-    epochs: int = 50
+    epochs: int = 10
     batch_size: int = 8
     learning_rate: float = 1e-4
     validation_split: float = 0.1
     confidence_warning_threshold: float = 0.90
     confidence_critical_threshold: float = 0.70
     random_seed: int = 42
+    min_epochs: int = 0
+    backend_options: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +213,8 @@ class TrainingConfig:
             "confidence_warning_threshold": self.confidence_warning_threshold,
             "confidence_critical_threshold": self.confidence_critical_threshold,
             "random_seed": self.random_seed,
+            "min_epochs": self.min_epochs,
+            "backend_options": dict(self.backend_options),
         }
 
 
@@ -207,6 +224,9 @@ class TrainingRunResult:
     model_path: str
     training_metrics: dict[str, Any] = field(default_factory=dict)
     validation_metrics: dict[str, Any] | None = None
+    # metrics of the untouched base model on the *same* validation split; the
+    # application layer refuses to activate a model that does not beat it
+    baseline_metrics: dict[str, Any] | None = None
     holdout_used: bool = False
     note: str | None = None
 
@@ -220,3 +240,9 @@ class TrainingResult:
     metrics: dict[str, Any] | None = None
     dataset_hash: str | None = None
     training_run_id: int | None = None
+    # how much confirmed training material exists / is required; lets the UI
+    # explain why a confirmation did not trigger a new model version yet
+    lines_collected: int | None = None
+    lines_required: int | None = None
+    words_collected: int | None = None
+    words_required: int | None = None

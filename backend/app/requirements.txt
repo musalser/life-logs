@@ -9,13 +9,17 @@ psycopg[binary]
 celery[redis]
 redis
 llama-cpp-python
+ollama
 PyJWT
 transformers
 torch
 pillow
 python-multipart
 pytest
-# Optional HTR backend (recognition + fine-tuning), install to enable it.
-# Windows note: coremltools has no Windows wheels, so `pip install kraken` fails;
-# install kraken with --no-deps plus the deps listed in app/htr/README.md.
+# Optional HTR backend (recognition + fine-tuning). On WSL2/Linux coremltools
+# has wheels, so the install works, but kraken pins safetensors~=0.7.0 while
+# transformers requires >=0.8.0: install kraken first, then force safetensors
+# back so `import transformers`/lightning keep working. See app/htr/README.md.
+#   uv pip install --python .venv/bin/python kraken==7.1.1
+#   uv pip install --python .venv/bin/python safetensors==0.8.0
 # kraken
