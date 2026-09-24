@@ -21,6 +21,7 @@ service; this adapter never reaches for a previous custom model.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import shutil
@@ -82,9 +83,12 @@ class KrakenTrainer(HTRTrainer):
             seed_everything,
             checkpoint_cls,
             lightning_trainer_cls,
+            freeze_callback_cls,
         ) = self._import_kraken()
         self._configure_runtime(config)
-        module_cls = self._resolve_module_class(base_path)
+        module_cls = self._training_module_class(
+            self._resolve_module_class(base_path), config
+        )
         arch = getattr(module_cls, "_arch", None) or DEFAULT_ARCH
         logger.info(
             "Kraken training: arch=%s base=%s samples=%s device=%s compile=%s",
@@ -111,7 +115,19 @@ class KrakenTrainer(HTRTrainer):
                 auto_insert_metric_name=False,
                 filename="checkpoint_{epoch:02d}-{val_metric:.4f}",
             )
-            accelerator, devices = self._device_settings(config.device)
+            accelerator, devices = self._runtime_device(config)
+            # freeze the backbone (everything but the codec projection) for the
+            # first steps: the freshly resized head would otherwise drag the
+            # pretrained features away (catastrophic forgetting on a tiny corpus)
+            freeze_steps = self._freeze_backbone_steps(config, len(train_files))
+            callbacks = [checkpoint_callback]
+            if freeze_steps > 0 or config.backend_options.get("freeze_bn", True):
+                callbacks.append(
+                    freeze_callback_cls(
+                        freeze_steps,
+                        freeze_batch_norm=config.backend_options.get("freeze_bn", True),
+                    )
+                )
             trainer = lightning_trainer_cls(
                 accelerator=accelerator,
                 devices=devices,
@@ -124,13 +140,14 @@ class KrakenTrainer(HTRTrainer):
                 # mode is avoided because some CUDA kernels do not support it
                 deterministic=False,
                 num_sanity_val_steps=0,
-                callbacks=[checkpoint_callback],
+                callbacks=callbacks,
                 val_check_interval=1.0,
             )
 
             with trainer.init_module(empty_init=False):
                 model = module_cls.load_from_weights(str(base_path), config=model_config)
 
+            height_metrics = self._apply_height_override(model, config)
             trainer.fit(model, data_module)
 
             best_checkpoint = checkpoint_callback.best_model_path
@@ -160,12 +177,25 @@ class KrakenTrainer(HTRTrainer):
                 module_cls, model_config, config, train_files, eval_files,
                 str(base_path), trainer,
             )
+            steps_per_epoch = max(1, math.ceil(len(train_files) / max(1, config.batch_size)))
             training_metrics: dict[str, Any] = {
                 "architecture": arch,
                 "epochs": config.epochs,
                 "train_samples": len(train_files),
                 "eval_samples": len(eval_files),
+                "steps_per_epoch": steps_per_epoch,
+                "freeze_backbone_steps": freeze_steps,
+                **height_metrics,
+                "freeze_batch_norm": config.backend_options.get("freeze_bn", True),
+                "aux_nrtr": config.backend_options.get("aux_nrtr", False),
             }
+            if freeze_steps >= steps_per_epoch * max(1, config.epochs):
+                logger.warning(
+                    "HTR training: the backbone stays frozen for the whole run "
+                    "(%s steps requested, %s available) — only the output layer "
+                    "will learn",
+                    freeze_steps, steps_per_epoch * max(1, config.epochs),
+                )
             if best_score is not None:
                 score = float(best_score)
                 # kraken's val_metric is character accuracy
@@ -205,12 +235,72 @@ class KrakenTrainer(HTRTrainer):
             from lightning.pytorch.callbacks import ModelCheckpoint
             from kraken.models.convert import convert_models
             from kraken.train import KrakenTrainer as KrakenLightningTrainer
+
+            from .callbacks import FreezeBackboneForSteps
         except ImportError as exc:
             raise TrainingError(
                 "the kraken training backend is not installed; install the "
                 "optional HTR backend (see app/htr/README.md) to enable training"
             ) from exc
-        return convert_models, seed_everything, ModelCheckpoint, KrakenLightningTrainer
+        return (
+            convert_models,
+            seed_everything,
+            ModelCheckpoint,
+            KrakenLightningTrainer,
+            FreezeBackboneForSteps,
+        )
+
+    @staticmethod
+    def _apply_height_override(model, config: TrainingConfig) -> dict[str, Any]:
+        """Force a line height that differs from the checkpoint's own.
+
+        kraken always overrides ``config.height`` with the height recorded in the
+        checkpoint, so the setting alone cannot change it. The override rewrites
+        the model's expected input geometry after loading, which is what the
+        data module and the network read.
+        """
+        requested = int(config.backend_options.get("height_override", 0) or 0)
+        declared = int(getattr(model, "height", 0) or 0)
+        metrics: dict[str, Any] = {"line_height": declared}
+        if not requested or requested == declared:
+            return metrics
+        net = getattr(model, "net", None)
+        if net is None or not getattr(net, "input", None) or len(net.input) != 4:
+            logger.warning(
+                "HTR training: cannot force line height %s on %s", requested, type(net).__name__
+            )
+            return metrics
+        batch, channels, _, width = net.input
+        net.input = (batch, channels, requested, width)
+        model.height = requested
+        metrics["line_height"] = requested
+        metrics["line_height_override_from"] = declared
+        logger.info(
+            "HTR training: line height forced to %s (checkpoint declares %s)",
+            requested, declared,
+        )
+        return metrics
+
+    def _freeze_backbone_steps(self, config: TrainingConfig, train_samples: int) -> int:
+        """How many optimizer steps to keep the backbone frozen for.
+
+        ``freeze_backbone`` is expressed in steps, not samples: kraken's help
+        text says "samples" but its callback compares against
+        ``trainer.global_step``, and we follow the implementation.
+
+        * ``0`` — no freezing at all;
+        * ``N > 0`` — freeze for the first N steps;
+        * ``N < 0`` (default) — freeze for the first epoch, which is long enough
+          for a freshly resized output layer to settle and short enough to
+          fine-tune the pretrained features afterwards.
+        """
+        requested = int(config.backend_options.get("freeze_backbone", 0) or 0)
+        if requested > 0:
+            return requested
+        if requested == 0:
+            return 0
+        steps_per_epoch = math.ceil(train_samples / max(1, config.batch_size))
+        return max(1, steps_per_epoch)
 
     @staticmethod
     def _configure_runtime(config: TrainingConfig) -> None:
@@ -235,6 +325,21 @@ class KrakenTrainer(HTRTrainer):
                 torch.set_float32_matmul_precision(precision)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Could not set matmul precision %r: %s", precision, exc)
+
+    @staticmethod
+    def _training_module_class(module_cls, config: TrainingConfig):
+        """Swap in the CTC-only module unless the auxiliary head is wanted.
+
+        The base checkpoint of this project is an inference model without an
+        NRTR head, so kraken would train one from random weights (see
+        infrastructure/kraken/modules.py).
+        """
+        arch = getattr(module_cls, "_arch", None) or DEFAULT_ARCH
+        if arch != "ppocrv6" or config.backend_options.get("aux_nrtr", False):
+            return module_cls
+        from .modules import CtcFineTunePPOCRv6
+
+        return CtcFineTunePPOCRv6
 
     def _resolve_module_class(self, base_model_path: Path):
         """Pick the kraken LightningModule for the base weights' architecture."""
@@ -274,7 +379,7 @@ class KrakenTrainer(HTRTrainer):
 
     def _build_model_config(self, module_cls, arch: str, config: TrainingConfig, tmp_root: Path):
         options = config.backend_options
-        accelerator, devices = self._device_settings(config.device)
+        accelerator, devices = self._runtime_device(config)
         kwargs: dict[str, Any] = {
             "epochs": config.epochs if config.epochs > 0 else -1,
             "batch_size": config.batch_size,
@@ -310,6 +415,9 @@ class KrakenTrainer(HTRTrainer):
             "evaluation_data": list(eval_files) or None,
             "partition": 1.0 if eval_files else 1.0 - config.validation_split,
             "format_type": "path",
+            # the crops are dewarped baseline strips, not boxes: without this
+            # kraken records seg_type=bbox and flips centerline normalization
+            "linetype": options.get("linetype", "baselines"),
             "num_workers": options.get("num_workers", 0),
             "augment": options.get("augment", False),
             "padding": options.get("padding", 16),
@@ -418,3 +526,10 @@ class KrakenTrainer(HTRTrainer):
         if value in ("cuda", "gpu"):
             return "gpu", "auto"
         return value, "auto"
+
+    @staticmethod
+    def _runtime_device(config: TrainingConfig) -> tuple[str, Any]:
+        """Device actually handed to Lightning (CPU if CUDA is unusable)."""
+        from .recognizer import available_lightning_device
+
+        return available_lightning_device(config.device)

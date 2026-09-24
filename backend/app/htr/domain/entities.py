@@ -60,12 +60,27 @@ class BoundingBox:
 # Recognition output (produced by a future HTRRecognizer implementation)
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class LineGeometry:
+    """Where a line sits on its page image.
+
+    ``bbox`` is the cheap envelope; ``polygon`` is the (possibly curved)
+    outline produced by the segmenter. Training crops follow the outline when
+    there is one, because that is what recognition does at inference time.
+    """
+
+    bbox: BoundingBox
+    polygon: list[tuple[int, int]] | None = None
+
+
 @dataclass
 class RecognizedWord:
     id: str
     bbox: BoundingBox
     text: str
     confidence: float
+    # polygon following the (possibly curved) baseline; bbox stays as envelope
+    polygon: list[tuple[int, int]] | None = None
 
 
 @dataclass
@@ -74,6 +89,7 @@ class RecognizedLine:
     bbox: BoundingBox
     words: list[RecognizedWord]
     text: str
+    polygon: list[tuple[int, int]] | None = None
 
 
 @dataclass
@@ -95,10 +111,36 @@ class WordView:
     predicted_text: str | None
     confidence: float | None
     corrected_text: str | None = None
+    polygon: list[tuple[int, int]] | None = None
+    # vocabulary check (see app.htr.application.lexicon): True when the word is
+    # in the dictionary, False when the user should look at it, None when the
+    # check could not run (no dictionary installed) or there is nothing to check
+    in_lexicon: bool | None = None
 
     @property
     def effective_text(self) -> str | None:
         return self.corrected_text if self.corrected_text is not None else self.predicted_text
+
+
+@dataclass(frozen=True)
+class SuggestionChange:
+    """One word the model proposes to replace, with its dictionary verdict.
+
+    ``in_lexicon`` is False when the new word is in no dictionary and in no
+    author vocabulary — exactly the kind of change that must not be applied in
+    bulk, because that is where a language model invents things.
+
+    ``start``/``end`` are the character offsets of ``before`` in the line the
+    proposal refers to (``start == end`` for an insertion), so a single change
+    can be applied on its own — for the user who likes some of the proposed
+    words but not all of them.
+    """
+
+    before: str
+    after: str
+    in_lexicon: bool | None = None
+    start: int = 0
+    end: int = 0
 
 
 @dataclass
@@ -108,9 +150,26 @@ class LineView:
     bbox: BoundingBox
     predicted_text: str | None
     corrected_text: str | None = None
+    # who wrote corrected_text: only 'user' now (accepting a proposal is a
+    # human decision); kept for historical rows
+    corrected_by: str | None = None
     words: list[WordView] = field(default_factory=list)
     # True when word bboxes no longer match the line transcription tokenization
     words_stale: bool = False
+    polygon: list[tuple[int, int]] | None = None
+    # model proposal, kept apart from corrected_text so the raw recognition is
+    # never overwritten by machine output
+    suggested_text: str | None = None
+    suggested_by: str | None = None
+    suggestion_changes: list[SuggestionChange] = field(default_factory=list)
+    # words of effective_text that are missing from the dictionary
+    oov_count: int = 0
+    # the same misses as text, in reading order (badge and list must agree)
+    oov_words: list[str] = field(default_factory=list)
+
+    @property
+    def geometry(self) -> LineGeometry:
+        return LineGeometry(bbox=self.bbox, polygon=self.polygon)
 
     @property
     def effective_text(self) -> str | None:
@@ -123,6 +182,26 @@ class LineView:
         if self.corrected_text is not None:
             return True
         return bool(self.predicted_text and self.predicted_text.strip())
+
+    @property
+    def has_suggestion(self) -> bool:
+        """True when the model proposes something different from what is stored."""
+        if not self.suggested_text:
+            return False
+        return self.suggested_text.strip() != (self.effective_text or "").strip()
+
+    @property
+    def suggestion_verified(self) -> bool:
+        """Safe to accept in bulk: every change is confirmed by the dictionary.
+
+        A change nobody could verify (no dictionary installed, ``in_lexicon``
+        None) blocks the bulk accept, and so does a proposal that only touches
+        punctuation — there is nothing to check there either, so the user reads
+        it themselves.
+        """
+        if not self.has_suggestion or not self.suggestion_changes:
+            return False
+        return all(change.in_lexicon is True for change in self.suggestion_changes)
 
 
 @dataclass
@@ -140,6 +219,27 @@ class PageView:
     prediction_cer: float | None = None
     prediction_wer: float | None = None
     lines: list[LineView] = field(default_factory=list)
+    # vocabulary check over the whole page (filled in on read, not stored)
+    oov_count: int = 0
+    lexicon_available: bool = False
+
+
+@dataclass
+class PageSummary:
+    """Lightweight page row for lists (no line/word payload)."""
+
+    id: int
+    author_id: int
+    status: PageStatus
+    file_path: str
+    created_at: datetime | None
+    confirmed_at: datetime | None
+    line_count: int
+    prediction_cer: float | None = None
+    prediction_wer: float | None = None
+    # words missing from the dictionary; None when the check is unavailable
+    oov_count: int | None = None
+    lexicon_available: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +273,8 @@ class TrainingSample:
     line_id: int
     image_path: str
     transcription: str
+    # outline the crop was cut along; part of the dataset identity
+    geometry: LineGeometry | None = None
 
 
 @dataclass
@@ -246,3 +348,38 @@ class TrainingResult:
     lines_required: int | None = None
     words_collected: int | None = None
     words_required: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# LLM-assisted correction of the raw prediction
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConfusionPair:
+    """A character confusion learned from the author's own corrections.
+
+    ``recognized`` is what the HTR model produced, ``correct`` what the user
+    wrote instead (e.g. ``н`` -> ``п``).
+    """
+
+    recognized: str
+    correct: str
+    count: int
+
+
+@dataclass
+class CorrectionContext:
+    """Author-specific material handed to the text corrector.
+
+    Nothing here is model-specific: it is the author's own vocabulary, the
+    confusions the recognizer makes on their hand, real correction examples and
+    the domain vocabulary extracted from the knowledge base.
+    """
+
+    lexicon: list[str] = field(default_factory=list)
+    vocabulary: list[str] = field(default_factory=list)
+    confusions: list[ConfusionPair] = field(default_factory=list)
+    examples: list[tuple[str, str]] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not (self.lexicon or self.vocabulary or self.confusions or self.examples)

@@ -354,8 +354,17 @@ class HTRLine(Base):
     y2 = Column(Integer, nullable=False)
     predicted_text = Column(Text, nullable=True)
     corrected_text = Column(Text, nullable=True)
+    # who put corrected_text there: 'user' (accepted model proposals count as
+    # user text, since the human made the decision)
+    corrected_by = Column(String(16), nullable=True)
+    # proposal of the language model: kept apart from corrected_text so the
+    # kraken transcription stays exactly as recognized until the user accepts
+    suggested_text = Column(Text, nullable=True)
+    suggested_by = Column(String(32), nullable=True)
     # word bboxes no longer match the tokenization of corrected_text
     words_stale = Column(Boolean, nullable=False, default=False)
+    # JSON [[x, y], ...] outline that follows the (curved) baseline
+    polygon = Column(Text, nullable=True)
 
     page = relationship("HTRPage", back_populates="lines")
     words = relationship(
@@ -379,6 +388,8 @@ class HTRWord(Base):
     predicted_text = Column(Text, nullable=True)
     confidence = Column(Float, nullable=True)
     corrected_text = Column(Text, nullable=True)
+    # JSON [[x, y], ...] outline of the word, following the line baseline
+    polygon = Column(Text, nullable=True)
 
     line = relationship("HTRLine", back_populates="words")
 
@@ -405,6 +416,38 @@ class HTRModelVersion(Base):
     activated_at = Column(DateTime(timezone=True), nullable=True)
 
     author = relationship("HTRAuthor", back_populates="model_versions")
+
+
+class HTRSuggestionEvent(Base):
+    """What the user did with a model proposal.
+
+    This is the feedback the correction loop was missing: without it there is
+    no way to tell whether the language model helps, which of its changes were
+    accepted, or whether the dictionary verdict predicted the user's decision.
+    Every accept (whole line, single word, bulk) and every dismissal lands here.
+    """
+
+    __tablename__ = "htr_suggestion_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    page_id = Column(Integer, ForeignKey("htr_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    line_id = Column(Integer, ForeignKey("htr_lines.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # accepted_change | accepted_line | accepted_bulk | dismissed
+    action = Column(String(24), nullable=False, index=True)
+    # the proposal as a whole and the piece that was acted on
+    suggested_text = Column(Text, nullable=True)
+    original_text = Column(Text, nullable=True)
+    change_before = Column(Text, nullable=True)
+    change_after = Column(Text, nullable=True)
+    # dictionary verdict of that change (True/False/None)
+    in_lexicon = Column(Boolean, nullable=True)
+    # model that made the proposal
+    suggested_by = Column(String(32), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    page = relationship("HTRPage")
+    line = relationship("HTRLine")
 
 
 class HTRTrainingRun(Base):

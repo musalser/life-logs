@@ -11,14 +11,72 @@ from typing import Any, Protocol
 
 from .entities import (
     BoundingBox,
+    CorrectionContext,
+    LineGeometry,
     ModelRef,
     ModelVersionInfo,
+    PageSummary,
     PageView,
     RecognitionResult,
     TrainingConfig,
     TrainingDataset,
     TrainingRunResult,
 )
+
+class TextCorrector(Protocol):
+    """Proposes a corrected version of one predicted line using an LLM.
+
+    The proposal is never written into the transcription: it is stored as a
+    suggestion and only the user moves it into ``corrected_text``.
+    Implementations must be best-effort: transport or model failures return
+    ``None`` (the raw prediction is kept), they never raise.
+    """
+
+    def correct_line(
+        self,
+        text: str,
+        context_lines: list[str],
+        context: CorrectionContext,
+    ) -> str | None: ...
+
+
+class VocabularyProvider(Protocol):
+    """Proper nouns / domain terms of a user (from the knowledge base)."""
+
+    def vocabulary(self, user_id: int) -> list[str]: ...
+
+
+class WordList(Protocol):
+    """Read-only set of known dictionary forms (a Bloom filter, a file, ...)."""
+
+    @property
+    def is_available(self) -> bool:
+        """False when the dictionary artifact is missing or unusable."""
+        ...
+
+    def __contains__(self, word: str) -> bool: ...
+
+
+class LexiconChecker(Protocol):
+    """Decides whether a recognized word exists in the known vocabulary."""
+
+    @property
+    def is_available(self) -> bool: ...
+
+    def is_known(self, word: str) -> bool: ...
+
+
+class LexiconProvider(Protocol):
+    """Vocabulary access for the pages of one author.
+
+    ``checker`` combines the general dictionary with the words this author
+    really writes; ``page_transcriptions`` gives the effective line texts per
+    page so lists can show an OOV total without loading every line.
+    """
+
+    def checker(self, author_id: int) -> LexiconChecker: ...
+
+    def page_transcriptions(self, author_id: int) -> dict[int, list[str]]: ...
 
 
 class HTRTrainer(ABC):
@@ -43,13 +101,28 @@ class HTRRecognizer(ABC):
     """
 
     @abstractmethod
-    def recognize(self, image_path: str, model_path: str) -> RecognitionResult:
-        """Raises RecognitionError when the backend or the model is unusable."""
+    def recognize(
+        self,
+        image_path: str,
+        model_path: str,
+        author_id: int | None = None,
+        word_checker: LexiconChecker | None = None,
+    ) -> RecognitionResult:
+        """Raises RecognitionError when the backend or the model is unusable.
+
+        ``author_id`` lets the backend pick author-specific decoding material
+        (a language model built from that author's confirmed pages).
+        ``word_checker`` is the vocabulary the decoder should prefer; the
+        application layer passes the author's own checker so decoding can favour
+        words the user has already confirmed.
+        """
         ...
 
 
 class LineCropper(Protocol):
-    def crop_line(self, page_image_path: str, bbox: BoundingBox, output_path: str) -> str:
+    def crop_line(
+        self, page_image_path: str, geometry: LineGeometry, output_path: str
+    ) -> str:
         """Write the line crop to output_path and return it. Raises CorruptImageError."""
         ...
 
@@ -60,6 +133,12 @@ class PageRepository(Protocol):
     ) -> PageView: ...
 
     def get_page(self, page_id: int) -> PageView | None: ...
+
+    def delete_page(self, page_id: int) -> None:
+        """Remove the page and its lines/words (cascade)."""
+        ...
+
+    def list_page_summaries(self, author_id: int) -> list[PageSummary]: ...
 
     def get_confirmed_pages(self, author_id: int) -> list[PageView]: ...
 
@@ -78,6 +157,49 @@ class PageRepository(Protocol):
     ) -> PageView: ...
 
     def apply_line_update(self, page_id: int, line_id: int, corrected_text: str) -> PageView: ...
+
+    def save_line_suggestion(
+        self,
+        page_id: int,
+        line_id: int,
+        suggested_text: str,
+        suggested_by: str,
+    ) -> PageView:
+        """Store a model proposal; ``corrected_text`` is left untouched."""
+        ...
+
+    def accept_line_suggestions(self, page_id: int, line_ids: list[int]) -> PageView:
+        """Move the proposals of these lines into the user's transcription."""
+        ...
+
+    def apply_line_change(self, page_id: int, line_id: int, corrected_text: str) -> PageView:
+        """Write a partially accepted proposal: text yes, proposal stays.
+
+        The user took some of the proposed words but not all of them, so the
+        rest of the proposal must remain visible for review.
+        """
+        ...
+
+    def clear_line_suggestions(self, page_id: int, line_ids: list[int]) -> PageView:
+        """Drop proposals (dismissed by the user)."""
+        ...
+
+    def record_suggestion_event(
+        self,
+        *,
+        page_id: int,
+        line_id: int,
+        user_id: int,
+        action: str,
+        suggested_text: str | None = None,
+        original_text: str | None = None,
+        change_before: str | None = None,
+        change_after: str | None = None,
+        in_lexicon: bool | None = None,
+        suggested_by: str | None = None,
+    ) -> None:
+        """Append one accepted/dismissed proposal to the feedback log."""
+        ...
 
     def confirm_page(
         self,

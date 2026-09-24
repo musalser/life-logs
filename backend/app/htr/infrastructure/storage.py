@@ -1,18 +1,22 @@
 """Filesystem layout and image operations for the HTR module.
 
 Layout:
-    <root>/pages/<page_id or user/author scoped>/original.<ext>
-    <root>/crops/<page_id>/<line_id>.png
-    <root>/models/author_<author_id>/v<version>/model.mlmodel
+    <root>/pages/author_<id>/<uuid>.<ext>
+    <root>/crops/page_<id>/line_<id>.png
+    <root>/models/author_<author_id>/v<version>/model.safetensors
 """
 from __future__ import annotations
 
 import io
+import logging
+import shutil
 import uuid
 from pathlib import Path
 
-from ..domain.entities import BoundingBox
+from ..domain.entities import BoundingBox, LineGeometry
 from ..domain.errors import CorruptImageError
+
+logger = logging.getLogger(__name__)
 
 try:
     from PIL import Image, ImageOps
@@ -73,6 +77,20 @@ class HTRStorage:
         except Exception as exc:
             raise CorruptImageError(f"Cannot decode image: {exc}") from exc
 
+    def delete_page_assets(self, page_id: int, file_path: str) -> None:
+        """Remove the stored page image and its line crops.
+
+        Missing files are fine (legacy rows point at paths from the Windows
+        deployment); the database row is the source of truth.
+        """
+        try:
+            path = Path(file_path)
+            if path.is_file():
+                path.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove page image %s: %s", file_path, exc)
+        shutil.rmtree(self.root / "crops" / f"page_{page_id}", ignore_errors=True)
+
     # -- line crops ------------------------------------------------------
 
     def line_crop_path(self, page_id: int, line_id: int) -> str:
@@ -96,9 +114,16 @@ class HTRStorage:
 
 
 class PilLineCropper:
-    """LineCropper implementation based on Pillow."""
+    """LineCropper fallback: the axis-aligned envelope of the line.
 
-    def crop_line(self, page_image_path: str, bbox: BoundingBox, output_path: str) -> str:
+    Used for lines without a polygon and as the safety net of
+    :class:`~app.htr.infrastructure.kraken.lines.KrakenLineCropper`.
+    """
+
+    def crop_line(
+        self, page_image_path: str, geometry: LineGeometry, output_path: str
+    ) -> str:
+        bbox = geometry.bbox
         try:
             with open_oriented_image(page_image_path) as img:
                 x1 = max(0, min(bbox.x1, img.width))

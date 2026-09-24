@@ -10,7 +10,7 @@ import io
 
 import pytest
 
-from app.htr.domain.entities import BoundingBox
+from app.htr.domain.entities import BoundingBox, LineGeometry
 from app.htr.domain.errors import CorruptImageError
 from app.htr.infrastructure.storage import (
     HTRStorage,
@@ -70,7 +70,9 @@ def test_line_crop_uses_oriented_geometry(tmp_path):
     page.write_bytes(jpeg_with_orientation((40, 20), 6))
     output = tmp_path / "crops" / "line_1.png"
 
-    PilLineCropper().crop_line(str(page), BoundingBox(0, 0, 10, 20), str(output))
+    PilLineCropper().crop_line(
+        str(page), LineGeometry(BoundingBox(0, 0, 10, 20)), str(output)
+    )
 
     with Image.open(output) as crop:
         assert crop.size == (10, 20)
@@ -81,7 +83,9 @@ def test_line_crop_clamps_boxes_to_the_image(tmp_path):
     page.write_bytes(jpeg_with_orientation((40, 20), 6))
     output = tmp_path / "line.png"
 
-    PilLineCropper().crop_line(str(page), BoundingBox(-50, -50, 5000, 5000), str(output))
+    PilLineCropper().crop_line(
+        str(page), LineGeometry(BoundingBox(-50, -50, 5000, 5000)), str(output)
+    )
 
     with Image.open(output) as crop:
         assert crop.size == (20, 40)
@@ -92,4 +96,6 @@ def test_line_crop_reports_corrupt_page(tmp_path):
     page.write_bytes(b"nope")
 
     with pytest.raises(CorruptImageError):
-        PilLineCropper().crop_line(str(page), BoundingBox(0, 0, 10, 10), str(tmp_path / "x.png"))
+        PilLineCropper().crop_line(
+            str(page), LineGeometry(BoundingBox(0, 0, 10, 10)), str(tmp_path / "x.png")
+        )

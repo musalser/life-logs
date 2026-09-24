@@ -17,9 +17,18 @@ from typing import Callable
 
 from ..domain.entities import PageStatus, TrainingDataset, TrainingSample
 from ..domain.errors import CorruptImageError, DatasetBuildError
+from ..domain.entities import LineGeometry
 from ..domain.interfaces import LineCropper, PageRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _geometry_digest(geometry: LineGeometry | None) -> str:
+    """Short digest of the line outline: the crop's pixels come from it."""
+    if geometry is None or not geometry.polygon:
+        return "-"
+    outline = ";".join(f"{int(x)},{int(y)}" for x, y in geometry.polygon)
+    return hashlib.sha256(outline.encode("utf-8")).hexdigest()[:12]
 
 
 class TrainingDatasetBuilder:
@@ -64,7 +73,7 @@ class TrainingDatasetBuilder:
                 continue
             crop_path = self.line_cropper.crop_line(
                 page.file_path,
-                line.bbox,
+                line.geometry,
                 self.crop_path_provider(page.id, line.id),
             )
             samples.append(
@@ -73,6 +82,10 @@ class TrainingDatasetBuilder:
                     line_id=line.id,
                     image_path=crop_path,
                     transcription=text,
+                    # what the crop actually shows: the outline decides the
+                    # pixels, so a re-recognition must change the hash even when
+                    # the text stays the same
+                    geometry=line.geometry,
                 )
             )
         return samples
@@ -80,7 +93,7 @@ class TrainingDatasetBuilder:
     @staticmethod
     def _compute_hash(samples: list[TrainingSample]) -> str:
         canonical = "\n".join(
-            f"{s.page_id}|{s.line_id}|{s.transcription}"
+            f"{s.page_id}|{s.line_id}|{s.transcription}|{_geometry_digest(s.geometry)}"
             for s in sorted(samples, key=lambda s: (s.page_id, s.line_id))
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

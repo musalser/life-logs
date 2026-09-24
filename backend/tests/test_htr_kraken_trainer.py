@@ -8,8 +8,10 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from app.htr.domain.entities import (
     ModelRef,
@@ -36,6 +38,24 @@ class FakePPOCRModule:
     _config_class = FakeConfig
     _data_config_class = FakeConfig
     _data_module_class = staticmethod(lambda config: config)
+
+
+class FakeNet(torch.nn.Module):
+    """A PP-OCRv6-shaped net: a backbone plus an exposed output projection."""
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = torch.nn.Sequential(
+            torch.nn.Linear(4, 4),
+            torch.nn.BatchNorm1d(4),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(4, 4),
+        )
+        self.output = torch.nn.Linear(4, 2)
+
+    @property
+    def _output_proj(self):
+        return self.output
 
 
 class FakeVGSLModule:
@@ -79,6 +99,153 @@ def make_dataset(paths):
 )
 def test_device_settings(device, expected):
     assert KrakenTrainer._device_settings(device) == expected
+
+
+def test_runtime_device_falls_back_to_cpu_without_cuda(monkeypatch):
+    from app.htr.infrastructure.kraken import recognizer as module
+
+    monkeypatch.setattr(module, "gpu_available", lambda: False)
+    assert KrakenTrainer._runtime_device(TrainingConfig(device="cuda:0")) == ("cpu", "auto")
+
+    monkeypatch.setattr(module, "gpu_available", lambda: True)
+    assert KrakenTrainer._runtime_device(TrainingConfig(device="cuda:0")) == ("gpu", [0])
+
+
+# -- freezing the backbone ----------------------------------------------------
+
+
+def test_freeze_backbone_auto_is_one_epoch():
+    trainer = KrakenTrainer()
+    # 62 samples / batch 4 -> 16 steps per epoch
+    assert trainer._freeze_backbone_steps(
+        TrainingConfig(batch_size=4, backend_options={"freeze_backbone": -1}), 62
+    ) == 16
+    # never zero: one epoch of a tiny corpus must still freeze something
+    assert trainer._freeze_backbone_steps(
+        TrainingConfig(batch_size=64, backend_options={"freeze_backbone": -1}), 3
+    ) == 1
+
+
+def test_freeze_backbone_can_be_disabled_or_set_exactly():
+    trainer = KrakenTrainer()
+    assert trainer._freeze_backbone_steps(
+        TrainingConfig(backend_options={"freeze_backbone": 0}), 100
+    ) == 0
+    assert trainer._freeze_backbone_steps(
+        TrainingConfig(backend_options={"freeze_backbone": 500}), 100
+    ) == 500
+    # missing key means "no freezing", so an old config cannot change behaviour
+    assert trainer._freeze_backbone_steps(TrainingConfig(), 100) == 0
+
+
+def test_freeze_callback_keeps_only_the_output_projection_trainable():
+    from app.htr.infrastructure.kraken.callbacks import FreezeBackboneForSteps
+
+    net = FakeNet()
+    module = SimpleNamespace(net=net)
+    callback = FreezeBackboneForSteps(unfreeze_at_step=5)
+
+    callback.on_train_start(trainer=None, pl_module=module)
+
+    assert net.backbone[0].weight.requires_grad is False
+    assert net.backbone[3].weight.requires_grad is False
+    assert net.output.weight.requires_grad is True
+    assert net.output.bias.requires_grad is True
+    # a frozen backbone must not keep updating its BatchNorm statistics either
+    assert net.backbone.training is False
+    assert net.output.training is True
+
+
+def test_freeze_callback_unfreezes_after_the_configured_step():
+    from app.htr.infrastructure.kraken.callbacks import FreezeBackboneForSteps
+
+    net = FakeNet()
+    module = SimpleNamespace(net=net)
+    callback = FreezeBackboneForSteps(unfreeze_at_step=3)
+    callback.on_train_start(trainer=None, pl_module=module)
+
+    callback.on_train_batch_start(SimpleNamespace(global_step=1), module, None, 0)
+    assert net.backbone[0].weight.requires_grad is False
+
+    # Lightning switches the model back to train mode after a validation run;
+    # while frozen the callback re-asserts its state on every batch
+    net.backbone.train()
+    callback.on_train_batch_start(SimpleNamespace(global_step=1), module, None, 0)
+    assert net.backbone.training is False
+
+    # a step that jumped over the threshold still unfreezes (kraken uses `==`)
+    callback.on_train_batch_start(SimpleNamespace(global_step=4), module, None, 0)
+    assert net.backbone[0].weight.requires_grad is True
+    assert net.backbone[3].weight.requires_grad is True
+    assert net.output.weight.requires_grad is True
+    assert net.backbone.training is True
+
+
+def test_batch_norm_statistics_stay_frozen_after_unfreezing():
+    """Batch of 4 crops cannot re-estimate 61 pretrained BatchNorm layers."""
+    from app.htr.infrastructure.kraken.callbacks import FreezeBackboneForSteps
+
+    net = FakeNet()
+    module = SimpleNamespace(net=net)
+    callback = FreezeBackboneForSteps(unfreeze_at_step=1)
+    callback.on_train_start(trainer=None, pl_module=module)
+    batch_norm = net.backbone[1]
+    assert batch_norm.training is False
+
+    callback.on_train_batch_start(SimpleNamespace(global_step=5), module, None, 0)
+
+    # the backbone is trainable again, but its statistics are not re-estimated
+    assert net.backbone[3].weight.requires_grad is True
+    assert batch_norm.training is False
+    assert net.output.training is True
+
+
+def test_batch_norm_freezing_can_be_disabled():
+    from app.htr.infrastructure.kraken.callbacks import FreezeBackboneForSteps
+
+    net = FakeNet()
+    module = SimpleNamespace(net=net)
+    callback = FreezeBackboneForSteps(unfreeze_at_step=1, freeze_batch_norm=False)
+    callback.on_train_start(trainer=None, pl_module=module)
+    callback.on_train_batch_start(SimpleNamespace(global_step=5), module, None, 0)
+
+    net.backbone.train()  # what Lightning does after every validation
+    callback.on_train_batch_start(SimpleNamespace(global_step=6), module, None, 0)
+    assert net.backbone[1].training is True
+
+
+def test_ppocrv6_is_trained_without_the_auxiliary_nrtr_head():
+    """The base checkpoint has no NRTR head; a random one must not steer training."""
+    pytest.importorskip("kraken.train.ppocr")
+    from app.htr.infrastructure.kraken.modules import CtcFineTunePPOCRv6
+
+    without = TrainingConfig(backend_options={"aux_nrtr": False})
+    with_head = TrainingConfig(backend_options={"aux_nrtr": True})
+
+    assert KrakenTrainer._training_module_class(FakePPOCRModule, without) is CtcFineTunePPOCRv6
+    assert KrakenTrainer._training_module_class(FakePPOCRModule, with_head) is FakePPOCRModule
+    # other architectures are left to kraken
+    assert KrakenTrainer._training_module_class(FakeVGSLModule, without) is FakeVGSLModule
+
+
+def test_ctc_only_module_zeroes_the_auxiliary_loss():
+    pytest.importorskip("kraken.train.ppocr")
+    from app.htr.infrastructure.kraken.modules import CtcFineTunePPOCRv6
+
+    loss = CtcFineTunePPOCRv6._gtc_loss(None, torch.zeros(2, 5), None, None)
+    assert loss.shape == ()
+    assert float(loss) == 0.0
+
+
+def test_freeze_callback_falls_back_to_the_last_layer_of_a_sequential_net():
+    """A VGSL net is an nn.Sequential: kraken's own `net[:-1]` case."""
+    from app.htr.infrastructure.kraken.callbacks import trainable_output_parameters
+
+    net = torch.nn.Sequential(
+        torch.nn.Linear(4, 4), torch.nn.ReLU(), torch.nn.Linear(4, 2)
+    )
+    keep = trainable_output_parameters(net)
+    assert keep == {id(p) for p in net[-1].parameters()}
 
 
 # -- ground truth materialization ---------------------------------------------
@@ -191,11 +358,19 @@ def test_validation_data_config_uses_test_data(tmp_path):
     assert data_config.training_data is None
 
 
-def test_vgsl_config_has_no_ppocr_keys(tmp_path):
+def test_vgsl_config_has_no_ppocr_keys(tmp_path, monkeypatch):
+    from app.htr.infrastructure.kraken import recognizer as module
+
+    monkeypatch.setattr(module, "gpu_available", lambda: True)
     config = TrainingConfig(device="cuda:0")
     model_config = KrakenTrainer()._build_model_config(FakeVGSLModule, "vgsl", config, tmp_path)
     assert not hasattr(model_config, "variant")
     assert model_config.accelerator == "gpu"
+
+    # without CUDA the same config is downgraded instead of failing
+    monkeypatch.setattr(module, "gpu_available", lambda: False)
+    cpu_config = KrakenTrainer()._build_model_config(FakeVGSLModule, "vgsl", config, tmp_path)
+    assert cpu_config.accelerator == "cpu"
 
 
 # -- guards -------------------------------------------------------------------

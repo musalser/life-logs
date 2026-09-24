@@ -1,6 +1,6 @@
 <template>
   <div class="min-h-screen bg-app-bg text-app-text">
-    <div class="mx-auto max-w-6xl px-4 py-6 md:px-8">
+    <div :class="isWideRoute ? 'mx-auto max-w-[1800px] px-4 py-6 md:px-6' : 'mx-auto max-w-6xl px-4 py-6 md:px-8'">
       <header class="mb-6 rounded-2xl border border-app-border/40 bg-app-panel/60 p-4">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div class="flex items-center gap-4">
@@ -13,6 +13,7 @@
               <NuxtLink to="/chat" class="nav-link" active-class="nav-link--active">Чат</NuxtLink>
               <NuxtLink to="/diary" class="nav-link" active-class="nav-link--active">Дневник</NuxtLink>
               <NuxtLink to="/knowledge" class="nav-link" active-class="nav-link--active">Знания</NuxtLink>
+              <NuxtLink to="/manuscripts" class="nav-link" active-class="nav-link--active">Рукописи</NuxtLink>
             </nav>
           </div>
 
@@ -60,8 +61,8 @@
         </div>
       </header>
 
-      <div class="grid grid-cols-1 gap-6 md:grid-cols-[260px_1fr]">
-        <aside class="rounded-2xl border border-app-border/40 bg-app-panel/60 p-4">
+      <div :class="isWideRoute ? 'grid grid-cols-1 gap-6' : 'grid grid-cols-1 gap-6 md:grid-cols-[260px_1fr]'">
+        <aside v-if="!isWideRoute" class="rounded-2xl border border-app-border/40 bg-app-panel/60 p-4">
           <div class="mb-3 flex items-center justify-between gap-2">
             <p class="text-xs uppercase tracking-widest text-app-accent">История страниц</p>
             <p v-if="isDiaryRoute && isAuthenticated" class="text-xs text-app-muted">{{ diaryPages.length }} шт.</p>
@@ -211,6 +212,8 @@ const authForm = reactive({ username: '', password: '', name: '' })
 const isAuthenticated = computed(() => authStore.isAuthenticated)
 const authUser = computed(() => authStore.user || 'Пользователь')
 const isDiaryRoute = computed(() => route.name === 'diary')
+// the annotation view needs the full width: no history sidebar
+const isWideRoute = computed(() => route.name === 'manuscripts')
 const activePageId = computed(() => {
   const parsed = Number(route.query.page)
   return Number.isInteger(parsed) ? parsed : null

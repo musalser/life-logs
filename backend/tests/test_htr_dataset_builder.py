@@ -98,6 +98,17 @@ def test_dataset_hash_is_stable_for_identical_content():
     assert h1 == h2
 
 
+def test_dataset_hash_changes_when_the_line_geometry_changes():
+    """The crop's pixels come from the outline, so it belongs in the identity."""
+    plain = make_page(1, lines=[make_line(100)])
+    outlined = make_page(1, lines=[make_line(100)])
+    outlined.lines[0].polygon = [(0, 0), (10, 0), (10, 5), (0, 5)]
+
+    assert build([plain]).build_for_author(1).dataset_hash != (
+        build([outlined]).build_for_author(1).dataset_hash
+    )
+
+
 def test_dataset_hash_changes_with_content():
     base = build([make_page(1)]).build_for_author(1).dataset_hash
     edited_page = make_page(1, lines=[make_line(100, corrected="другой текст")])

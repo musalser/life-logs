@@ -23,6 +23,7 @@ class OllamaAdapter:
 
     async def warmup(self) -> None:
         """Pre-load model weights so first user request has no cold-start delay."""
+        return # hotfix
         try:
             logger.info("Warming up model %s...", MODEL)
             await self.client.generate(

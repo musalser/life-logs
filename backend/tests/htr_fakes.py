@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from app.htr.domain.entities import (
     BoundingBox,
@@ -248,6 +248,63 @@ class FakeDatasetBuilder:
         return self.dataset
 
 
+class FakeCorrector:
+    """Stands in for the LLM corrector: maps predictions to corrections."""
+
+    model = "fake-llm"
+
+    def __init__(self, mapping: dict[str, str] | None = None, fail: bool = False):
+        self.mapping = dict(mapping or {})
+        self.fail = fail
+        self.calls: list[tuple[str, list[str], Any]] = []
+
+    def correct_line(self, text: str, context_lines: list[str], context) -> str | None:
+        self.calls.append((text, list(context_lines), context))
+        if self.fail:
+            return None
+        return self.mapping.get(text, text)
+
+
+class FakeWordList:
+    """In-memory stand-in for the dictionary artifact."""
+
+    def __init__(self, words: Iterable[str] = (), available: bool = True):
+        self.words = frozenset(words)
+        self._available = available
+
+    @property
+    def is_available(self) -> bool:
+        return self._available
+
+    def __contains__(self, word: object) -> bool:
+        return word in self.words
+
+
+class FakeLexiconProvider:
+    """Stands in for the dictionary: only ``known`` words are in the lexicon."""
+
+    def __init__(
+        self,
+        known: Iterable[str] = (),
+        texts: dict[int, list[str]] | None = None,
+        available: bool = True,
+    ):
+        from app.htr.infrastructure.lexicon import LayeredLexiconChecker
+
+        self._checker = LayeredLexiconChecker(
+            base=None,
+            extra={word.casefold() for word in known},
+            available=available,
+        )
+        self.texts = texts or {}
+
+    def checker(self, author_id: int):
+        return self._checker
+
+    def page_transcriptions(self, author_id: int):
+        return self.texts
+
+
 class FakeRecognizer(HTRRecognizer):
     """Records the (image, model) pairs it is asked to recognize."""
 
@@ -260,40 +317,58 @@ class FakeRecognizer(HTRRecognizer):
         self.error = error
         self.calls: list[tuple[str, str]] = []
 
-    def recognize(self, image_path: str, model_path: str) -> RecognitionResult:
+    def recognize(
+        self,
+        image_path: str,
+        model_path: str,
+        author_id: int | None = None,
+        word_checker=None,
+    ) -> RecognitionResult:
         self.calls.append((image_path, model_path))
+        self.last_word_checker = word_checker
         if self.error is not None:
             raise self.error
         assert self.result is not None
         return self.result
 
 
+def _quad(box, skew=0):
+    """Polygon of a bbox with an optional vertical skew (curved baseline)."""
+    return [
+        (box.x1, box.y1),
+        (box.x2, box.y1 + skew),
+        (box.x2, box.y2),
+        (box.x1, box.y2 - skew),
+    ]
+
+
 def recognition_result(width=200, height=120) -> RecognitionResult:
     """Two lines with word geometry, as a real recognizer would return."""
     from app.htr.domain.entities import RecognizedLine, RecognizedWord
 
+    line1 = BoundingBox(0, 0, width, 40)
+    line2 = BoundingBox(0, 50, width, 90)
+    words1 = [
+        RecognizedWord("w1", BoundingBox(0, 0, 30, 40), "Уж", 0.98,
+                       polygon=_quad(BoundingBox(0, 0, 30, 40))),
+        RecognizedWord("w2", BoundingBox(35, 0, 90, 40), "очень", 0.55,
+                       polygon=_quad(BoundingBox(35, 0, 90, 40), skew=6)),
+        RecognizedWord("w3", BoundingBox(95, 0, 130, 40), "дед", 0.95,
+                       polygon=_quad(BoundingBox(95, 0, 130, 40))),
+    ]
+    words2 = [
+        RecognizedWord("w4", BoundingBox(0, 50, 40, 90), "на", 0.97,
+                       polygon=_quad(BoundingBox(0, 50, 40, 90))),
+        RecognizedWord("w5", BoundingBox(45, 50, 120, 90), "еврея", 0.75,
+                       polygon=_quad(BoundingBox(45, 50, 120, 90), skew=4)),
+    ]
     return RecognitionResult(
         page_width=width,
         page_height=height,
         lines=[
-            RecognizedLine(
-                id="l1",
-                bbox=BoundingBox(0, 0, width, 40),
-                text="Уж очень дед",
-                words=[
-                    RecognizedWord("w1", BoundingBox(0, 0, 30, 40), "Уж", 0.98),
-                    RecognizedWord("w2", BoundingBox(35, 0, 90, 40), "очень", 0.55),
-                    RecognizedWord("w3", BoundingBox(95, 0, 130, 40), "дед", 0.95),
-                ],
-            ),
-            RecognizedLine(
-                id="l2",
-                bbox=BoundingBox(0, 50, width, 90),
-                text="на еврея",
-                words=[
-                    RecognizedWord("w4", BoundingBox(0, 50, 40, 90), "на", 0.97),
-                    RecognizedWord("w5", BoundingBox(45, 50, 120, 90), "еврея", 0.75),
-                ],
-            ),
+            RecognizedLine(id="l1", bbox=line1, text="Уж очень дед",
+                           words=words1, polygon=_quad(line1, skew=8)),
+            RecognizedLine(id="l2", bbox=line2, text="на еврея",
+                           words=words2, polygon=_quad(line2, skew=6)),
         ],
     )

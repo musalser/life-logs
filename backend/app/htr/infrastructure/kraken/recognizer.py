@@ -8,32 +8,35 @@ optional HTR backend is not installed.
 Pipeline for one page::
 
     PIL image (EXIF orientation normalized)
-      -> binarization (kraken.binarization.nlbin)
-      -> line segmentation (kraken.pageseg.segment)
+      -> line segmentation (neural bLLA, or the classical projection profile)
       -> CTC recognition (kraken.models.load_models + kraken.tasks)
 
-Two deliberate choices, both driven by the Windows deployment:
+Two deliberate choices:
 
 * Recognition models are loaded from the ``safetensors`` format (e.g. the
   multilingual PP-OCRv6 models, which cover Russian/Cyrillic handwriting).
-* Segmentation uses the classical projection-profile segmenter
-  (:mod:`kraken.pageseg`) instead of the neural bLLA segmenter, whose weights
-  ship as ``kraken/blla.mlmodel`` in the CoreML format. Loading CoreML requires
-  ``coremltools``, which publishes no Windows wheels, while ``pageseg`` only
-  needs numpy/scipy. The same applies to the Kraken ``.mlmodel`` recognition
-  format.
+* Segmentation defaults to the bundled neural bLLA model
+  (:meth:`kraken.tasks.SegmentationTaskModel.load_model`). It returns *baseline
+  polygons* that follow curved lines instead of axis-aligned boxes, which is
+  what handwritten photos of notebooks need; the classical
+  :mod:`kraken.pageseg` projection-profile segmenter remains available through
+  ``segmentation_engine='classical'`` (and as an automatic fallback). The bLLA
+  weights ship as ``kraken/blla.mlmodel`` in the CoreML container format, so
+  loading them needs ``coremltools`` — available on Linux/WSL, not on Windows.
 
 Verified against kraken 7.1.1.
 """
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import unicodedata
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from ...domain.interfaces import LexiconChecker
 from ...domain.entities import (
     BoundingBox,
     RecognitionResult,
@@ -54,6 +57,57 @@ _MODEL_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 _MODEL_CACHE_LOCK = threading.Lock()
 _RECOGNITION_LOCK = threading.Lock()
 _MAX_CACHED_MODELS = 4
+
+# Character language models are tens of megabytes; the last few paths are kept.
+_LM_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_MAX_CACHED_LMS = 2
+
+
+def _loaded_language_model(path: str | None):
+    """Load (and cache) a character language model, or None when unavailable."""
+    if not path:
+        return None
+    target = Path(path)
+    try:
+        stat = target.stat()
+    except OSError:
+        logger.warning("HTR decoding: no language model at %s, using greedy decoding", path)
+        return None
+    key = (str(target.resolve()), stat.st_mtime_ns, stat.st_size)
+    with _MODEL_CACHE_LOCK:
+        cached = _LM_CACHE.get(key)
+        if cached is not None:
+            _LM_CACHE.move_to_end(key)
+            return cached
+    try:
+        from ..lm.char_ngram import CharNGram
+
+        model = CharNGram.load(target)
+    except Exception as exc:
+        logger.warning("HTR decoding: cannot load %s (%s), using greedy decoding", path, exc)
+        return None
+    with _MODEL_CACHE_LOCK:
+        _LM_CACHE[key] = model
+        while len(_LM_CACHE) > _MAX_CACHED_LMS:
+            _LM_CACHE.popitem(last=False)
+    logger.info("HTR decoding: language model %s (order %s) loaded", path, model.order)
+    return model
+
+# The bundled bLLA segmentation model is a singleton: loading it is expensive
+# and it is stateless, unlike the recognition nets.
+_SEGMENTATION_MODEL: Any = None
+_SEGMENTATION_MODEL_LOCK = threading.Lock()
+
+
+def _segmentation_model():
+    global _SEGMENTATION_MODEL
+    with _SEGMENTATION_MODEL_LOCK:
+        if _SEGMENTATION_MODEL is None:
+            from kraken.tasks import SegmentationTaskModel
+
+            logger.info("Loading the default bLLA line segmentation model")
+            _SEGMENTATION_MODEL = SegmentationTaskModel.load_model()
+        return _SEGMENTATION_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -108,42 +162,394 @@ def polygon_bbox(polygon: Sequence) -> BoundingBox | None:
     return BoundingBox(min(xs), min(ys), max(xs), max(ys))
 
 
-def words_from_record(record: Any, line_id: str) -> list[RecognizedWord]:
+def polygon_points(polygon: Sequence) -> list[tuple[int, int]] | None:
+    """Normalize a kraken polygon into a list of integer points.
+
+    Returns None for baseline-style ``(x_start, x_end)`` cuts, which carry no
+    vertical extent and therefore cannot be rendered as a shape.
+    """
+    if polygon is None:
+        return None
+    points = list(polygon)
+    if len(points) < 3 or isinstance(points[0], (int, float)):
+        return None
+    try:
+        return [(int(round(point[0])), int(round(point[1]))) for point in points]
+    except (TypeError, IndexError):
+        return None
+
+
+def line_polygon(record: Any) -> list[tuple[int, int]] | None:
+    """Bounding polygon of the line a record belongs to (baseline models)."""
+    boundary = getattr(record, "boundary", None)
+    points = polygon_points(boundary) if boundary else None
+    if points:
+        return points
+    baseline = getattr(record, "baseline", None)
+    return polygon_points(baseline) if baseline else None
+
+
+# ---------------------------------------------------------------------------
+# Gluing split-off line pieces back together before recognition
+# ---------------------------------------------------------------------------
+
+def baseline_ends(line: Any) -> tuple[float, float, float, float] | None:
+    """(x_start, y_start, x_end, y_end) of a line's baseline, left to right."""
+    baseline = getattr(line, "baseline", None)
+    if not baseline or len(baseline) < 2:
+        return None
+    start, end = baseline[0], baseline[-1]
+    x0, y0 = float(start[0]), float(start[1])
+    x1, y1 = float(end[0]), float(end[1])
+    if x0 > x1:  # right-to-left text: normalize so callers can assume lr
+        x0, y0, x1, y1 = x1, y1, x0, y0
+    return x0, y0, x1, y1
+
+
+def line_height(line: Any) -> float | None:
+    boundary = getattr(line, "boundary", None)
+    if boundary and len(boundary) >= 3:
+        ys = [float(point[1]) for point in boundary]
+        height = max(ys) - min(ys)
+        if height > 0:
+            return height
+    return None
+
+
+def unit_direction(points: Sequence, at_end: bool) -> tuple[float, float] | None:
+    """Unit vector of the baseline near its start or end (local slope)."""
+    if not points or len(points) < 2:
+        return None
+    a, b = (points[-2], points[-1]) if at_end else (points[0], points[1])
+    dx, dy = float(b[0]) - float(a[0]), float(b[1]) - float(a[1])
+    norm = math.hypot(dx, dy)
+    if norm == 0:
+        return None
+    return dx / norm, dy / norm
+
+
+def estimate_pitch(baselines: list[list]) -> float | None:
+    """Rough distance between two consecutive text lines.
+
+    Boundary heights are a bad scale here: the outline of a wavy line can be
+    taller than the line pitch. The span of all baseline midpoints divided by
+    the number of gaps is stable and needs no image dimensions.
+    """
+    mids = sorted(
+        (float(points[0][1]) + float(points[-1][1])) / 2
+        for points in baselines
+        if len(points) >= 2
+    )
+    if len(mids) < 4:
+        return None
+    span = mids[-1] - mids[0]
+    if span <= 0:
+        return None
+    return span / (len(mids) - 1)
+
+
+def is_continuation(
+    first: Sequence | None,
+    second: Sequence | None,
+    scale: float,
+    gap_factor: float = 1.5,
+    perp_factor: float = 0.5,
+    overlap_factor: float = 0.5,
+    angle_factor: float = 0.5,
+) -> bool:
+    """True when two baselines are pieces of the same physical line.
+
+    The segmenter occasionally detaches the first word of a line into its own
+    record. The connecting vector between the two pieces then runs *along* the
+    baseline (small perpendicular component). A genuinely following line is
+    offset *across* the baseline by about one line pitch, so its perpendicular
+    component is large — even on a strongly slanted page, where comparing raw
+    ``y`` values alone would wrongly glue lines together.
+
+    ``scale`` is the line pitch (see :func:`estimate_pitch`), not the glyph
+    height.
+    """
+    first_points = list(first or [])
+    second_points = list(second or [])
+    if len(first_points) < 2 or len(second_points) < 2:
+        return False
+    if first_points[-1][0] > second_points[0][0]:
+        first_points, second_points = second_points, first_points
+
+    direction = unit_direction(first_points, at_end=True)
+    if direction is None:
+        return False
+
+    ax, ay = float(first_points[-1][0]), float(first_points[-1][1])
+    bx, by = float(second_points[0][0]), float(second_points[0][1])
+    vx, vy = bx - ax, by - ay
+    along = vx * direction[0] + vy * direction[1]
+    perpendicular = abs(vx * direction[1] - vy * direction[0])
+
+    if perpendicular > perp_factor * scale:
+        return False
+    if along > gap_factor * scale or along < -overlap_factor * scale:
+        return False
+
+    other = unit_direction(second_points, at_end=False)
+    if other is not None and abs(direction[0] * other[1] - direction[1] * other[0]) > angle_factor:
+        return False
+    return True
+
+
+def group_collinear_lines(lines: list[Any], scale: float | None = None) -> list[list[int]]:
+    """Group indices of segments that form one line (union-find over geometry).
+
+    ``scale`` is the line pitch; it is estimated from the baselines when not
+    given (tests pass it explicitly).
+    """
+    baselines = [list(getattr(line, "baseline", None) or []) for line in lines]
+    if not scale:
+        scale = estimate_pitch(baselines)
+    if not scale:
+        return [[index] for index in range(len(lines))]
+
+    parent = list(range(len(lines)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(lines)):
+        for j in range(i + 1, len(lines)):
+            if is_continuation(baselines[i], baselines[j], scale):
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[max(root_i, root_j)] = min(root_i, root_j)
+
+    groups: dict[int, list[int]] = {}
+    for index in range(len(lines)):
+        groups.setdefault(find(index), []).append(index)
+    return list(groups.values())
+
+
+def merge_collinear_lines(lines: list[Any], scale: float | None = None) -> list[Any]:
+    """Glue split-off pieces back together, keeping the reading order.
+
+    This runs *before* recognition so the model sees the whole line; merging
+    afterwards would only hide the split. A merged record keeps the position of
+    its earliest piece.
+    """
+    groups = group_collinear_lines(lines, scale)
+    if all(len(group) == 1 for group in groups):
+        return list(lines)
+
+    from copy import copy
+
+    merged: list[Any] = []
+    for group in groups:
+        if len(group) == 1:
+            merged.append(lines[group[0]])
+            continue
+        pieces = sorted(
+            (lines[index] for index in group),
+            key=lambda line: baseline_ends(line)[0],
+        )
+        baseline = [
+            (int(round(point[0])), int(round(point[1])))
+            for piece in pieces
+            for point in (piece.baseline or [])
+        ]
+        boundary = merged_boundary(pieces, baseline)
+        logger.info(
+            "HTR segmentation: merged %s segment(s) into one line (%s..%s)",
+            len(pieces), baseline[0][0] if baseline else "?", baseline[-1][0] if baseline else "?",
+        )
+        merged_line = copy(pieces[0])
+        merged_line.baseline = baseline
+        merged_line.boundary = boundary
+        merged.append(merged_line)
+    return merged
+
+
+def merged_boundary(
+    pieces: list[Any], baseline: list[tuple[int, int]]
+) -> list[tuple[int, int]] | None:
+    """Convex hull of the pieces' outlines, with a quad as a safety net."""
+    points = [
+        (float(point[0]), float(point[1]))
+        for piece in pieces
+        for point in (getattr(piece, "boundary", None) or [])
+    ]
+    if points:
+        from shapely.geometry import MultiPoint
+
+        hull = MultiPoint(points).convex_hull
+        if hull.geom_type == "Polygon":
+            return [(int(round(x)), int(round(y))) for x, y in hull.exterior.coords]
+    heights = sorted(h for h in (line_height(piece) for piece in pieces) if h)
+    if not heights or not baseline:
+        return getattr(pieces[0], "boundary", None)
+    half = heights[len(heights) // 2] / 2
+    (x0, y0), (x1, y1) = baseline[0], baseline[-1]
+    return [
+        (int(round(x0)), int(round(y0 - half))),
+        (int(round(x1)), int(round(y1 - half))),
+        (int(round(x1)), int(round(y1 + half))),
+        (int(round(x0)), int(round(y0 + half))),
+        (int(round(x0)), int(round(y0 - half))),
+    ]
+
+
+def words_from_record(
+    record: Any, line_id: str, text: str | None = None
+) -> list[RecognizedWord]:
     """Words of a kraken OCR record, derived from its per-character geometry.
 
-    Kraken yields one text plus per-character cuts/confidences per line; the word
-    layer used by the editor and by training is rebuilt here by slicing the
-    record on whitespace boundaries.
+    Kraken yields one text plus per-character cuts per line; the word layer used
+    by the editor is rebuilt here by slicing that text on whitespace.
+
+    The cut of a single code point is a *position* on the line (the CTC
+    alignment puts most characters at ``[d, d]``), not a box. Slicing the record
+    over a one-character span therefore yields a zero-width section with the
+    full line height — which is what used to draw single-letter words (``я``,
+    ``о``, ``у``) as thin vertical slivers. A word is instead cut from the start
+    of its first code point to the start of the code point *after* it (or to the
+    end of the line for the last word), which is the word's real extent.
     """
-    text = record.prediction or ""
+    predicted = record.prediction or ""
+    # a beam-search text may differ from what kraken decoded; the per-character
+    # geometry still describes the greedy path, so it is only reused when the
+    # two tokenizations have the same shape (see below)
+    text = predicted if text is None else text
     if not text.strip():
         return []
-    cuts = list(getattr(record, "cuts", []) or [])
-    if len(cuts) != len(text):
+    if len(getattr(record, "cuts", ()) or ()) != len(predicted):
         # multi-codepoint labels: per-character geometry is not aligned
         logger.warning(
             "Skipping word geometry for line %s: %s cuts for %s code points",
-            line_id, len(cuts), len(text),
+            line_id, len(getattr(record, "cuts", ()) or ()), len(predicted),
         )
         return []
+
+    spans = word_spans(text)
+    if text != predicted and len(spans) != len(word_spans(predicted)):
+        # the decoder changed the number of words: the boxes no longer describe
+        # the transcription the user will read, so no boxes are claimed at all
+        logger.info(
+            "Line %s: word count changed (%s -> %s), dropping word geometry",
+            line_id, len(word_spans(predicted)), len(spans),
+        )
+        return []
+
     words: list[RecognizedWord] = []
-    for order, (start, end) in enumerate(word_spans(text)):
-        try:
-            token, cut, confidence = record[start:end]
-        except Exception:  # pragma: no cover - defensive
+    for order, (start, end) in enumerate(spans):
+        geometry = word_cut(record, start, end)
+        if geometry is None:
             continue
-        bbox = polygon_bbox(cut)
+        points, confidence = geometry
+        bbox = polygon_bbox(points)
         if bbox is None:
             continue
         words.append(
             RecognizedWord(
                 id=f"{line_id}:{order}",
                 bbox=bbox,
-                text=normalize_text(token),
-                confidence=float(confidence),
+                text=normalize_text(text[start:end]),
+                confidence=confidence,
+                polygon=polygon_points(points),
             )
         )
     return words
+
+
+def word_cut(
+    record: Any, start: int, end: int
+) -> tuple[list, float | None] | None:
+    """Polygon and mean confidence of the code points ``[start, end)``.
+
+    Prefers the exact section between the span's outer cut positions; falls back
+    to kraken's own slicing (which degenerates for single code points) when the
+    record does not expose them.
+    """
+    cut = _section_between(record, start, end)
+    if cut is None:
+        try:
+            _, fallback_cut, confidence = record[start:end]
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if not polygon_points(fallback_cut):
+            return None
+        return list(fallback_cut), float(confidence)
+    confidence = _mean_confidence(record, start, end)
+    return cut, confidence
+
+
+#: the outline of a line converges to a point at its very end, so a section
+#: ending exactly there is a triangle; the end is pulled back in these steps
+#: until the right edge is a real one again
+TAIL_STEP = 2.0
+TAIL_LIMIT = 40.0
+
+
+def _section_between(record: Any, start: int, end: int) -> list | None:
+    """Line polygon section between the outer cuts of a span."""
+    cuts = getattr(record, "_cuts", None)
+    baseline = getattr(record, "baseline", None)
+    boundary = getattr(record, "boundary", None)
+    if not cuts or not baseline or not boundary or len(cuts) != len(record.prediction or ""):
+        return None
+    try:
+        start_offset = float(cuts[start][0])
+        if end < len(cuts):
+            end_offset = float(cuts[end][0])
+            if end_offset <= start_offset:
+                return None
+            return _line_section(baseline, boundary, start_offset, end_offset)
+
+        # last word of the line: run to the end of the baseline
+        length = float(getattr(record, "_bl_length", 0.0) or 0.0)
+        if length <= start_offset:
+            return None
+        best = _line_section(baseline, boundary, start_offset, length)
+        if best is None or _has_real_right_edge(best):
+            return best
+        back = TAIL_STEP
+        while back <= TAIL_LIMIT:
+            candidate = _line_section(baseline, boundary, start_offset, length - back)
+            if candidate is not None and _has_real_right_edge(candidate):
+                return candidate
+            back += TAIL_STEP
+        return best
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Falling back to slice geometry: %s", exc)
+        return None
+
+
+def _line_section(baseline: Sequence, boundary: Sequence, start: float, end: float) -> list | None:
+    from kraken.lib.segmentation import compute_polygon_section
+
+    return list(compute_polygon_section(baseline, boundary, start, end))
+
+
+def _has_real_right_edge(points: Sequence) -> bool:
+    """False when the section tapers to a point at the end of the line."""
+    if len(points) != 4:
+        return True
+    right = math.hypot(
+        float(points[3][0]) - float(points[2][0]), float(points[3][1]) - float(points[2][1])
+    )
+    left = math.hypot(
+        float(points[1][0]) - float(points[0][0]), float(points[1][1]) - float(points[0][1])
+    )
+    return right >= 0.5 * left
+
+
+def _mean_confidence(record: Any, start: int, end: int) -> float | None:
+    values: list[float] = []
+    for index in range(start, end):
+        try:
+            values.append(float(record[index][2]))
+        except Exception:  # pragma: no cover - defensive
+            return None
+    return sum(values) / len(values) if values else None
 
 
 def line_bbox(record: Any) -> BoundingBox | None:
@@ -183,6 +589,32 @@ def lightning_device(device: str) -> tuple[str, Any]:
     return value, "auto"
 
 
+def gpu_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:  # pragma: no cover - torch missing/broken
+        return False
+
+
+def available_lightning_device(device: str) -> tuple[str, Any]:
+    """Like :func:`lightning_device`, but never asks for a GPU that is absent.
+
+    A configured ``cuda:0`` on a machine (or a process) without a usable CUDA
+    backend used to abort recognition with *"No supported gpu backend found!"*.
+    Falling back to the CPU keeps the feature working; the caller logs it.
+    """
+    accelerator, devices = lightning_device(device)
+    if accelerator in ("gpu", "cuda") and not gpu_available():
+        logger.warning(
+            "HTR: device %r has no usable CUDA backend in this process; using CPU instead",
+            device,
+        )
+        return "cpu", "auto"
+    return accelerator, devices
+
+
 # ---------------------------------------------------------------------------
 # Recognizer
 # ---------------------------------------------------------------------------
@@ -199,6 +631,14 @@ class KrakenRecognizer(HTRRecognizer):
         maxcolseps: int = 2,
         no_hlines: bool = True,
         temperature: float = 1.0,
+        segmentation_engine: str = "neural",
+        merge_lines: bool = True,
+        return_logits: bool = False,
+        decoder: str = "greedy",
+        lm_path: str | None = None,
+        beam_config: Any | None = None,
+        lexicon_path: str | None = None,
+        min_lm_text_chars: int = 0,
     ):
         self.device = device
         self.batch_size = batch_size
@@ -208,10 +648,31 @@ class KrakenRecognizer(HTRRecognizer):
         self.maxcolseps = maxcolseps
         self.no_hlines = no_hlines
         self.temperature = temperature
+        # 'neural' = bundled bLLA model (baseline polygons that follow curved
+        # lines), 'classical' = projection-profile segmenter (straight boxes)
+        self.segmentation_engine = segmentation_engine
+        # glue a detached first word back onto its line before recognition
+        self.merge_lines = merge_lines
+        # 'greedy' = kraken's own decoder; 'beam' = prefix beam search with a
+        # character language model and an optional lexicon bonus
+        self.decoder = (decoder or "greedy").strip().lower()
+        self.lm_path = lm_path
+        self.beam_config = beam_config
+        self.lexicon_path = lexicon_path
+        self.min_lm_text_chars = max(0, int(min_lm_text_chars))
+        # the beam decoder needs the probability matrix *before* kraken's own
+        # greedy decoder, so logits are requested whenever it is active
+        self.return_logits = return_logits or self.decoder == "beam"
 
     # ------------------------------------------------------------------
 
-    def recognize(self, image_path: str, model_path: str) -> RecognitionResult:
+    def recognize(
+        self,
+        image_path: str,
+        model_path: str,
+        author_id: int | None = None,
+        word_checker: LexiconChecker | None = None,
+    ) -> RecognitionResult:
         model_file = Path(model_path)
         if not model_file.is_file():
             raise RecognitionError(
@@ -228,14 +689,15 @@ class KrakenRecognizer(HTRRecognizer):
         try:
             with _RECOGNITION_LOCK:
                 model, config = self._prepared_model(model_file)
-                segmentation = self._segment(image)
+                decoder = self._build_decoder(model, author_id, word_checker)
+                segmentation = self._merge_split_lines(self._segment(image))
                 if not segmentation.lines:
                     raise RecognitionError(
                         "No text lines were found on the page; check the scan "
                         "orientation and quality"
                     )
                 records = list(model.predict(image, segmentation))
-            result = self._to_result(image.size, records)
+            result = self._to_result(image.size, records, decoder)
         except RecognitionError:
             raise
         except Exception as exc:
@@ -251,7 +713,133 @@ class KrakenRecognizer(HTRRecognizer):
 
     # ------------------------------------------------------------------
 
+    def _build_decoder(
+        self,
+        model: Any,
+        author_id: int | None,
+        word_checker: LexiconChecker | None = None,
+    ):
+        """Beam-search decoder with the language model of this author, or None.
+
+        ``word_checker`` is the vocabulary of this author as the application
+        layer sees it (general dictionary *plus* their own confirmed words and
+        knowledge terms); the word bonus uses it to prefer words the user has
+        already used. Without one the general dictionary alone is used, and
+        without that the beam simply runs with no lexicon bonus at all.
+        """
+        if self.decoder != "beam":
+            return None
+        lm = _loaded_language_model(self._lm_for(author_id))
+        if lm is None:
+            return None
+        min_chars = int(self.min_lm_text_chars)
+        running_chars = int(lm.meta.get("running_text_chars", 0) or 0)
+        if lm.char_id(" ") == 0 or running_chars < min_chars:
+            # A model built from bare word forms knows letters but not what
+            # follows a space: measured, it turned WER 0.30 into 0.95, and with
+            # a few hundred characters of real text it is still a coin flip.
+            # Below the threshold greedy decoding is the safer choice.
+            logger.warning(
+                "HTR decoding: language model %s has too little running text "
+                "(%s characters, need %s), keeping greedy decoding",
+                self.lm_path, running_chars, min_chars,
+            )
+            return None
+        from .beam import BeamSearchConfig, PrefixBeamSearch
+
+        config = self.beam_config or BeamSearchConfig()
+
+        def known(word: str) -> bool:
+            checker = word_checker or self._file_lexicon_checker()
+            if checker is None:
+                return False
+            # the beam works on the decomposed text the codec emits, the
+            # dictionary on the composed text the user sees
+            return checker.is_known(unicodedata.normalize("NFC", word))
+
+        return PrefixBeamSearch(codec=model.codec, lm=lm, config=config, known_word=known)
+
+    def _file_lexicon_checker(self):
+        """Fallback vocabulary: the dictionary file alone, no author words."""
+        if not self.lexicon_path:
+            return None
+        try:
+            from ..lexicon import LayeredLexiconChecker, load_file_lexicon
+
+            lexicon = load_file_lexicon(self.lexicon_path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("HTR decoding: lexicon %s unusable: %s", self.lexicon_path, exc)
+            return None
+        if not lexicon.is_available:
+            return None
+        return LayeredLexiconChecker(base=lexicon)
+
+    def _lm_for(self, author_id: int | None) -> str | None:
+        """Author-specific language model when one was built, else the general one."""
+        if author_id is not None and self.lm_path:
+            candidate = Path(self.lm_path).with_name(f"author_{author_id}_char_lm.npz")
+            if candidate.is_file():
+                return str(candidate)
+        return self.lm_path
+
+    @staticmethod
+    def _decoded_text(record: Any, decoder, greedy: str, line_id: str) -> str:
+        """Beam-search text of a line, falling back to kraken's own decoding."""
+        logits = getattr(record, "logits", None)
+        if logits is None:
+            logger.warning(
+                "Line %s: no CTC matrix on the record, keeping the greedy text", line_id
+            )
+            return greedy
+        try:
+            import numpy as np
+
+            matrix = np.asarray(logits.detach().cpu(), dtype=np.float32)
+            return normalize_text(decoder.decode(matrix) or greedy)
+        except Exception as exc:  # pragma: no cover - the decoder must not break recognition
+            logger.warning("Line %s: beam search failed (%s), keeping greedy", line_id, exc)
+            return greedy
+
     def _segment(self, image):
+        if self.segmentation_engine == "neural":
+            try:
+                return self._neural_segment(image)
+            except Exception as exc:
+                logger.warning(
+                    "Neural line segmentation unavailable (%s); falling back to the "
+                    "classical projection-profile segmenter", exc,
+                )
+        return self._classical_segment(image)
+
+    def _merge_split_lines(self, segmentation):
+        """Re-join segments that the segmenter split off the same line."""
+        if not self.merge_lines:
+            return segmentation
+        lines = list(getattr(segmentation, "lines", None) or [])
+        if len(lines) < 2 or not all(getattr(line, "baseline", None) for line in lines):
+            return segmentation
+        merged = merge_collinear_lines(lines)
+        if len(merged) == len(lines):
+            return segmentation
+        from dataclasses import replace
+
+        return replace(segmentation, lines=merged)
+
+    def _neural_segment(self, image):
+        """Bundled bLLA model: polygons and baselines that follow curved lines."""
+        from kraken.configs import SegmentationInferenceConfig
+        from kraken.tasks import SegmentationTaskModel
+
+        model = _segmentation_model()
+        accelerator, devices = available_lightning_device(self.device)
+        config = SegmentationInferenceConfig(
+            accelerator=accelerator,
+            device=devices,
+            text_direction=self.text_direction,
+        )
+        return model.predict(image, config)
+
+    def _classical_segment(self, image):
         from kraken.binarization import nlbin
         from kraken.pageseg import segment
 
@@ -274,6 +862,7 @@ class KrakenRecognizer(HTRRecognizer):
             self.padding,
             self.num_line_workers,
             self.temperature,
+            self.return_logits,
         )
         with _MODEL_CACHE_LOCK:
             cached = _MODEL_CACHE.get(key)
@@ -303,7 +892,7 @@ class KrakenRecognizer(HTRRecognizer):
                 "for segmentation?)"
             )
         task = RecognitionTaskModel(models)
-        accelerator, devices = lightning_device(self.device)
+        accelerator, devices = available_lightning_device(self.device)
         config = RecognitionInferenceConfig(
             accelerator=accelerator,
             device=devices,
@@ -311,6 +900,7 @@ class KrakenRecognizer(HTRRecognizer):
             padding=self.padding,
             num_line_workers=self.num_line_workers,
             temperature=self.temperature,
+            return_logits=self.return_logits,
         )
         net = task.net
         net.prepare_for_inference(config)
@@ -341,8 +931,13 @@ class KrakenRecognizer(HTRRecognizer):
 
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _to_result(page_size: tuple[int, int], records: Iterable[Any]) -> RecognitionResult:
+    @classmethod
+    def _to_result(
+        cls,
+        page_size: tuple[int, int],
+        records: Iterable[Any],
+        decoder: "PrefixBeamSearch | None" = None,
+    ) -> RecognitionResult:
         lines: list[RecognizedLine] = []
         for order, record in enumerate(records):
             line_id = str(order)
@@ -350,12 +945,17 @@ class KrakenRecognizer(HTRRecognizer):
             if bbox is None:
                 logger.warning("Skipping line %s: no bounding box in record", line_id)
                 continue
+            greedy = normalize_text(record.prediction or "")
+            text = greedy
+            if decoder is not None:
+                text = cls._decoded_text(record, decoder, greedy, line_id)
             lines.append(
                 RecognizedLine(
                     id=line_id,
                     bbox=bbox,
-                    text=normalize_text(record.prediction or ""),
-                    words=words_from_record(record, line_id),
+                    text=text,
+                    words=words_from_record(record, line_id, text=text),
+                    polygon=line_polygon(record),
                 )
             )
         if not lines:

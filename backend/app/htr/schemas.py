@@ -73,22 +73,47 @@ class WordResponse(BaseModel):
     id: int
     order: int
     bbox: BoundingBoxSchema
+    # [[x, y], ...] outline following the baseline; None for box-only results
+    polygon: list[list[int]] | None = None
     predicted_text: str | None
     corrected_text: str | None
     effective_text: str | None
     confidence: float | None
     confidence_level: str
+    # vocabulary check: None when no dictionary is installed / nothing to check
+    in_lexicon: bool | None = None
+
+
+class SuggestionChangeSchema(BaseModel):
+    """One word the model would replace, with its dictionary verdict."""
+
+    before: str
+    after: str
+    # False = the new word is in no dictionary; None = nothing to check against
+    in_lexicon: bool | None = None
 
 
 class LineResponse(BaseModel):
     id: int
     order: int
     bbox: BoundingBoxSchema
+    polygon: list[list[int]] | None = None
     predicted_text: str | None
     corrected_text: str | None
+    # who wrote corrected_text: the user (accepting a proposal is their call)
+    corrected_by: str | None = None
     effective_text: str | None
     words_stale: bool
     words: list[WordResponse]
+    # model proposal, kept apart from the transcription
+    suggested_text: str | None = None
+    suggested_by: str | None = None
+    suggestion_changes: list[SuggestionChangeSchema] = []
+    # every change is confirmed by the dictionary -> safe to accept in bulk
+    suggestion_verified: bool = False
+    # words of the transcription that are missing from the dictionary
+    oov_count: int = 0
+    oov_words: list[str] = []
 
 
 class ConfidenceThresholdsResponse(BaseModel):
@@ -110,11 +135,30 @@ class PageResponse(BaseModel):
     prediction_wer: float | None
     confidence_thresholds: ConfidenceThresholdsResponse
     lines: list[LineResponse]
+    # vocabulary check over the page (empty when no dictionary is installed)
+    oov_count: int = 0
+    lexicon_available: bool = False
 
 
 class PageUploadResponse(BaseModel):
     page_id: int
     status: str
+
+
+class PageSummaryResponse(BaseModel):
+    """Sidebar row: enough to pick a page without loading its lines/words."""
+
+    page_id: int
+    author_id: int
+    status: str
+    created_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    line_count: int
+    prediction_cer: float | None = None
+    prediction_wer: float | None = None
+    # words missing from the dictionary; None when no dictionary is installed
+    oov_count: int | None = None
+    lexicon_available: bool = False
 
 
 class WordUpdateRequest(BaseModel):
@@ -158,3 +202,10 @@ class TrainingResultResponse(BaseModel):
 class PageConfirmResponse(BaseModel):
     page: PageResponse
     training: TrainingResultResponse
+
+
+class SuggestionsResponse(BaseModel):
+    """Page after a bulk accept, plus how many lines were actually taken."""
+
+    page: PageResponse
+    accepted: int

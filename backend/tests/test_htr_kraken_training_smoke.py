@@ -71,7 +71,9 @@ def test_real_fine_tuning_workflow(tmp_path):
         epochs=1,
         batch_size=2,
         validation_split=0.34,
-        backend_options={"num_workers": 0, "augment": False},
+        # freeze for one step: too short to change the result, long enough to
+        # exercise the freeze/unfreeze callback inside the real training loop
+        backend_options={"num_workers": 0, "augment": False, "freeze_backbone": 1},
     )
     output = tmp_path / "author_model.safetensors"
 
@@ -86,6 +88,7 @@ def test_real_fine_tuning_workflow(tmp_path):
     assert result.model_path.endswith(".safetensors")
     assert result.holdout_used is False
     assert result.note
+    assert result.training_metrics["freeze_backbone_steps"] == 1
     # the exported model must be loadable exactly like the recognizer loads it
     from kraken.models import load_safetensors
 
