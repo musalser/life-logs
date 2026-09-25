@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,7 @@ from ..htr.domain.errors import (
     RecognitionError,
 )
 from ..htr.schemas import (
+    WordAlternativeSchema,
     AuthorCreateRequest,
     AuthorResponse,
     BoundingBoxSchema,
@@ -36,7 +37,8 @@ from ..htr.schemas import (
     LineResponse,
     LineUpdateRequest,
     ModelVersionResponse,
-    PageConfirmResponse,
+    PageNameRequest,
+    PageOrderRequest,
     PageResponse,
     PageSummaryResponse,
     PageUploadResponse,
@@ -93,6 +95,9 @@ def _to_page_response(page: PageView) -> PageResponse:
         author_id=page.author_id,
         status=page.status.value,
         file_path=page.file_path,
+        file_name=page.file_name,
+        source_path=page.source_path,
+        order_index=page.order_index,
         width=page.width,
         height=page.height,
         created_at=page.created_at,
@@ -141,6 +146,10 @@ def _to_page_response(page: PageView) -> PageResponse:
                         effective_text=word.effective_text,
                         confidence=word.confidence,
                         confidence_level=policy.classify(word.confidence).value,
+                        alternatives=[
+                            WordAlternativeSchema(text=item.text, score=item.score)
+                            for item in word.alternatives
+                        ],
                         in_lexicon=word.in_lexicon,
                     )
                     for word in line.words
@@ -223,6 +232,7 @@ def list_authors(
 async def upload_page(
     author_id: int,
     file: UploadFile = File(...),
+    source_path: str | None = Form(default=None),
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
@@ -231,7 +241,13 @@ async def upload_page(
     _get_author(db, author_id, user)
     content = await file.read()
     try:
-        page = page_service.upload_page(user.id, author_id, file.filename or "page.png", content)
+        page = page_service.upload_page(
+            user.id,
+            author_id,
+            file.filename or "page.png",
+            content,
+            source_path=source_path,
+        )
     except CorruptImageError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return PageUploadResponse(page_id=page.id, status=page.status.value)
@@ -249,6 +265,10 @@ def _to_page_summary(summary: PageSummary) -> PageSummaryResponse:
         prediction_wer=summary.prediction_wer,
         oov_count=summary.oov_count,
         lexicon_available=summary.lexicon_available,
+        file_name=summary.file_name,
+        source_path=summary.source_path,
+        file_path=summary.file_path,
+        order_index=summary.order_index,
     )
 
 
@@ -259,10 +279,37 @@ def list_author_pages(
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
 ):
-    """Pages of one author, newest first (for the sidebar list)."""
+    """Pages of one author in their stored (draggable) order."""
     user = _get_user(db, username)
     _get_author(db, author_id, user)
     summaries = page_service.list_page_summaries(author_id)
+    return [_to_page_summary(s) for s in summaries]
+
+
+@router.put(
+    "/authors/{author_id}/pages/order",
+    response_model=list[PageSummaryResponse],
+    summary="Store the sidebar order of the author's pages",
+)
+def reorder_author_pages(
+    author_id: int,
+    request: PageOrderRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """Apply drag-and-drop order.
+
+    ``page_ids`` is the full visible order. Ids the client did not send (for
+    example a page uploaded in another tab) keep their relative order at the
+    end instead of being dropped from the list.
+    """
+    user = _get_user(db, username)
+    _get_author(db, author_id, user)
+    try:
+        summaries = page_service.reorder_pages(author_id, request.page_ids)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     return [_to_page_summary(s) for s in summaries]
 
 
@@ -396,6 +443,13 @@ def suggest_corrections(
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
+    # preflight: an unreachable Ollama must not cost a timeout per line before
+    # the page comes back unchanged
+    problem = page_service.corrector_status()
+    if problem is not None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=problem
+        )
     try:
         page = page_service.suggest_corrections(page_id)
     except PageStateError as exc:
@@ -518,6 +572,28 @@ def get_page(
     return _to_page_response(page_service.get_page(page_id))
 
 
+@router.patch(
+    "/pages/{page_id}/name",
+    response_model=PageResponse,
+    summary="Rename the displayed file name of a page",
+)
+def rename_page(
+    page_id: int,
+    request: PageNameRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    user = _get_user(db, username)
+    _get_owned_page(page_service, page_id, user)
+    file_name = request.file_name.strip()
+    if not file_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File name must not be blank"
+        )
+    return _to_page_response(page_service.rename_page(page_id, file_name))
+
+
 @router.delete(
     "/pages/{page_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -583,14 +659,23 @@ def update_line(
     return _to_page_response(page)
 
 
-@router.post("/pages/{page_id}/confirm", response_model=PageConfirmResponse)
+@router.post(
+    "/pages/{page_id}/confirm",
+    response_model=PageResponse,
+    summary="Confirm the page as ground truth (does not trigger training)",
+)
 def confirm_page(
     page_id: int,
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
-    training_service: HandwritingTrainingService = Depends(get_training_service),
 ):
+    """Marks the page as confirmed ground truth and measures its prediction error.
+
+    Training is deliberately *not* started here: confirming several pages in a
+    row must not pay for a fine-tune each time. The client calls
+    ``POST /htr/authors/{author_id}/train`` when it wants a new model version.
+    """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
     try:
@@ -599,13 +684,7 @@ def confirm_page(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except PageStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    # Synchronous for the first stage; the training service is HTTP-agnostic
-    # and can later be dispatched to a background worker unchanged.
-    training_result = training_service.train_author(page.author_id)
-    return PageConfirmResponse(
-        page=_to_page_response(page),
-        training=_to_training_response(training_result),
-    )
+    return _to_page_response(page)
 
 
 # ---------------------------------------------------------------------------

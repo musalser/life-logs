@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from ...models import HTRLine, HTRPage, HTRSuggestionEvent, HTRWord
 from ..domain.entities import (
+    WordAlternative,
     BoundingBox,
     LineView,
     PageStatus,
@@ -42,6 +43,40 @@ def _dump_polygon(points) -> str | None:
     return json.dumps([[int(x), int(y)] for x, y in points])
 
 
+def _load_alternatives(raw: str | None) -> list[WordAlternative]:
+    """Other readings of a word, tolerant to anything unexpected in the column."""
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    loaded: list[WordAlternative] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        try:
+            score = float(item.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        loaded.append(WordAlternative(text=text, score=score))
+    return loaded
+
+
+def _dump_alternatives(items) -> str | None:
+    if not items:
+        return None
+    return json.dumps(
+        [{"text": item.text, "score": round(float(item.score), 4)} for item in items],
+        ensure_ascii=False,
+    )
+
+
 def _to_word_view(word: HTRWord) -> WordView:
     return WordView(
         id=word.id,
@@ -51,6 +86,7 @@ def _to_word_view(word: HTRWord) -> WordView:
         confidence=word.confidence,
         corrected_text=word.corrected_text,
         polygon=_load_polygon(word.polygon),
+        alternatives=_load_alternatives(word.alternatives),
     )
 
 
@@ -84,6 +120,9 @@ def _to_page_view(page: HTRPage) -> PageView:
         recognition_model_version_id=page.recognition_model_version_id,
         prediction_cer=page.prediction_cer,
         prediction_wer=page.prediction_wer,
+        file_name=getattr(page, "file_name", None),
+        source_path=getattr(page, "source_path", None),
+        order_index=int(getattr(page, "order_index", 0) or 0),
         lines=[_to_line_view(l) for l in page.lines],
     )
 
@@ -119,12 +158,29 @@ class SqlAlchemyPageRepository:
     # ------------------------------------------------------------------
 
     def create_page(
-        self, user_id: int, author_id: int, file_path: str, width: int, height: int
+        self,
+        user_id: int,
+        author_id: int,
+        file_path: str,
+        width: int,
+        height: int,
+        file_name: str | None = None,
+        source_path: str | None = None,
     ) -> PageView:
+        # new pages go to the end of the author's list; the sidebar order is the
+        # user's from then on, so upload order survives a multi-file upload
+        highest = (
+            self.db.query(func.max(HTRPage.order_index))
+            .filter(HTRPage.author_id == author_id)
+            .scalar()
+        )
         page = HTRPage(
             user_id=user_id,
             author_id=author_id,
             file_path=file_path,
+            file_name=file_name,
+            source_path=source_path,
+            order_index=int(highest) + 1 if highest is not None else 0,
             status=PageStatus.UPLOADED.value,
             width=width,
             height=height,
@@ -158,7 +214,8 @@ class SqlAlchemyPageRepository:
             .outerjoin(HTRLine, HTRLine.page_id == HTRPage.id)
             .filter(HTRPage.author_id == author_id)
             .group_by(HTRPage.id)
-            .order_by(HTRPage.id.desc())
+            # manual order first; id is only the tie-breaker of legacy rows
+            .order_by(HTRPage.order_index.asc(), HTRPage.id.asc())
             .all()
         )
         return [
@@ -172,9 +229,38 @@ class SqlAlchemyPageRepository:
                 line_count=int(line_count or 0),
                 prediction_cer=page.prediction_cer,
                 prediction_wer=page.prediction_wer,
+                file_name=getattr(page, "file_name", None),
+                source_path=getattr(page, "source_path", None),
+                order_index=int(getattr(page, "order_index", 0) or 0),
             )
             for page, line_count in rows
         ]
+
+    def reorder_pages(self, author_id: int, page_ids: list[int]) -> list[PageSummary]:
+        pages = self.db.query(HTRPage).filter(HTRPage.author_id == author_id).all()
+        by_id = {page.id: page for page in pages}
+        for page_id in page_ids:
+            if page_id not in by_id:
+                raise NotFoundError(f"Page {page_id} not found for author {author_id}")
+        ordered = [by_id[page_id] for page_id in page_ids]
+        seen = {page.id for page in ordered}
+        remaining = sorted(
+            (page for page in pages if page.id not in seen),
+            key=lambda page: (page.order_index, page.id),
+        )
+        for index, page in enumerate(ordered + remaining):
+            page.order_index = index
+        self.db.commit()
+        return self.list_page_summaries(author_id)
+
+    def rename_page(self, page_id: int, file_name: str) -> PageView:
+        page = self._get_orm_page(page_id)
+        page.file_name = file_name
+        # a manually chosen name is canonical; the client-side path it came from
+        # no longer describes the page
+        page.source_path = None
+        self.db.commit()
+        return _to_page_view(page)
 
     def get_confirmed_pages(self, author_id: int) -> list[PageView]:
         pages = (
@@ -221,6 +307,7 @@ class SqlAlchemyPageRepository:
                         predicted_text=rec_word.text,
                         confidence=rec_word.confidence,
                         polygon=_dump_polygon(rec_word.polygon),
+                        alternatives=_dump_alternatives(rec_word.alternatives),
                     )
                 )
             page.lines.append(line)

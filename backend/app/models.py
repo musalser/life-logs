@@ -320,6 +320,13 @@ class HTRPage(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     author_id = Column(Integer, ForeignKey("htr_authors.id", ondelete="CASCADE"), nullable=False, index=True)
     file_path = Column(String(1024), nullable=False)
+    # the name of the uploaded file, shown in the sidebar instead of the page id;
+    # source_path keeps the client-side path when it supplied one (folder upload),
+    # so pages with equal names can be told apart by their full path
+    file_name = Column(String(1024), nullable=True)
+    source_path = Column(String(2048), nullable=True)
+    # manual order inside the author's sidebar list (ascending)
+    order_index = Column(Integer, nullable=False, default=0, server_default="0", index=True)
     # UPLOADED | RECOGNIZED | EDITING | CONFIRMED
     status = Column(String(32), nullable=False, default="UPLOADED", index=True)
     width = Column(Integer, nullable=True)
@@ -390,6 +397,9 @@ class HTRWord(Base):
     corrected_text = Column(Text, nullable=True)
     # JSON [[x, y], ...] outline of the word, following the line baseline
     polygon = Column(Text, nullable=True)
+    # JSON [{"text": ..., "score": ...}, ...] — other readings the beam
+    # considered for this word, best first (see domain.entities.WordAlternative)
+    alternatives = Column(Text, nullable=True)
 
     line = relationship("HTRLine", back_populates="words")
 
