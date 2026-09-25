@@ -11,38 +11,69 @@
           </p>
         </div>
 
-        <div class="flex flex-wrap items-center gap-2">
-          <div v-if="authors.length" class="flex items-center gap-2">
-            <span class="text-xs uppercase tracking-widest text-app-accent">Автор</span>
-            <select
-              v-model.number="authorId"
-              class="app-select min-w-[9rem]"
-              style="min-width: 9rem"
-              @change="onAuthorChange"
-            >
-              <option v-for="a in authors" :key="a.id" :value="a.id">{{ a.name }}</option>
-            </select>
-          </div>
-
-          <button type="button" class="app-ghost" @click="showAuthorForm = !showAuthorForm">
-            {{ showAuthorForm ? 'Отмена' : '+ автор' }}
-          </button>
-
+        <div class="flex flex-col items-end gap-2">
+          <!-- training is explicit: confirming a page no longer starts it -->
           <button
             type="button"
-            class="app-primary"
-            :disabled="!authorId || uploading"
-            @click="fileInput?.click()"
+            class="app-success"
+            :disabled="!authorId || trainingStarting"
+            title="Дообучить персональную модель на всех подтверждённых страницах автора"
+            @click="trainAuthor"
           >
-            {{ uploading ? 'Загрузка…' : 'Загрузить страницу' }}
+            {{ trainingStarting ? 'Обучение…' : 'Обучить модель' }}
           </button>
-          <input
-            ref="fileInput"
-            type="file"
-            accept="image/*"
-            class="hidden"
-            @change="onUpload"
-          />
+
+          <div class="flex flex-wrap items-center justify-end gap-2">
+            <div v-if="authors.length" class="flex items-center gap-2">
+              <span class="text-xs uppercase tracking-widest text-app-accent">Автор</span>
+              <select
+                v-model.number="authorId"
+                class="app-select min-w-[9rem]"
+                style="min-width: 9rem"
+                @change="onAuthorChange"
+              >
+                <option v-for="a in authors" :key="a.id" :value="a.id">{{ a.name }}</option>
+              </select>
+            </div>
+
+            <button type="button" class="app-ghost" @click="showAuthorForm = !showAuthorForm">
+              {{ showAuthorForm ? 'Отмена' : '+ автор' }}
+            </button>
+
+            <button
+              type="button"
+              class="app-primary"
+              :disabled="!authorId || uploading"
+              @click="fileInput?.click()"
+            >
+              {{ uploading ? 'Загрузка…' : 'Загрузить страницу' }}
+            </button>
+            <button
+              type="button"
+              class="app-ghost"
+              :disabled="!authorId || uploading"
+              title="Загрузить все изображения из папки — имена файлов станут названиями страниц"
+              @click="folderInput?.click()"
+            >
+              Загрузить папку
+            </button>
+            <input
+              ref="fileInput"
+              type="file"
+              accept="image/*"
+              class="hidden"
+              @change="onUpload"
+            />
+            <input
+              ref="folderInput"
+              type="file"
+              webkitdirectory
+              directory
+              multiple
+              class="hidden"
+              @change="onUpload"
+            />
+          </div>
         </div>
       </div>
 
@@ -65,7 +96,7 @@
       {{ notice }}
     </p>
 
-    <!-- training outcome after confirmation -->
+    <!-- outcome of the explicit «Обучить модель» run -->
     <section
       v-if="training"
       class="rounded-2xl border p-4"
@@ -142,21 +173,55 @@
             :key="item.page_id"
             role="button"
             tabindex="0"
-            class="w-full cursor-pointer rounded-xl border px-3 py-2 text-left transition"
-            :class="
+            :draggable="canReorder"
+            class="page-item w-full cursor-pointer rounded-xl border px-3 py-2 text-left transition"
+            :class="[
               page?.page_id === item.page_id
                 ? 'border-app-primary/70 bg-app-primary/10'
-                : 'border-app-border/40 bg-app-panel/30 hover:border-app-primary/40 hover:bg-app-panel/50'
-            "
+                : 'border-app-border/40 bg-app-panel/30 hover:border-app-primary/40 hover:bg-app-panel/50',
+              dragPageId === item.page_id ? 'page-item--dragging' : '',
+              dropTarget && dropTarget.id === item.page_id
+                ? (dropTarget.after ? 'page-item--drop-after' : 'page-item--drop-before')
+                : '',
+            ]"
             @click="selectPage(item.page_id)"
             @keydown.enter.prevent="selectPage(item.page_id)"
+            @dragstart="onPageDragStart(item, $event)"
+            @dragover.prevent="onPageDragOver(item, $event)"
+            @drop.prevent="onPageDrop(item)"
+            @dragend="onPageDragEnd"
           >
             <div class="flex items-center justify-between gap-2">
-              <p class="text-sm font-medium">Стр. #{{ item.page_id }}</p>
+              <div class="flex min-w-0 items-center gap-1.5">
+                <span
+                  v-if="canReorder"
+                  class="page-grip"
+                  title="Перетащите, чтобы изменить порядок"
+                  aria-hidden="true"
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
+                    <path d="M8 6h2v2H8V6zm6 0h2v2h-2V6zM8 11h2v2H8v-2zm6 0h2v2h-2v-2zM8 16h2v2H8v-2zm6 0h2v2h-2v-2z" />
+                  </svg>
+                </span>
+                <p class="truncate text-sm font-medium" :title="pageFullPath(item)">
+                  {{ pageLabel(item) }}
+                </p>
+              </div>
               <div class="flex items-center gap-1">
                 <span class="rounded-full px-2 py-0.5 text-[10px] font-semibold" :class="statusOf(item.status).class">
                   {{ statusOf(item.status).label }}
                 </span>
+                <button
+                  type="button"
+                  class="page-icon"
+                  title="Переименовать страницу"
+                  :disabled="renamingPageId === item.page_id"
+                  @click.stop="renamePage(item)"
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
+                    <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"></path>
+                  </svg>
+                </button>
                 <button
                   type="button"
                   class="page-delete"
@@ -170,8 +235,8 @@
                 </button>
               </div>
             </div>
-            <p class="mt-1 text-[11px] text-app-muted">
-              {{ item.line_count }} строк · {{ formatDate(item.created_at) }}
+            <p class="mt-1 truncate text-[11px] text-app-muted">
+              #{{ item.page_id }} · {{ item.line_count }} строк · {{ formatDate(item.created_at) }}
             </p>
             <p v-if="item.oov_count" class="text-[11px] text-violet-300">
               не в словаре: {{ item.oov_count }}
@@ -489,6 +554,30 @@
               </div>
             </div>
 
+            <!-- other readings the recognizer considered for the clicked word -->
+            <div
+              v-if="activeWordAlternatives(line).length"
+              class="mt-1 flex flex-wrap items-center gap-1 rounded-lg border border-app-primary/40 bg-app-primary/5 px-2 py-1"
+            >
+              <span class="text-[10px] text-app-muted">
+                {{ activeWord?.effective_text }} → варианты:
+              </span>
+              <button
+                v-for="alternative in activeWordAlternatives(line)"
+                :key="`alt-${line.id}-${alternative.text}`"
+                type="button"
+                class="rounded-full border border-app-border/60 bg-app-panel/60 px-2 py-0.5 text-[11px] hover:border-app-primary/70"
+                :disabled="readOnly"
+                :title="`Оценка строки: ${Number(alternative.score ?? 0).toFixed(1)}`"
+                @click.stop="applyAlternative(line, alternative)"
+              >
+                {{ alternative.text }}
+              </button>
+              <span class="text-[10px] text-app-muted">
+                (только то, что рассматривал декодер)
+              </span>
+            </div>
+
             <!-- dictionary misses of this line: click jumps to the word on the page -->
             <div v-if="line.oov_words?.length" class="mt-1 flex flex-wrap items-center gap-1">
               <span class="text-[10px] text-app-muted">не в словаре:</span>
@@ -534,12 +623,18 @@ const authors = ref([])
 const authorId = ref(null)
 const pages = ref([])
 const deletingPageId = ref(null)
+const renamingPageId = ref(null)
 const sortByOov = ref(false)
 const page = ref(null)
 const drafts = reactive({})
 const savingLines = reactive(new Set())
 
+// drag-and-drop ordering of the sidebar list
+const dragPageId = ref(null)
+const dropTarget = ref(null) // { id, after }
+
 const fileInput = ref(null)
+const folderInput = ref(null)
 const viewport = ref(null)
 const textareaRefs = new Map()
 
@@ -556,6 +651,7 @@ const naturalSize = ref({ width: 0, height: 0 })
 const error = ref('')
 const notice = ref('')
 const training = ref(null)
+const trainingStarting = ref(false)
 
 const showAuthorForm = ref(false)
 const newAuthorName = ref('')
@@ -656,6 +752,31 @@ const sortedPages = computed(() => {
     (a, b) => (b.oov_count ?? -1) - (a.oov_count ?? -1) || b.page_id - a.page_id
   )
 })
+
+// ------------------------------------------------------- sidebar name & order
+
+// reordering is meaningless while the list shows a computed dictionary order
+const canReorder = computed(() => !sortByOov.value && pages.value.length > 1)
+
+/** File names used by more than one page: those rows must show their full path. */
+const duplicateFileNames = computed(() => {
+  const counts = new Map()
+  for (const item of pages.value) {
+    const name = (item.file_name || '').trim().toLowerCase()
+    if (!name) continue
+    counts.set(name, (counts.get(name) || 0) + 1)
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([name]) => name))
+})
+
+const pageNameOf = (item) => (item.file_name || '').trim()
+const pageFullPath = (item) => item.source_path || item.file_path || pageNameOf(item)
+/** What the sidebar shows: the file name, or the full path when names collide. */
+const pageLabel = (item) => {
+  const name = pageNameOf(item)
+  if (!name) return `Стр. #${item.page_id}`
+  return duplicateFileNames.value.has(name.toLowerCase()) ? pageFullPath(item) : name
+}
 const pageWidth = computed(() => page.value?.width || naturalSize.value.width || 1)
 const pageHeight = computed(() => page.value?.height || naturalSize.value.height || 1)
 const totalWords = computed(() => (page.value?.lines || []).reduce((sum, l) => sum + l.words.length, 0))
@@ -952,13 +1073,123 @@ const flushPendingSaves = async () => {
   }
 }
 
+// ------------------------------------------------- sidebar order & page names
+
+/** Store the order the user dragged the sidebar into. */
+const savePageOrder = async (pageIds) => {
+  const response = await api(`/htr/authors/${authorId.value}/pages/order`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ page_ids: pageIds }),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => null)
+    throw new Error(detail?.detail || 'Не удалось сохранить порядок страниц')
+  }
+  // the server is the source of truth: it renumbers the whole list
+  pages.value = await response.json()
+}
+
+const onPageDragStart = (item, event) => {
+  if (!canReorder.value) {
+    event.preventDefault()
+    return
+  }
+  dragPageId.value = item.page_id
+  dropTarget.value = null
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(item.page_id))
+  }
+}
+
+/** Half of the row under the pointer decides before/after, as file managers do. */
+const onPageDragOver = (item, event) => {
+  if (!dragPageId.value || dragPageId.value === item.page_id) {
+    dropTarget.value = null
+    return
+  }
+  const rect = event.currentTarget.getBoundingClientRect()
+  dropTarget.value = {
+    id: item.page_id,
+    after: event.clientY > rect.top + rect.height / 2,
+  }
+}
+
+const onPageDragEnd = () => {
+  dragPageId.value = null
+  dropTarget.value = null
+}
+
+const onPageDrop = async (item) => {
+  const sourceId = dragPageId.value
+  const target = dropTarget.value
+  onPageDragEnd()
+  if (!sourceId || !target || sourceId === item.page_id) return
+
+  const next = [...pages.value]
+  const from = next.findIndex((p) => p.page_id === sourceId)
+  if (from < 0) return
+  const [moved] = next.splice(from, 1)
+  let to = next.findIndex((p) => p.page_id === target.id)
+  if (to < 0) return
+  if (target.after) to += 1
+  next.splice(to, 0, moved)
+
+  const previous = pages.value
+  pages.value = next
+  clearMessages()
+  try {
+    await savePageOrder(next.map((p) => p.page_id))
+  } catch (err) {
+    pages.value = previous
+    error.value = err.message || 'Ошибка изменения порядка страниц'
+  }
+}
+
+const renamePage = async (item) => {
+  const current = pageNameOf(item)
+  const value = prompt('Имя страницы (имя файла)', current || `Стр. #${item.page_id}`)
+  if (value === null) return
+  const name = value.trim()
+  if (!name || name === current) return
+
+  renamingPageId.value = item.page_id
+  clearMessages()
+  try {
+    const response = await api(`/htr/pages/${item.page_id}/name`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_name: name }),
+    })
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null)
+      throw new Error(detail?.detail || 'Не удалось переименовать страницу')
+    }
+    const updated = await response.json()
+    item.file_name = updated.file_name
+    // the upload path is dropped server-side; mirror that so a duplicate name
+    // is not shown as a stale full path
+    item.source_path = updated.source_path
+    if (page.value?.page_id === item.page_id) {
+      page.value.file_name = updated.file_name
+      page.value.source_path = updated.source_path
+    }
+  } catch (err) {
+    error.value = err.message || 'Ошибка переименования страницы'
+  } finally {
+    renamingPageId.value = null
+  }
+}
+
 // ---------------------------------------------------------------- actions
 
 const deletePage = async (item) => {
+  const label = pageLabel(item)
   const message =
     item.status === 'CONFIRMED'
-      ? `Удалить страницу #${item.page_id}? Она подтверждена и входит в обучающий набор — в следующих обучениях использоваться не будет. Уже обученные версии модели останутся.`
-      : `Удалить страницу #${item.page_id}? Изображение и разметка будут удалены.`
+      ? `Удалить страницу «${label}» (#${item.page_id})? Она подтверждена и входит в обучающий набор — в следующих обучениях использоваться не будет. Уже обученные версии модели останутся.`
+      : `Удалить страницу «${label}» (#${item.page_id})? Изображение и разметка будут удалены.`
   if (!confirm(message)) return
 
   deletingPageId.value = item.page_id
@@ -1013,25 +1244,51 @@ const selectPage = async (pageId) => {
   await openPage(pageId)
 }
 
+const IMAGE_FILE = /\.(png|jpe?g|tiff?|bmp|webp|gif|heic|heif)$/i
+
+/** A folder upload may pick up non-images; only images become pages. */
+const isImageFile = (file) => file.type.startsWith('image/') || IMAGE_FILE.test(file.name)
+
 const onUpload = async (event) => {
-  const file = event.target.files?.[0]
+  const files = Array.from(event.target.files || [])
   event.target.value = ''
-  if (!file || !authorId.value) return
+  if (!files.length || !authorId.value) return
   uploading.value = true
   error.value = ''
+  notice.value = ''
+  let lastPageId = null
+  let uploadedCount = 0
+  let skippedCount = 0
   try {
-    const form = new FormData()
-    form.append('file', file)
-    const response = await api(`/htr/authors/${authorId.value}/pages`, { method: 'POST', body: form })
-    if (!response.ok) {
-      const detail = await response.json().catch(() => null)
-      throw new Error(detail?.detail || 'Не удалось загрузить страницу')
+    for (const file of files) {
+      if (!isImageFile(file)) {
+        skippedCount += 1
+        continue
+      }
+      const form = new FormData()
+      form.append('file', file)
+      // a folder upload knows the full client-side path; keeping it is what
+      // lets two equal file names from different folders be told apart
+      const relative = file.webkitRelativePath || ''
+      if (relative) form.append('source_path', relative)
+      const response = await api(`/htr/authors/${authorId.value}/pages`, { method: 'POST', body: form })
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null)
+        throw new Error(detail?.detail || `Не удалось загрузить «${file.name}»`)
+      }
+      const created = await response.json()
+      lastPageId = created.page_id
+      uploadedCount += 1
     }
-    const created = await response.json()
     await loadPages(false)
-    await selectPage(created.page_id)
+    if (lastPageId != null) await selectPage(lastPageId)
+    if (skippedCount) {
+      notice.value = `Загружено страниц: ${uploadedCount}. Пропущено не-изображений: ${skippedCount}.`
+    }
   } catch (err) {
     error.value = err.message || 'Ошибка загрузки страницы'
+    // part of a folder may already be stored: show what made it
+    await loadPages(false)
   } finally {
     uploading.value = false
   }
@@ -1100,7 +1357,9 @@ const suggestWithLlm = async () => {
     const count = pendingSuggestionCount.value
     notice.value = count
       ? `Модель предложила правки в ${count} строках — распознанный текст не изменён, примите нужные.`
-      : 'Модель не предложила правок (или недоступна) — текст оставлен как есть.'
+      // an unreachable Ollama now comes back as a 503 with its own message,
+      // so this branch really means "the model had nothing to change"
+      : 'Модель не предложила правок — текст оставлен как есть.'
   } catch (err) {
     error.value = err.message || 'Ошибка обращения к модели'
   } finally {
@@ -1221,7 +1480,6 @@ const confirmPage = async () => {
   if (!page.value) return
   confirming.value = true
   clearMessages()
-  training.value = null
   try {
     await flushPendingSaves()
     const response = await api(`/htr/pages/${page.value.page_id}/confirm`, { method: 'POST' })
@@ -1229,17 +1487,41 @@ const confirmPage = async () => {
       const detail = await response.json().catch(() => null)
       throw new Error(detail?.detail || 'Не удалось подтвердить страницу')
     }
-    const payload = await response.json()
-    if (payload.page) {
-      page.value = payload.page
-      resetDrafts()
-    }
-    training.value = payload.training || null
+    // the response is the confirmed page itself: confirming never trains
+    page.value = await response.json()
+    resetDrafts()
     await loadPages(false)
   } catch (err) {
     error.value = err.message || 'Ошибка подтверждения'
   } finally {
     confirming.value = false
+  }
+}
+
+/**
+ * Fine-tune the author's model on every confirmed page.
+ *
+ * Deliberately separate from «Подтвердить страницу»: a page becomes ground
+ * truth at confirmation time, while training costs minutes and is started by
+ * the user when they want a new model version.
+ */
+const trainAuthor = async () => {
+  if (!authorId.value) return
+  trainingStarting.value = true
+  clearMessages()
+  training.value = null
+  try {
+    const response = await api(`/htr/authors/${authorId.value}/train`, { method: 'POST' })
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null)
+      throw new Error(detail?.detail || 'Не удалось запустить обучение')
+    }
+    training.value = await response.json()
+    await loadPages(false)
+  } catch (err) {
+    error.value = err.message || 'Ошибка обучения'
+  } finally {
+    trainingStarting.value = false
   }
 }
 
@@ -1317,6 +1599,40 @@ const onWordClick = async (word) => {
     const span = tokenSpan(drafts[line.id] ?? '', word.order)
     if (span) textarea.setSelectionRange(span[0], span[1])
   }
+}
+
+/** The word the user clicked last, wherever it lives on the page. */
+const activeWord = computed(() => {
+  if (!activeWordId.value) return null
+  return allWords.value.find((word) => word.id === activeWordId.value) || null
+})
+
+/** Alternative readings of the active word, if it belongs to this line. */
+const activeWordAlternatives = (line) => {
+  const word = activeWord.value
+  if (!word || !(line.words || []).some((item) => item.id === word.id)) return []
+  return word.alternatives || []
+}
+
+/**
+ * Replace the active word with one of the readings the recognizer considered.
+ * The word keeps its position, so the line's word geometry stays valid, and the
+ * new text is saved through the same path a manual edit takes.
+ */
+const applyAlternative = async (line, alternative) => {
+  if (readOnly.value || !alternative) return
+  const word = activeWord.value
+  if (!word) return
+  const text = drafts[line.id] ?? effectiveText(line)
+  const span = tokenSpan(text, word.order)
+  if (!span) return
+  const updated = text.slice(0, span[0]) + alternative.text + text.slice(span[1])
+  if (updated === text) return
+  drafts[line.id] = updated
+  clearMessages()
+  await saveLine(line)
+  // the line is re-read from the server, so its words hold the fresh state
+  activeWordId.value = null
 }
 
 const tokenSpan = (text, index) => {
@@ -1435,6 +1751,55 @@ watch(
 }
 
 .page-delete:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* --- sidebar ordering ----------------------------------------------------- */
+
+.page-item[draggable='true'] {
+  cursor: grab;
+}
+
+.page-item--dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+
+/* a line on the edge the page would land on */
+.page-item--drop-before {
+  box-shadow: inset 0 2px 0 0 rgba(99, 102, 241, 0.95);
+}
+
+.page-item--drop-after {
+  box-shadow: inset 0 -2px 0 0 rgba(99, 102, 241, 0.95);
+}
+
+.page-grip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  color: #64748b;
+  cursor: grab;
+}
+
+.page-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  padding: 0.15rem 0.25rem;
+  color: #94a3b8;
+  background: transparent;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.page-icon:hover:not(:disabled) {
+  background: rgba(99, 102, 241, 0.2);
+  color: #a5b4fc;
+}
+
+.page-icon:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }

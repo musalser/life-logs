@@ -69,6 +69,14 @@ class RecognitionResultIn(BaseModel):
 
 # -- page views ---------------------------------------------------------------
 
+class WordAlternativeSchema(BaseModel):
+    """One other reading the decoder considered for a word."""
+
+    text: str
+    #: line-level objective (log10, higher is better) the variant came from
+    score: float
+
+
 class WordResponse(BaseModel):
     id: int
     order: int
@@ -80,6 +88,9 @@ class WordResponse(BaseModel):
     effective_text: str | None
     confidence: float | None
     confidence_level: str
+    # other readings of this word from the recognition N-best, best first;
+    # empty when the page was recognized without the beam or before this existed
+    alternatives: list[WordAlternativeSchema] = []
     # vocabulary check: None when no dictionary is installed / nothing to check
     in_lexicon: bool | None = None
 
@@ -126,6 +137,12 @@ class PageResponse(BaseModel):
     author_id: int
     status: str
     file_path: str
+    #: uploaded file name (basename) shown in the sidebar
+    file_name: str | None = None
+    #: full client-side path when the upload had one
+    source_path: str | None = None
+    #: manual position in the author's list (ascending)
+    order_index: int = 0
     width: int | None
     height: int | None
     created_at: datetime | None
@@ -159,6 +176,24 @@ class PageSummaryResponse(BaseModel):
     # words missing from the dictionary; None when no dictionary is installed
     oov_count: int | None = None
     lexicon_available: bool = False
+    #: uploaded file name (basename) shown in the sidebar
+    file_name: str | None = None
+    #: full client-side path when the upload had one; None otherwise
+    source_path: str | None = None
+    #: server-side stored path, the last-resort disambiguator of equal names
+    file_path: str | None = None
+    #: manual position in the author's list (ascending)
+    order_index: int = 0
+
+
+class PageOrderRequest(BaseModel):
+    """The sidebar order the user dragged the pages into."""
+
+    page_ids: list[int] = Field(min_length=1)
+
+
+class PageNameRequest(BaseModel):
+    file_name: str = Field(min_length=1, max_length=1024)
 
 
 class WordUpdateRequest(BaseModel):
@@ -197,11 +232,6 @@ class TrainingResultResponse(BaseModel):
     lines_required: int | None = None
     words_collected: int | None = None
     words_required: int | None = None
-
-
-class PageConfirmResponse(BaseModel):
-    page: PageResponse
-    training: TrainingResultResponse
 
 
 class SuggestionsResponse(BaseModel):
