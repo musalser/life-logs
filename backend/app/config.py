@@ -54,12 +54,21 @@ class Settings(BaseSettings):
     htr_lm_path: str = "htr_storage/lm/ru_char_lm.npz"
     htr_beam_width: int = 32
     htr_beam_top_k: int = 8
-    # Weight of the language model, on a leakage-free model (built without the
-    # page being decoded): at 0.1 the page with the most text behind it goes
-    # from WER 25.5 % to 16.7 % and CER 5.6 % to 3.5 %; larger weights hurt
-    # (0.45 -> 28.7 %). The weight is low because the model knows letters and
-    # word boundaries well but has seen little running text.
-    htr_beam_alpha: float = 0.1
+    # Weight of the character language model. Re-tuned on *strict* ground truth
+    # (only lines the user actually corrected) over honest acoustic folds — each
+    # page recognized by the model that existed before its confirmation:
+    #
+    #   acoustic group   a=0.0        a=0.1 (old)   a=0.2 (new)
+    #   weak  (v2)       .1047/.3342  .0887/.2722   .0807/.2488
+    #   medium(v7-v9)    .0549/.2167  .0493/.1920   .0460/.1760
+    #   strong(v10-v12)  .0324/.1484  .0300/.1342   .0240/.1053
+    #
+    # 0.2 wins in every group — the earlier 0.1 came from a *mixed* reference
+    # (uncorrected lines compared against the previous model's own output), which
+    # systematically punishes the LM for disagreeing with it. Note that the
+    # measurement used a language model that includes the Leipzig corpus; if the
+    # corpus changes, re-run scripts/measure_htr_decoders.py --only-corrected.
+    htr_beam_alpha: float = 0.2
     htr_beam_beta: float = 0.0
     htr_beam_word_bonus: float = 0.8
     # Beam decoding needs a language model with real running text behind it;
@@ -67,6 +76,40 @@ class Settings(BaseSettings):
     # *not* bare word forms) the model cannot judge word boundaries and greedy
     # decoding is used instead.
     htr_lm_min_text_chars: int = 1000
+    # Second pass: a word-level KenLM model re-ranks the beam's N best
+    # hypotheses. Empty path (or a missing kenlm) disables it, and then decoding
+    # is single-pass exactly as before. The weight stays small on purpose: the
+    # word model is trained on general news text and pulls towards frequent
+    # words, so it may only overrule an unsure first pass (see the guard below).
+    # Second pass, measured honestly on chronological folds (8 pages, 239
+    # lines): WER 0.2101 -> 0.2082 with the weight chosen on the other pages,
+    # 0.2032 with the best weight chosen on all of them. That is +1..3 %, not
+    # the +30 % an earlier run suggested: that run scored with a word model
+    # that had the author's own pages baked in. When measuring this feature the
+    # two components MUST be pure — a KenLM interpolated model is one merged
+    # model, its halves cannot be un-mixed by re-weighting at query time.
+    # Measured on strong acoustic folds and on the unseen pages 23/24: the word
+    # model changes 0.05 % of characters there and *slightly worsens* WER
+    # (0.0763 -> 0.0789 on v13). It stays implemented and tested, but off by
+    # default; point this at the model to enable the second pass (worth
+    # re-measuring once the author has much more confirmed text).
+    htr_word_lm_path: str = ""
+    #: the word score is an average per word, the beam score a total over ~40
+    #: characters — 0.5 makes the two comparable; larger values let the word
+    #: model dominate and measured worse once the leak was removed
+    htr_rescore_weight: float = 0.5
+    htr_rescore_n: int = 10
+    #: the guard (allow a re-ranking only for an unsure top-1) is a wash on the
+    #: honest model: the guarded optimum is 0.2044 against 0.2032 unguarded, and
+    #: the leave-one-page-out selection picks unguarded on most pages. Kept as
+    #: an option, off by default.
+    htr_rescore_guard: bool = False
+    htr_rescore_min_mean_acoustic: float = -0.30
+    #: How many alternative readings to keep per recognized word for the editor
+    #: (0 = keep none). They come from the same N-best list the second pass
+    #: uses, so this costs nothing beyond the search that already runs; the
+    #: variants are only what the beam considered, not a dictionary search.
+    htr_word_alternatives: int = 5
 
     # HTR recognition (inference)
     # Device string understood by kraken/lightning: 'cpu', 'cuda:0', 'auto'.
@@ -100,6 +143,11 @@ class Settings(BaseSettings):
     #  reasoning tokens that the line-only sanitiser then rejects.
     htr_correction_model: str = "gemma3:12b"
     htr_correction_timeout_s: float = 90.0
+    # Connecting to Ollama must fail fast: a stopped Ollama (or a stale Windows
+    # host address) drops the connection silently instead of refusing it, so
+    # with one shared timeout every dead attempt cost the full 90 s of
+    # generation budget and a page took three minutes to come back empty.
+    htr_correction_connect_timeout_s: float = 5.0
     htr_correction_context_lines: int = 2
     htr_correction_max_lexicon: int = 200
     htr_correction_max_vocabulary: int = 200

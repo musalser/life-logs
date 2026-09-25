@@ -217,3 +217,58 @@ def test_corrector_skips_blank_lines_without_calling_the_model():
 
     assert corrector.correct_line("   ", [], CorrectionContext()) is None
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# connecting must fail fast: a stopped Ollama drops the connection silently
+# ---------------------------------------------------------------------------
+
+
+def test_connect_timeout_is_separate_from_generation_timeout():
+    """One shared budget made a dead Ollama cost 90 s per line."""
+    corrector = OllamaLineCorrector(
+        model="gemma3:12b", host="http://ollama.invalid", timeout=90.0, connect_timeout=5.0
+    )
+
+    # ollama.Client keeps the httpx client (and therefore the Timeout) inside
+    timeout = corrector.client._client.timeout
+
+    assert timeout.connect == 5.0
+    assert timeout.read == 90.0
+    assert timeout.pool == 5.0
+
+
+class FakeListClient(FakeOllamaClient):
+    def __init__(self, error: Exception | None = None):
+        super().__init__()
+        self.list_error = error
+        self.list_calls = 0
+
+    def list(self):
+        self.list_calls += 1
+        if self.list_error is not None:
+            raise self.list_error
+        return {"models": []}
+
+
+def test_availability_probe_does_not_generate():
+    client = FakeListClient()
+    corrector = make_corrector(client)
+
+    assert corrector.is_available() is True
+    assert client.list_calls == 1
+    assert client.calls == []  # no generation was attempted
+
+
+def test_availability_probe_reports_an_unreachable_host():
+    corrector = make_corrector(FakeListClient(error=ConnectionError("timed out")))
+
+    assert corrector.is_available() is False
+
+
+def test_default_connect_timeout_is_short():
+    """Guards the 5 s default: 90 s of waiting for a dead host is the bug."""
+    corrector = OllamaLineCorrector(model="gemma3:12b", host="http://ollama.invalid")
+
+    assert corrector.connect_timeout <= 10.0
+    assert corrector.timeout == 90.0

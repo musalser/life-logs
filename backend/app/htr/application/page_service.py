@@ -42,6 +42,27 @@ logger = logging.getLogger(__name__)
 # otherwise a hanging Ollama would cost one timeout per line of the page.
 MAX_CONSECUTIVE_CORRECTION_FAILURES = 2
 
+#: column limits of the page name/source path (see app.models.HTRPage)
+FILE_NAME_MAX_LENGTH = 1024
+SOURCE_PATH_MAX_LENGTH = 2048
+
+
+def split_page_path(raw: str | None) -> tuple[str, str | None]:
+    """Split an upload name into (basename, full path).
+
+    Browsers send only the basename for a plain file input, but a folder upload
+    (``webkitRelativePath``) or an API client can send a path. The basename is
+    what the sidebar shows; the full path is kept only when it really contains a
+    directory, because that is what tells two equal file names apart.
+    """
+    if not raw:
+        return "page", None
+    normalized = raw.strip().replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1].strip()
+    if not name:
+        return "page", None
+    return name[:FILE_NAME_MAX_LENGTH], (normalized[:SOURCE_PATH_MAX_LENGTH] if "/" in normalized else None)
+
 
 class PageImageStore(Protocol):
     def save_page_image(self, user_id: int, author_id: int, filename: str, content: bytes) -> str: ...
@@ -100,6 +121,18 @@ class HandwritingPageService:
             return summaries
         return self.lexicon_annotator.annotate_summaries(summaries)
 
+    def reorder_pages(self, author_id: int, page_ids: list[int]) -> list[PageSummary]:
+        """Apply the sidebar order the user dragged the pages into."""
+        summaries = self.page_repository.reorder_pages(author_id, page_ids)
+        if self.lexicon_annotator is None:
+            return summaries
+        return self.lexicon_annotator.annotate_summaries(summaries)
+
+    def rename_page(self, page_id: int, file_name: str) -> PageView:
+        """Rename the displayed file name of one page."""
+        self.page_repository.rename_page(page_id, file_name)
+        return self.get_page(page_id)
+
     def _annotate(self, page: PageView) -> PageView:
         if self.lexicon_annotator is None:
             return page
@@ -108,20 +141,28 @@ class HandwritingPageService:
     # ------------------------------------------------------------------
 
     def upload_page(
-        self, user_id: int, author_id: int, filename: str, content: bytes
+        self,
+        user_id: int,
+        author_id: int,
+        filename: str,
+        content: bytes,
+        source_path: str | None = None,
     ) -> PageView:
         width, height = self.image_store.probe_image(content)
         file_path = self.image_store.save_page_image(user_id, author_id, filename, content)
+        file_name, original_path = split_page_path(source_path or filename)
         page = self.page_repository.create_page(
             user_id=user_id,
             author_id=author_id,
             file_path=file_path,
             width=width,
             height=height,
+            file_name=file_name,
+            source_path=original_path,
         )
         logger.info(
-            "HTR page uploaded: user_id=%s author_id=%s page_id=%s",
-            user_id, author_id, page.id,
+            "HTR page uploaded: user_id=%s author_id=%s page_id=%s file_name=%s",
+            user_id, author_id, page.id, file_name,
         )
         return self._annotate(page)
 
@@ -191,10 +232,47 @@ class HandwritingPageService:
         )
         page = self.apply_recognition(page_id, result, force=force)
         if self.auto_correct and self.corrector is not None:
-            page = self.suggest_corrections(page_id)
+            # an unreachable LLM must not silently turn the automatic step into
+            # a per-line timeout inside recognition
+            problem = self.corrector_status()
+            if problem is not None:
+                logger.warning(
+                    "HTR page %s: skipping the automatic correction: %s",
+                    page_id, problem,
+                )
+            else:
+                page = self.suggest_corrections(page_id)
         return self._annotate(page)
 
     # ------------------------------------------------------------------
+
+    def corrector_status(self) -> str | None:
+        """Why the LLM cannot be used right now, or None when it can.
+
+        A cheap preflight, meant to be called *before* a page-long correction
+        run: the difference for the user is an immediate explanation instead of
+        a couple of timeouts and an empty page.
+        """
+        if self.corrector is None:
+            return (
+                "правки языковой моделью выключены "
+                "(htr_correction_enabled=false)"
+            )
+        check = getattr(self.corrector, "is_available", None)
+        if check is None:
+            return None
+        host = getattr(self.corrector, "host", None)
+        try:
+            reachable = bool(check())
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"Ollama недоступна ({type(exc).__name__}: {exc})"
+        if reachable:
+            return None
+        where = f" по адресу {host}" if host else ""
+        return (
+            f"Ollama недоступна{where} — запустите её и повторите; "
+            "распознанный текст не изменялся"
+        )
 
     def suggest_corrections(self, page_id: int) -> PageView:
         """Ask the LLM for corrections and store them as *proposals*.

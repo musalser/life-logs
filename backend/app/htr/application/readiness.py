@@ -1,10 +1,10 @@
 """Decides whether a confirmed-page corpus is large enough for fine-tuning.
 
-Fine-tuning is triggered after every confirmed page, but a single page (a few
-dozen lines) is rarely enough to adapt a model without overfitting it. The
-dataset therefore has to reach a configurable size before training runs; until
-then confirmation succeeds and the training result reports how much material is
-still missing (``INSUFFICIENT_DATA``).
+Training is started explicitly by the user, but a single page (a few dozen
+lines) is rarely enough to adapt a model without overfitting it. The dataset
+therefore has to reach a configurable size before a training run does any work;
+until then the request succeeds and the training result reports how much
+material is still missing (``INSUFFICIENT_DATA``).
 
 The threshold is expressed in lines by default. An optional word threshold can
 be enabled as well (``min_words > 0``); both conditions must then hold.
@@ -53,7 +53,7 @@ class TrainingReadinessPolicy:
                 reason=(
                     "Not enough confirmed training data yet: "
                     + ", ".join(missing)
-                    + "; training will start once the threshold is reached"
+                    + "; confirm more pages, then start training again"
                 ),
             )
         return TrainingReadiness(

@@ -567,3 +567,251 @@ def test_author_language_model_wins_over_the_general_one(tmp_path):
     assert recognizer._lm_for(7) == str(author)
     # another author still gets the general model
     assert recognizer._lm_for(8) == str(general)
+
+
+# ---------------------------------------------------------------------------
+# second pass: word-level rescoring inside the recognizer
+# ---------------------------------------------------------------------------
+
+
+class FakeLogits:
+    """Stands in for the torch tensor attached to a kraken record."""
+
+    def __init__(self, matrix):
+        import numpy as np
+
+        self._matrix = np.asarray(matrix, dtype="float32")
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def __array__(self, dtype=None):
+        import numpy as np
+
+        return np.asarray(self._matrix, dtype=dtype)
+
+
+class FakeLogitsRecord:
+    logits = FakeLogits([[0.1, 0.9], [0.9, 0.1]])
+
+
+class FakeNBestDecoder:
+    """Decoder double returning a fixed N-best list."""
+
+    def __init__(self, candidates):
+        self.candidates = candidates
+        self.calls: list[int] = []
+
+    def decode(self, matrix, temperature=1.0):
+        return self.candidates[0].text
+
+    def decode_nbest(self, matrix, n=10, temperature=1.0):
+        self.calls.append(n)
+        return list(self.candidates)[:n]
+
+
+def test_rescorer_is_skipped_without_a_word_model():
+    recognizer = KrakenRecognizer(decoder="beam")
+
+    assert recognizer._build_rescorer(None) is None
+
+
+def test_rescorer_is_skipped_when_the_model_is_missing(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("app.htr.infrastructure.kraken.recognizer")
+    monkeypatch.setattr(module, "_loaded_word_model", lambda path: None)
+    recognizer = KrakenRecognizer(decoder="beam", word_lm_path="missing.binary")
+
+    assert recognizer._build_rescorer(None) is None
+
+
+def test_rescorer_uses_the_word_model_when_present(monkeypatch):
+    import importlib
+
+    from app.htr.infrastructure.lm.word_rescorer import WordRescorer
+
+    module = importlib.import_module("app.htr.infrastructure.kraken.recognizer")
+
+    class FakeKenLM:
+        def score(self, sentence, bos=True, eos=True):
+            return -1.0
+
+    monkeypatch.setattr(module, "_loaded_word_model", lambda path: FakeKenLM())
+    recognizer = KrakenRecognizer(
+        decoder="beam", word_lm_path="word.binary", rescore_n=5
+    )
+
+    rescorer = recognizer._build_rescorer(FakeChecker({"корова"}))
+
+    assert isinstance(rescorer, WordRescorer)
+    assert recognizer.rescore_n == 5
+
+
+def test_decoded_text_returns_the_second_pass_winner(monkeypatch):
+    """The production path: beam N-best -> word model -> chosen text."""
+    from app.htr.infrastructure.kraken.beam import BeamCandidate
+    from app.htr.infrastructure.lm.word_rescorer import RescoreConfig, WordRescorer
+
+    class PrefersSecond:
+        def score(self, sentence):
+            return 0.0 if sentence == "корова" else -10.0
+
+    decoder = FakeNBestDecoder(
+        [
+            BeamCandidate(text="карова", score=-1.0, acoustic=-1.0, lm=0.0, words=0.0),
+            BeamCandidate(text="корова", score=-2.0, acoustic=-2.0, lm=0.0, words=0.0),
+        ]
+    )
+    rescorer = WordRescorer(PrefersSecond(), RescoreConfig(weight=8.0, guard=False))
+
+    text = KrakenRecognizer._decoded_text(
+        FakeLogitsRecord(), decoder, "карова", "l1", rescorer, 10
+    )
+
+    assert decoder.calls == [10], "второй проход просит N гипотез"
+    assert text == "корова"
+
+
+def test_decoded_text_keeps_the_top1_when_the_guard_blocks(monkeypatch):
+    from app.htr.infrastructure.kraken.beam import BeamCandidate
+    from app.htr.infrastructure.lm.word_rescorer import RescoreConfig, WordRescorer
+
+    class PrefersSecond:
+        def score(self, sentence):
+            return 0.0 if sentence == "корова" else -10.0
+
+    decoder = FakeNBestDecoder(
+        [
+            BeamCandidate(text="Судиславль", score=-1.0, acoustic=-1.0, lm=0.0, words=0.0),
+            BeamCandidate(text="корова", score=-2.0, acoustic=-2.0, lm=0.0, words=0.0),
+        ]
+    )
+    rescorer = WordRescorer(
+        PrefersSecond(),
+        RescoreConfig(weight=8.0, guard=True),
+        known_word=lambda word: True,          # топоним известен словарю
+    )
+
+    text = KrakenRecognizer._decoded_text(
+        FakeLogitsRecord(), decoder, "Судиславль", "l1", rescorer, 10
+    )
+
+    assert text == "Судиславль"
+
+
+def test_decoded_text_without_a_rescorer_is_single_pass():
+    from app.htr.infrastructure.kraken.beam import BeamCandidate
+
+    decoder = FakeNBestDecoder(
+        [BeamCandidate(text="карова", score=-1.0, acoustic=-1.0, lm=0.0, words=0.0)]
+    )
+
+    text = KrakenRecognizer._decoded_text(
+        FakeLogitsRecord(), decoder, "карова", "l1", None, 10
+    )
+
+    assert text == "карова"
+    assert decoder.calls == [], "без второго прохода N-best не запрашивается"
+
+
+# ---------------------------------------------------------------------------
+# CTC matrix shapes kraken hands over on the two segmenter paths
+# ---------------------------------------------------------------------------
+
+
+def test_logits_matrix_accepts_a_tensor_like_object():
+    matrix = KrakenRecognizer._logits_matrix(FakeLogits([[0.1, 0.9], [0.9, 0.1]]))
+
+    assert matrix is not None and matrix.shape == (2, 2)
+
+
+def test_logits_matrix_rejects_the_classical_paths_payload():
+    """BBoxOCRRecord carries per-character tuples, not a CTC matrix.
+
+    Measured on a real crop: ``logits`` there is a list of
+    ``(str, int, int, float)`` tuples, so the classical segmenter path has no
+    matrix to decode from and must fall back to greedy *cleanly* — it used to
+    surface as "CTC matrix must be 2-D, got ()".
+    """
+    payload = [("д", 0, 3, 0.9), ("е", 3, 7, 0.8)]
+
+    assert KrakenRecognizer._logits_matrix(payload) is None
+    assert KrakenRecognizer._logits_matrix(payload, 0) is None
+    assert KrakenRecognizer._logits_matrix([], 0) is None
+
+
+def test_logits_matrix_accepts_a_defensive_list_of_pairs():
+    """A per-line list of (tensor, lengths) pairs is still understood."""
+    per_line = [
+        (FakeLogits([[0.1, 0.9], [0.9, 0.1]]), None),
+        (FakeLogits([[0.2, 0.8], [0.8, 0.2]]), None),
+    ]
+
+    first = KrakenRecognizer._logits_matrix(per_line, 0)
+    second = KrakenRecognizer._logits_matrix(per_line, 1)
+
+    assert first is not None and second is not None
+    assert first[0].tolist() == pytest.approx([0.1, 0.9])
+    assert second[0].tolist() == pytest.approx([0.2, 0.8])
+    assert KrakenRecognizer._logits_matrix(per_line, 5) is None
+
+
+def test_logits_matrix_returns_none_for_a_missing_matrix():
+    assert KrakenRecognizer._logits_matrix(None) is None
+
+
+def test_to_result_attaches_alternatives_to_the_words():
+    """The wiring the live run proved necessary: candidates -> word alternatives."""
+    from app.htr.infrastructure.kraken.beam import BeamCandidate
+
+    text = "дед был"
+    record = FakeRecord(
+        text, char_cuts(text), bbox=(0, 0, 70, 20),
+        boundary=[[0, 0], [70, 0], [70, 20], [0, 20]],
+    )
+    record.logits = FakeLogits([[0.5, 0.5], [0.5, 0.5]])
+    decoder = FakeNBestDecoder(
+        [
+            BeamCandidate(text="дед был", score=0.0, acoustic=0.0, lm=0.0, words=0.0),
+            BeamCandidate(text="дедъ был", score=-1.0, acoustic=-1.0, lm=0.0, words=0.0),
+        ]
+    )
+
+    result = KrakenRecognizer._to_result((100, 100), [record], decoder, None, 10, 5)
+
+    words = result.lines[0].words
+    assert words, "геометрия слов должна сохраниться"
+    assert [item.text for item in words[0].alternatives] == ["дедъ"]
+
+
+def test_words_from_record_keeps_geometry_when_the_decoder_merged_words():
+    """The regression behind page 26: a merge dropped every word box on the line."""
+    greedy = "где -то погиб."
+    beam = "где-то погиб."
+    boundary = [[0, 0], [200, 0], [200, 20], [0, 20], [0, 0]]
+    offsets = list(range(0, len(greedy) * 10, 10))
+    record = FakeBaselineRecord(
+        greedy, offsets, baseline=[(0, 10), (200, 10)],
+        boundary=boundary, bl_length=200,
+    )
+
+    words = words_from_record(record, "0", text=beam)
+
+    assert [word.text for word in words] == ["где-то", "погиб."]
+    assert all(word.polygon for word in words)
+    # the merged word must cover both greedy words, not just the first one
+    assert words[0].bbox.x2 > words[0].bbox.x1
+
+
+def test_words_from_record_still_reports_a_line_without_any_cut():
+    record = FakeBaselineRecord(
+        "дом", [0, 0], baseline=[(0, 10), (60, 10)],
+        boundary=[[0, 0], [60, 0], [60, 20], [0, 20]], bl_length=60,
+    )
+    record.cuts = record._cuts  # lengths disagree: no geometry is claimed
+
+    assert words_from_record(record, "0") == []

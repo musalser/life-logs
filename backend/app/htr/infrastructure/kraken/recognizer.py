@@ -43,7 +43,9 @@ from ...domain.entities import (
     RecognizedLine,
     RecognizedWord,
 )
+from ...domain.entities import WordAlternative
 from ...domain.errors import CorruptImageError, RecognitionError
+from ...domain.text import align_word_alternatives, map_spans_to_reference
 from ...domain.interfaces import HTRRecognizer
 from ..storage import open_oriented_image
 
@@ -61,6 +63,42 @@ _MAX_CACHED_MODELS = 4
 # Character language models are tens of megabytes; the last few paths are kept.
 _LM_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 _MAX_CACHED_LMS = 2
+#: the word-level models are ~1 GB each; one at a time is plenty
+_MAX_CACHED_WORD_MODELS = 1
+_WORD_MODEL_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+
+
+def _loaded_word_model(path: str | None):
+    """Load (and cache) the word-level KenLM model; None when unusable.
+
+    ``kenlm`` is an optional dependency: the pipeline works without it, only the
+    second pass is skipped.
+    """
+    if not path:
+        return None
+    cached = _WORD_MODEL_CACHE.get(path)
+    if cached is not None:
+        return cached
+    try:
+        import kenlm
+    except ImportError:
+        logger.warning(
+            "HTR decoding: kenlm is not installed, skipping the second pass (%s)", path
+        )
+        return None
+    if not Path(path).is_file():
+        logger.warning("HTR decoding: no word-level model at %s, skipping it", path)
+        return None
+    try:
+        model = kenlm.Model(path)
+    except Exception as exc:
+        logger.warning("HTR decoding: cannot load %s (%s), skipping it", path, exc)
+        return None
+    logger.info("HTR decoding: word-level model %s (order %s) loaded", path, model.order)
+    _WORD_MODEL_CACHE[path] = model
+    while len(_WORD_MODEL_CACHE) > _MAX_CACHED_WORD_MODELS:
+        _WORD_MODEL_CACHE.popitem(last=False)
+    return model
 
 
 def _loaded_language_model(path: str | None):
@@ -399,7 +437,10 @@ def merged_boundary(
 
 
 def words_from_record(
-    record: Any, line_id: str, text: str | None = None
+    record: Any,
+    line_id: str,
+    text: str | None = None,
+    alternatives: dict[int, list[WordAlternative]] | None = None,
 ) -> list[RecognizedWord]:
     """Words of a kraken OCR record, derived from its per-character geometry.
 
@@ -430,18 +471,25 @@ def words_from_record(
         return []
 
     spans = word_spans(text)
-    if text != predicted and len(spans) != len(word_spans(predicted)):
-        # the decoder changed the number of words: the boxes no longer describe
-        # the transcription the user will read, so no boxes are claimed at all
-        logger.info(
-            "Line %s: word count changed (%s -> %s), dropping word geometry",
-            line_id, len(word_spans(predicted)), len(spans),
-        )
+    # The decoder's text and kraken's own greedy text can disagree — the beam
+    # may merge ("где -то" -> "где-то"), split or replace characters. The cuts
+    # describe the *greedy* text, so the display words are mapped onto it by a
+    # character alignment instead of dropping the whole line's geometry (which
+    # left lines with a correct transcription and no word boxes at all).
+    ranges = map_spans_to_reference(text, predicted, spans)
+    if text != predicted and len(ranges) != len(spans):  # pragma: no cover - defensive
+        logger.warning("Line %s: cannot align the decoded text, keeping greedy", line_id)
         return []
 
     words: list[RecognizedWord] = []
     for order, (start, end) in enumerate(spans):
-        geometry = word_cut(record, start, end)
+        span = ranges[order] if order < len(ranges) else None
+        if span is None:
+            logger.debug(
+                "Line %s: word %s has no counterpart in the greedy text", line_id, order
+            )
+            continue
+        geometry = word_cut(record, span[0], span[1])
         if geometry is None:
             continue
         points, confidence = geometry
@@ -455,7 +503,15 @@ def words_from_record(
                 text=normalize_text(text[start:end]),
                 confidence=confidence,
                 polygon=polygon_points(points),
+                alternatives=(alternatives or {}).get(order, []),
             )
+        )
+    if not words:
+        # used to be silent: a line could end up with a correct transcription
+        # and no word boxes at all, which reads as an interface bug
+        logger.warning(
+            "Line %s: no word geometry could be built (%s spans, %s cuts)",
+            line_id, len(spans), len(getattr(record, "cuts", ()) or ()),
         )
     return words
 
@@ -639,6 +695,10 @@ class KrakenRecognizer(HTRRecognizer):
         beam_config: Any | None = None,
         lexicon_path: str | None = None,
         min_lm_text_chars: int = 0,
+        word_lm_path: str | None = None,
+        rescore_config: Any | None = None,
+        rescore_n: int = 10,
+        word_alternatives: int = 5,
     ):
         self.device = device
         self.batch_size = batch_size
@@ -660,6 +720,15 @@ class KrakenRecognizer(HTRRecognizer):
         self.beam_config = beam_config
         self.lexicon_path = lexicon_path
         self.min_lm_text_chars = max(0, int(min_lm_text_chars))
+        # second pass: a word-level KenLM re-ranks the beam's N best hypotheses.
+        # None (or a missing kenlm) simply means single-pass decoding.
+        self.word_lm_path = word_lm_path
+        self.rescore_config = rescore_config
+        self.rescore_n = max(1, int(rescore_n))
+        #: how many alternative readings per word to keep (0 = do not keep any).
+        #: They come from the same N-best list the second pass uses, so keeping
+        #: them costs nothing beyond the search that already runs.
+        self.word_alternatives = max(0, int(word_alternatives))
         # the beam decoder needs the probability matrix *before* kraken's own
         # greedy decoder, so logits are requested whenever it is active
         self.return_logits = return_logits or self.decoder == "beam"
@@ -690,6 +759,11 @@ class KrakenRecognizer(HTRRecognizer):
             with _RECOGNITION_LOCK:
                 model, config = self._prepared_model(model_file)
                 decoder = self._build_decoder(model, author_id, word_checker)
+                rescorer = (
+                    self._build_rescorer(word_checker)
+                    if decoder is not None
+                    else None
+                )
                 segmentation = self._merge_split_lines(self._segment(image))
                 if not segmentation.lines:
                     raise RecognitionError(
@@ -697,7 +771,14 @@ class KrakenRecognizer(HTRRecognizer):
                         "orientation and quality"
                     )
                 records = list(model.predict(image, segmentation))
-            result = self._to_result(image.size, records, decoder)
+            result = self._to_result(
+                image.size,
+                records,
+                decoder,
+                rescorer,
+                self.rescore_n,
+                self.word_alternatives,
+            )
         except RecognitionError:
             raise
         except Exception as exc:
@@ -728,6 +809,7 @@ class KrakenRecognizer(HTRRecognizer):
         without that the beam simply runs with no lexicon bonus at all.
         """
         if self.decoder != "beam":
+            logger.info("HTR decoding: greedy CTC (htr_decoder=%s)", self.decoder)
             return None
         lm = _loaded_language_model(self._lm_for(author_id))
         if lm is None:
@@ -749,15 +831,51 @@ class KrakenRecognizer(HTRRecognizer):
 
         config = self.beam_config or BeamSearchConfig()
 
+        logger.info(
+            "HTR decoding: prefix beam search over the CTC matrix "
+            "(lm=%s, width=%s, top_k=%s, alpha=%s, beta=%s, word_bonus=%s, "
+            "author_vocabulary=%s)",
+            self._lm_for(author_id), config.beam_width, config.top_k,
+            config.alpha, config.beta, config.word_bonus,
+            word_checker is not None,
+        )
+
+        return PrefixBeamSearch(
+            codec=model.codec, lm=lm, config=config,
+            known_word=self._known_word_fn(word_checker),
+        )
+
+    def _known_word_fn(self, word_checker: LexiconChecker | None):
+        """Vocabulary callable shared by the beam bonus and the rescoring guard."""
+        checker = word_checker or self._file_lexicon_checker()
+        if checker is None:
+            return None
+
         def known(word: str) -> bool:
-            checker = word_checker or self._file_lexicon_checker()
-            if checker is None:
-                return False
-            # the beam works on the decomposed text the codec emits, the
-            # dictionary on the composed text the user sees
+            # the codec emits decomposed text, the dictionary holds composed
+            # words, so normalization happens exactly here
             return checker.is_known(unicodedata.normalize("NFC", word))
 
-        return PrefixBeamSearch(codec=model.codec, lm=lm, config=config, known_word=known)
+        return known
+
+    def _build_rescorer(self, word_checker: LexiconChecker | None):
+        """Second-pass re-ranker over the beam's N best, or None."""
+        if not self.word_lm_path:
+            return None
+        model = _loaded_word_model(self.word_lm_path)
+        if model is None:
+            return None
+        from ..lm.word_rescorer import KenLMSentenceScorer, RescoreConfig, WordRescorer
+
+        config = self.rescore_config or RescoreConfig()
+        logger.info(
+            "HTR decoding: second pass with the word-level model %s "
+            "(weight=%s, n=%s, guard=%s)",
+            self.word_lm_path, config.weight, self.rescore_n, config.guard,
+        )
+        return WordRescorer(
+            KenLMSentenceScorer(model), config, known_word=self._known_word_fn(word_checker)
+        )
 
     def _file_lexicon_checker(self):
         """Fallback vocabulary: the dictionary file alone, no author words."""
@@ -783,22 +901,117 @@ class KrakenRecognizer(HTRRecognizer):
         return self.lm_path
 
     @staticmethod
-    def _decoded_text(record: Any, decoder, greedy: str, line_id: str) -> str:
-        """Beam-search text of a line, falling back to kraken's own decoding."""
-        logits = getattr(record, "logits", None)
+    def _logits_matrix(logits: Any, index: int = 0):
+        """The CTC matrix of one record, whatever shape kraken handed over.
+
+        With the neural (baseline) segmenter ``record.logits`` is the CTC tensor
+        (classes × time) and everything works. The classical (bbox) segmenter
+        does **not** attach a matrix at all: measured on ``BBoxOCRRecord``, its
+        ``logits`` is a list of per-character tuples ``(str, int, int, float)``,
+        which is why that path has neither beam decoding nor per-word
+        alternatives and cleanly falls back to greedy. Taking a tensor for
+        granted there used to surface as a confusing "matrix must be 2-D"
+        warning; now such a payload is reported as "no CTC matrix".
+        """
         if logits is None:
+            return None
+        import numpy as np
+
+        value = logits
+        if isinstance(value, (list, tuple)):
+            if index >= len(value):
+                return None
+            value = value[index]
+            # (logits, lengths)-style pair from the classical path
+            if isinstance(value, (list, tuple)):
+                value = value[0] if value else None
+                if value is None:
+                    return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        try:
+            matrix = np.asarray(value, dtype=np.float32)
+        except (TypeError, ValueError):
+            # the classical path hands over per-character tuples of strings and
+            # numbers, which cannot be a probability matrix at all
+            return None
+        if matrix.ndim != 2 or min(matrix.shape) < 2:
+            return None
+        return matrix
+
+    @staticmethod
+    def _word_alternatives(
+        text: str, candidates: list[Any], limit: int
+    ) -> dict[int, list[WordAlternative]]:
+        """Other readings per word index, from the line's N-best list."""
+        if limit <= 0 or len(candidates) < 2 or not text.strip():
+            return {}
+        chosen_words = [text[start:end] for start, end in word_spans(text)]
+        hypotheses = [
+            ([piece for piece in candidate.text.split() if piece], candidate.score)
+            for candidate in candidates
+        ]
+        raw = align_word_alternatives(chosen_words, hypotheses, limit)
+        return {
+            index: [WordAlternative(text=word, score=score) for word, score in items]
+            for index, items in raw.items()
+        }
+
+    @classmethod
+    def _decoded_text(
+        cls,
+        record: Any,
+        decoder,
+        greedy: str,
+        line_id: str,
+        rescorer: Any | None = None,
+        rescore_n: int = 10,
+    ) -> str:
+        """Just the text of a line (kept for callers that need nothing else)."""
+        return cls._decoded_line(record, decoder, greedy, line_id, rescorer, rescore_n)[0]
+
+    @staticmethod
+    def _decoded_line(
+        record: Any,
+        decoder,
+        greedy: str,
+        line_id: str,
+        rescorer: Any | None = None,
+        rescore_n: int = 10,
+        alternatives_n: int = 0,
+        record_index: int = 0,
+    ) -> tuple[str, list[Any]]:
+        """Beam-search text of a line, falling back to kraken's own decoding.
+
+        With a rescorer the beam returns its N best hypotheses and a word-level
+        model re-ranks them; the guard inside the rescorer decides whether it is
+        allowed to change the winner at all.
+        """
+        logits = getattr(record, "logits", None)
+        matrix = KrakenRecognizer._logits_matrix(logits, record_index)
+        if matrix is None:
             logger.warning(
                 "Line %s: no CTC matrix on the record, keeping the greedy text", line_id
             )
-            return greedy
+            return greedy, []
         try:
-            import numpy as np
-
-            matrix = np.asarray(logits.detach().cpu(), dtype=np.float32)
-            return normalize_text(decoder.decode(matrix) or greedy)
+            # the N-best list is needed by the second pass and by the per-word
+            # alternatives, so it is requested once for both
+            n = max(rescore_n if rescorer is not None else 0, alternatives_n)
+            if n <= 1:
+                return normalize_text(decoder.decode(matrix) or greedy), []
+            candidates = decoder.decode_nbest(matrix, n=n)
+            if not candidates:
+                return normalize_text(decoder.decode(matrix) or greedy), []
+            if rescorer is None:
+                return normalize_text(candidates[0].text or greedy), candidates
+            outcome = rescorer.choose(candidates)
+            if outcome.changed:
+                logger.info("Line %s: %s", line_id, outcome)
+            return normalize_text(outcome.text or greedy), candidates
         except Exception as exc:  # pragma: no cover - the decoder must not break recognition
             logger.warning("Line %s: beam search failed (%s), keeping greedy", line_id, exc)
-            return greedy
+            return greedy, []
 
     def _segment(self, image):
         if self.segmentation_engine == "neural":
@@ -937,6 +1150,9 @@ class KrakenRecognizer(HTRRecognizer):
         page_size: tuple[int, int],
         records: Iterable[Any],
         decoder: "PrefixBeamSearch | None" = None,
+        rescorer: Any | None = None,
+        rescore_n: int = 10,
+        alternatives_n: int = 0,
     ) -> RecognitionResult:
         lines: list[RecognizedLine] = []
         for order, record in enumerate(records):
@@ -947,14 +1163,21 @@ class KrakenRecognizer(HTRRecognizer):
                 continue
             greedy = normalize_text(record.prediction or "")
             text = greedy
+            candidates: list[Any] = []
             if decoder is not None:
-                text = cls._decoded_text(record, decoder, greedy, line_id)
+                text, candidates = cls._decoded_line(
+                    record, decoder, greedy, line_id, rescorer, rescore_n,
+                    alternatives_n, order,
+                )
+            alternatives = cls._word_alternatives(text, candidates, alternatives_n)
             lines.append(
                 RecognizedLine(
                     id=line_id,
                     bbox=bbox,
                     text=text,
-                    words=words_from_record(record, line_id, text=text),
+                    words=words_from_record(
+                        record, line_id, text=text, alternatives=alternatives
+                    ),
                     polygon=line_polygon(record),
                 )
             )

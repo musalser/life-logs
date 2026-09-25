@@ -93,6 +93,17 @@ def upload(client, author_id: int) -> int:
     return response.json()["page_id"]
 
 
+def upload_named(client, author_id: int, filename: str, source_path: str | None = None) -> int:
+    data = {"source_path": source_path} if source_path is not None else {}
+    response = client.post(
+        f"/htr/authors/{author_id}/pages",
+        files={"file": (filename, png_bytes(), "image/png")},
+        data=data,
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["page_id"]
+
+
 @pytest.fixture()
 def lexicon_api(db_session, tmp_path, user, author):
     """Same app, but with a working dictionary check wired in."""
@@ -294,6 +305,126 @@ def test_list_author_pages_returns_summaries(api):
     assert body[0]["line_count"] == 2  # the fake recognizer returns two lines
 
 
+def test_upload_keeps_the_file_name_and_the_full_path(api):
+    client, _, author = api
+    page_id = upload_named(client, author.id, "scan_001.jpg", source_path="diary/scan_001.jpg")
+
+    page = client.get(f"/htr/pages/{page_id}").json()
+    assert page["file_name"] == "scan_001.jpg"
+    assert page["source_path"] == "diary/scan_001.jpg"
+
+    summary = client.get(f"/htr/authors/{author.id}/pages").json()[0]
+    assert summary["file_name"] == "scan_001.jpg"
+    assert summary["source_path"] == "diary/scan_001.jpg"
+    assert summary["order_index"] == 0
+
+
+def test_source_path_is_normalized_and_split(api):
+    client, _, author = api
+    page_id = upload_named(
+        client, author.id, "page_07.png", source_path=r"Дневник\1975\page_07.png"
+    )
+
+    page = client.get(f"/htr/pages/{page_id}").json()
+    assert page["file_name"] == "page_07.png"
+    assert page["source_path"] == "Дневник/1975/page_07.png"
+
+
+def test_upload_without_a_path_keeps_only_the_name(api):
+    client, _, author = api
+    page_id = upload_named(client, author.id, "letter.png")
+
+    page = client.get(f"/htr/pages/{page_id}").json()
+    assert page["file_name"] == "letter.png"
+    assert page["source_path"] is None
+
+
+def test_pages_keep_the_upload_order_until_the_user_reorders_them(api):
+    client, _, author = api
+    first = upload_named(client, author.id, "a.png")
+    second = upload_named(client, author.id, "b.png")
+    third = upload_named(client, author.id, "c.png")
+
+    body = client.get(f"/htr/authors/{author.id}/pages").json()
+    assert [row["page_id"] for row in body] == [first, second, third]
+    assert [row["order_index"] for row in body] == [0, 1, 2]
+
+
+def test_reorder_endpoint_stores_the_dragged_order(api):
+    client, _, author = api
+    first = upload_named(client, author.id, "a.png")
+    second = upload_named(client, author.id, "b.png")
+    third = upload_named(client, author.id, "c.png")
+    # drag the last page to the very top
+    response = client.put(
+        f"/htr/authors/{author.id}/pages/order",
+        json={"page_ids": [third, first, second]},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [row["page_id"] for row in body] == [third, first, second]
+    assert [row["order_index"] for row in body] == [0, 1, 2]
+
+    # the stored order survives a reload
+    reloaded = client.get(f"/htr/authors/{author.id}/pages").json()
+    assert [row["page_id"] for row in reloaded] == [third, first, second]
+
+
+def test_reorder_endpoint_keeps_pages_the_client_did_not_send(api):
+    client, _, author = api
+    first = upload_named(client, author.id, "a.png")
+    second = upload_named(client, author.id, "b.png")
+    third = upload_named(client, author.id, "c.png")
+
+    response = client.put(
+        f"/htr/authors/{author.id}/pages/order",
+        json={"page_ids": [third, first]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [row["page_id"] for row in response.json()] == [third, first, second]
+
+
+def test_reorder_endpoint_rejects_a_foreign_page(api):
+    client, _, author = api
+    page_id = upload_named(client, author.id, "a.png")
+
+    response = client.put(
+        f"/htr/authors/{author.id}/pages/order",
+        json={"page_ids": [page_id, 999_999]},
+    )
+
+    assert response.status_code == 404
+    # nothing moved
+    body = client.get(f"/htr/authors/{author.id}/pages").json()
+    assert [row["page_id"] for row in body] == [page_id]
+
+
+def test_rename_endpoint_changes_the_display_name(api):
+    client, _, author = api
+    page_id = upload_named(client, author.id, "scan_001.jpg", source_path="diary/scan_001.jpg")
+
+    response = client.patch(f"/htr/pages/{page_id}/name", json={"file_name": "Письмо деда"})
+
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["file_name"] == "Письмо деда"
+    # a manual name is canonical: the upload path must not shadow it
+    assert page["source_path"] is None
+    summary = client.get(f"/htr/authors/{author.id}/pages").json()[0]
+    assert summary["file_name"] == "Письмо деда"
+
+
+def test_rename_endpoint_rejects_a_blank_name(api):
+    client, _, author = api
+    page_id = upload_named(client, author.id, "scan_001.jpg")
+
+    response = client.patch(f"/htr/pages/{page_id}/name", json={"file_name": "   "})
+
+    assert response.status_code == 400
+
+
 def test_page_image_endpoint_serves_the_original(api):
     client, _, author = api
     page_id = upload(client, author.id)
@@ -362,14 +493,38 @@ def test_full_http_flow_recognize_edit_confirm(api):
 
     assert confirmed.status_code == 200, confirmed.text
     body = confirmed.json()
-    assert body["page"]["status"] == "CONFIRMED"
-    assert body["page"]["lines"][0]["corrected_text"] == "Уж очень дед"
-    assert body["page"]["prediction_cer"] == pytest.approx(0.0)
+    assert body["status"] == "CONFIRMED"
+    assert body["lines"][0]["corrected_text"] == "Уж очень дед"
+    assert body["prediction_cer"] == pytest.approx(0.0)
+
+
+def test_confirm_does_not_train_the_model(api):
+    """Confirmation is ground truth only: fine-tuning is an explicit action."""
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    client.post(f"/htr/pages/{page_id}/confirm")
+
+    # nothing was trained behind the user's back
+    assert client.get(f"/htr/authors/{author.id}/models").json() == []
+
+
+def test_train_endpoint_fine_tunes_the_confirmed_corpus(api):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    client.post(f"/htr/pages/{page_id}/confirm")
+
+    response = client.post(f"/htr/authors/{author.id}/train")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
     # training used the confirmed page (fake trainer in the real service)
-    assert body["training"]["outcome"] == "SUCCESS"
+    assert body["outcome"] == "SUCCESS"
     # regression: the response must carry the post-activation status, not the
     # TRAINING status the version had when it was created
-    assert body["training"]["model_version"]["status"] == "ACTIVE"
+    assert body["model_version"]["status"] == "ACTIVE"
 
 
 def test_recognition_does_not_ask_the_model_automatically(api):
@@ -403,6 +558,27 @@ def test_recognition_suggests_automatically_when_enabled(api):
     assert line["suggested_text"] == "Уж очень, дед"
     assert line["predicted_text"] == "Уж очень дед"
     assert line["corrected_text"] is None
+
+
+def test_recognition_response_carries_word_alternatives(api):
+    """The editor needs them on the same page read it renders the words from."""
+    from app.htr.domain.entities import WordAlternative
+
+    client, service, author = api
+    result = recognition_result()
+    result.lines[0].words[0].alternatives = [
+        WordAlternative(text="Ужъ", score=-1.5),
+        WordAlternative(text="Уш", score=-2.5),
+    ]
+    service.recognizer.result = result
+    page_id = upload(client, author.id)
+
+    body = client.post(f"/htr/pages/{page_id}/recognize").json()
+
+    word = body["lines"][0]["words"][0]
+    assert [item["text"] for item in word["alternatives"]] == ["Ужъ", "Уш"]
+    assert word["alternatives"][0]["score"] == -1.5
+    assert body["lines"][0]["words"][1]["alternatives"] == []
 
 
 def test_suggestions_endpoint_stores_proposals(api):
@@ -534,6 +710,43 @@ def test_bulk_accept_endpoint_takes_verified_proposals_only(lexicon_api):
     assert lines[1]["suggested_text"] == "на еврея, Захарьевка"
     assert lines[1]["suggestion_verified"] is False
     assert [change["in_lexicon"] for change in lines[1]["suggestion_changes"]] == [False]
+
+
+def test_automatic_correction_is_skipped_when_ollama_is_unreachable(api):
+    """Recognition must not turn a dead LLM into a per-line wait."""
+    client, service, author = api
+    corrector = FakeCorrector({"Уж очень дед": "Уж очень, дед"}, available=False)
+    service.corrector = corrector
+    service.correction_context_builder = CorrectionContextBuilder(service.page_repository)
+    service.auto_correct = True
+    page_id = upload(client, author.id)
+
+    body = client.post(f"/htr/pages/{page_id}/recognize").json()
+
+    assert body["status"] == "RECOGNIZED"
+    assert corrector.calls == []
+    assert all(line["suggested_text"] is None for line in body["lines"])
+
+
+def test_suggestions_refuse_fast_when_ollama_is_unreachable(api):
+    """A stopped Ollama must not cost a timeout per line before the page returns."""
+    client, service, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    corrector = FakeCorrector({"на еврея": "на еврея,"}, available=False)
+    service.corrector = corrector
+    service.correction_context_builder = CorrectionContextBuilder(service.page_repository)
+
+    response = client.post(f"/htr/pages/{page_id}/suggestions")
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "Ollama недоступна" in detail
+    assert "fake-ollama" in detail
+    # not a single line was attempted, and nothing was proposed
+    assert corrector.calls == []
+    body = client.get(f"/htr/pages/{page_id}").json()
+    assert all(line["suggested_text"] is None for line in body["lines"])
 
 
 def test_suggestions_endpoint_refuses_a_confirmed_page(api):

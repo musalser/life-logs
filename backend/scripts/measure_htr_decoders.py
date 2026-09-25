@@ -69,6 +69,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reuse-cache", action="store_true")
     parser.add_argument("--pages", type=int, nargs="*", default=None)
     parser.add_argument(
+        "--only-corrected",
+        action="store_true",
+        help=(
+            "считать метрики только по строкам, которые пользователь реально "
+            "исправлял (corrected_text). Без этого у неподтверждённых страниц и у "
+            "строк без правок эталоном становится вывод самой модели, и CER "
+            "искусственно падает"
+        ),
+    )
+    parser.add_argument(
+        "--include-recognized",
+        action="store_true",
+        help=(
+            "брать и неподтверждённые страницы (RECOGNIZED/EDITING). Эталона у них "
+            "нет: за эталон берётся predicted_text, то есть вывод той модели, "
+            "которая их распознала. Годится для сравнения моделей и влияния LM, "
+            "но НЕ для честного CER/WER"
+        ),
+    )
+    parser.add_argument(
+        "--model-map",
+        default=None,
+        help=(
+            "JSON {page_id: path} или {page_id: {path: ...}} — своя акустическая "
+            "модель на страницу. Нужно для честного замера: страница должна "
+            "распознаваться моделью, созданной ДО её подтверждения. Кэш матриц "
+            "при этом получает метку модели, иначе тексты разных моделей смешаются"
+        ),
+    )
+    parser.add_argument(
         "--leave-one-page-out",
         action="store_true",
         help=(
@@ -101,6 +131,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=str(Path(settings.htr_storage_dir) / "lm" / "folds"),
         help="куда кэшировать LM-фолды leave-one-page-out",
     )
+    parser.add_argument(
+        "--fold-tag",
+        default=None,
+        help=(
+            "метка набора фолдов, чтобы не переиспользовать чужой кэш: "
+            "имена станут <tag>_<page>_char_lm.npz (по умолчанию chrono/page). "
+            "Нужна, когда меняется корпус (например, добавлен --extra-text)"
+        ),
+    )
     # the defaults mirror the production settings, so a bare run measures the
     # configuration that actually serves recognition
     parser.add_argument("--beam-width", type=int, default=settings.htr_beam_width)
@@ -115,6 +154,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-lm", action="store_true", help="alpha = 0: только акустика")
     parser.add_argument("--no-lexicon", action="store_true")
+    parser.add_argument(
+        "--word-lm-general",
+        default=None,
+        help="словесная KenLM-модель общего корпуса (бинарник или ARPA), общая для всех фолдов",
+    )
+    parser.add_argument(
+        "--word-lm-author-dir",
+        default=None,
+        help=(
+            "каталог с author_<page>.arpa — словесная модель автора без текста "
+            "оцениваемой страницы (честный замер rescoring)"
+        ),
+    )
+    parser.add_argument(
+        "--word-weights",
+        type=float,
+        nargs=2,
+        default=(0.5, 0.5),
+        metavar=("W_GENERAL", "W_AUTHOR"),
+        help="веса интерполяции из interpolate --just_tune",
+    )
+    parser.add_argument(
+        "--rescore-n", type=int, default=10,
+        help="сколько гипотез beam отдавать на переранжирование",
+    )
+    parser.add_argument(
+        "--rescore-weight", type=float, default=0.5,
+        help="вес словесной модели в итоговом скоре (стартуйте с малого)",
+    )
+    parser.add_argument(
+        "--no-rescore-guard", action="store_true",
+        help="разрешить rescoring менять победителя всегда (для сравнения)",
+    )
+    parser.add_argument(
+        "--min-mean-acoustic", type=float, default=-0.30,
+        help="порог средней акустической уверенности символа (log10)",
+    )
     parser.add_argument("--examples", type=int, default=8, help="сколько расхождений напечатать")
     parser.add_argument("--json-out", default=None)
     return parser.parse_args(argv)
@@ -123,7 +199,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def load_pages(author_id: int, only: list[int] | None):
+def load_pages(
+    author_id: int,
+    only: list[int] | None,
+    statuses=("CONFIRMED",),
+    only_corrected: bool = False,
+):
     from app.db import SessionLocal
     from app.models import HTRLine, HTRPage
 
@@ -131,7 +212,7 @@ def load_pages(author_id: int, only: list[int] | None):
     try:
         query = (
             db.query(HTRPage)
-            .filter(HTRPage.author_id == author_id, HTRPage.status == "CONFIRMED")
+            .filter(HTRPage.author_id == author_id, HTRPage.status.in_(statuses))
             .order_by(HTRPage.id)
         )
         pages = []
@@ -144,10 +225,16 @@ def load_pages(author_id: int, only: list[int] | None):
                 .order_by(HTRLine.order_index)
                 .all()
             )
-            reference = {
-                line.order_index: (line.corrected_text or line.predicted_text or "")
-                for line in lines
-            }
+            reference = {}
+            for line in lines:
+                if only_corrected:
+                    if not line.corrected_text:
+                        continue
+                    reference[line.order_index] = line.corrected_text
+                else:
+                    reference[line.order_index] = (
+                        line.corrected_text or line.predicted_text or ""
+                    )
             pages.append((page.id, page.file_path, reference))
         return pages
     finally:
@@ -179,6 +266,52 @@ def build_known_word(author_id: int):
 
 
 # ---------------------------------------------------------------------------
+
+
+class InterpolatedWordScorer:
+    """Word-level score of a line: KenLM general + KenLM of this author.
+
+    KenLM's ``interpolate`` bakes the tuned weights into a single model; for the
+    *measurement* we keep the two apart, because the author half must be rebuilt
+    without the evaluated page (otherwise the page suggests its own words) while
+    the general half is the same for every fold. Applying the same weights to
+    the two scores gives the same ranking as the interpolated model.
+    """
+
+    def __init__(self, general, author, weights):
+        self.general = general
+        self.author = author
+        self.weights = weights
+
+    def score(self, sentence: str) -> float:
+        total = 0.0
+        if self.general is not None:
+            total += self.weights[0] * float(self.general.score(sentence, bos=True, eos=True))
+        if self.author is not None:
+            total += self.weights[1] * float(self.author.score(sentence, bos=True, eos=True))
+        return total
+
+
+def load_word_models(args, pages: list):
+    """(general model, {page_id: author model}); empty when rescoring is off."""
+    if not args.word_lm_general and not args.word_lm_author_dir:
+        return None, {}
+    import kenlm  # optional: only the rescoring experiment needs it
+
+    general = kenlm.Model(args.word_lm_general) if args.word_lm_general else None
+    if general is not None:
+        logger.info("словесная модель (общая): %s, порядок %s", args.word_lm_general, general.order)
+    authors = {}
+    if args.word_lm_author_dir:
+        directory = Path(args.word_lm_author_dir)
+        for page_id, *_rest in pages:
+            path = directory / f"author_{page_id}.arpa"
+            if path.is_file():
+                authors[page_id] = kenlm.Model(str(path))
+                logger.info("словесная модель автора для стр.%s: %s", page_id, path.name)
+            else:
+                logger.warning("нет авторской модели для стр.%s (%s)", page_id, path)
+    return general, authors
 
 
 def prepare_model(recognizer, model_path: str):
@@ -272,7 +405,7 @@ def leave_one_out_lms(args: argparse.Namespace, pages: list) -> dict:
     # the general part (word forms, extra text) does not depend on the page
     prose, words = builder.general_texts(builder_args)
     models: dict[int, CharNGram] = {}
-    prefix = "chrono" if args.chronological else "page"
+    prefix = args.fold_tag or ("chrono" if args.chronological else "page")
     for page_id, *_rest in pages:
         cache = fold_dir / f"{prefix}_{page_id}_char_lm.npz"
         if args.reuse_cache and cache.is_file():
@@ -313,7 +446,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     args = parse_args(argv)
 
-    pages = load_pages(args.author_id, args.pages)
+    statuses = (
+        ("CONFIRMED", "RECOGNIZED", "EDITING")
+        if args.include_recognized
+        else ("CONFIRMED",)
+    )
+    pages = load_pages(args.author_id, args.pages, statuses, args.only_corrected)
     if not pages:
         print("нет подтверждённых страниц автора", file=sys.stderr)
         return 2
@@ -348,8 +486,28 @@ def main(argv: list[str] | None = None) -> int:
     from app.htr.factory import build_recognizer
 
     recognizer = build_recognizer()
-    net = prepare_model(recognizer, args.model)
-    beam = PrefixBeamSearch(codec=net.codec, lm=lm, config=config, known_word=known)
+    model_map: dict[int, str] = {}
+    if args.model_map:
+        raw = json.loads(Path(args.model_map).read_text(encoding="utf-8"))
+        for key, value in raw.items():
+            path = value.get("path") if isinstance(value, dict) else value
+            model_map[int(key)] = str(path)
+        print("модели по страницам:", {page: Path(path).parent.name for page, path in model_map.items()})
+
+    def model_and_tag(page_id: int) -> tuple[str, str]:
+        path = model_map.get(page_id, args.model)
+        return path, Path(path).parent.name if page_id in model_map else "default"
+
+    nets: dict[str, object] = {}
+
+    def net_for(page_id: int):
+        path, tag = model_and_tag(page_id)
+        if tag not in nets:
+            nets[tag] = prepare_model(recognizer, path)
+        return nets[tag]
+
+    first_net = net_for(pages[0][0])
+    beam = PrefixBeamSearch(codec=first_net.codec, lm=lm, config=config, known_word=known)
 
     def search_for(page_id: int) -> PrefixBeamSearch | None:
         """The decoder this page gets in production (greedy when the LM is weak)."""
@@ -364,24 +522,47 @@ def main(argv: list[str] | None = None) -> int:
             )
             return None
         return PrefixBeamSearch(
-            codec=net.codec, lm=page_lm, config=config, known_word=known
+            codec=net_for(page_id).codec, lm=page_lm, config=config, known_word=known
         )
+    word_general, word_authors = load_word_models(args, pages)
     evaluator = MetricsEvaluator()
     cache_root = Path(args.cache_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
 
     all_greedy: list[tuple[str, str]] = []
     all_beam: list[tuple[str, str]] = []
+    all_rescored: list[tuple[str, str]] = []
     differences: list[tuple[int, str, str, str]] = []
+    rescore_changes: list[tuple[int, str, str, str, str]] = []
+    decoder_gap: list[tuple[str, str]] = []
+    rescore_gap: list[tuple[str, str]] = []
     rows = []
     for page_id, image_path, reference in pages:
-        cache = cache_root / f"page_{page_id}.npz"
+        page_net = net_for(page_id)
+        _path, tag = model_and_tag(page_id)
+        suffix = "" if tag == "default" else f"_{tag}"
+        cache = cache_root / f"page_{page_id}{suffix}.npz"
         if args.reuse_cache and cache.is_file():
             matrices, greedy = load_page_cache(cache)
         else:
-            matrices, greedy = recognize_page(recognizer, net, image_path, cache)
+            matrices, greedy = recognize_page(recognizer, page_net, image_path, cache)
 
         page_search = search_for(page_id)
+        rescorer = None
+        if word_general is not None or page_id in word_authors:
+            from app.htr.infrastructure.lm.word_rescorer import RescoreConfig, WordRescorer
+
+            rescorer = WordRescorer(
+                InterpolatedWordScorer(
+                    word_general, word_authors.get(page_id), args.word_weights
+                ),
+                RescoreConfig(
+                    weight=args.rescore_weight,
+                    guard=not args.no_rescore_guard,
+                    min_mean_acoustic=args.min_mean_acoustic,
+                ),
+                known_word=known,
+            )
         running = (
             int(folds[page_id].meta.get("running_text_chars", 0) or 0)
             if folds is not None
@@ -389,49 +570,118 @@ def main(argv: list[str] | None = None) -> int:
         )
         page_greedy: list[tuple[str, str]] = []
         page_beam: list[tuple[str, str]] = []
+        page_rescored: list[tuple[str, str]] = []
         for index, matrix in enumerate(matrices):
             expected = (reference.get(index) or "").strip()
             if not expected:
                 continue
-            if page_search is not None:
-                beam_text = page_search.decode(matrix)
+            search = page_search if page_search is not None else None
+            if search is not None:
+                candidates = (
+                    search.decode_nbest(matrix, n=args.rescore_n)
+                    if rescorer is not None
+                    else None
+                )
+                beam_text = candidates[0].text if candidates else search.decode(matrix)
             elif folds is not None:
                 # production fallback: an unusable fold means greedy, *not* the
                 # global model (that one contains this very page and would
                 # report a fake improvement)
                 beam_text = greedy[index]
+                candidates = None
             else:
-                beam_text = beam.decode(matrix)
+                candidates = (
+                    beam.decode_nbest(matrix, n=args.rescore_n)
+                    if rescorer is not None
+                    else None
+                )
+                beam_text = candidates[0].text if candidates else beam.decode(matrix)
+
+            rescored_text = beam_text
+            if rescorer is not None and candidates:
+                outcome = rescorer.choose(candidates)
+                rescored_text = outcome.text
+                if outcome.changed:
+                    rescore_changes.append(
+                        (page_id, beam_text, rescored_text, expected, outcome.reason)
+                    )
+
             page_greedy.append((expected, greedy[index]))
             page_beam.append((expected, beam_text))
+            page_rescored.append((expected, rescored_text))
             if beam_text != greedy[index]:
                 differences.append((page_id, greedy[index], beam_text, expected))
 
         all_greedy.extend(page_greedy)
         all_beam.extend(page_beam)
+        all_rescored.extend(page_rescored)
+        # how much the language model *itself* moved the output, independent of
+        # any reference: greedy -> beam is the character LM, beam -> rescored the
+        # word LM. On strong acoustics these should shrink.
+        decoder_gap.extend((g, b) for (_ref, g), (_ref2, b) in zip(page_greedy, page_beam))
+        rescore_gap.extend((b, r) for (_ref, b), (_ref2, r) in zip(page_beam, page_rescored))
         greedy_metrics = evaluator.evaluate_pairs(page_greedy)
         beam_metrics = evaluator.evaluate_pairs(page_beam)
-        rows.append((page_id, len(page_greedy), greedy_metrics, beam_metrics))
+        rescored_metrics = evaluator.evaluate_pairs(page_rescored)
+        rows.append(
+            (page_id, len(page_greedy), greedy_metrics, beam_metrics, rescored_metrics)
+        )
         extra = f" | текст {running}" if running >= 0 else ""
+        rescored_note = ""
+        if rescorer is not None:
+            rescored_note = (
+                f" | rescored CER {rescored_metrics['cer']:.4f} "
+                f"WER {rescored_metrics['wer']:.4f}"
+            )
         print(
             f"page {page_id:>3}: строк {len(page_greedy):>3} | "
             f"greedy CER {greedy_metrics['cer']:.4f} WER {greedy_metrics['wer']:.4f} | "
-            f"beam CER {beam_metrics['cer']:.4f} WER {beam_metrics['wer']:.4f}{extra}"
+            f"beam CER {beam_metrics['cer']:.4f} WER {beam_metrics['wer']:.4f}"
+            f"{rescored_note}{extra}"
         )
 
     total_greedy = evaluator.evaluate_pairs(all_greedy)
     total_beam = evaluator.evaluate_pairs(all_beam)
+    total_rescored = (
+        evaluator.evaluate_pairs(all_rescored) if rescore_changes or word_general else None
+    )
     print("\nитог (все страницы, микро-среднее):")
     print(f"  greedy: CER {total_greedy['cer']:.4f}   WER {total_greedy['wer']:.4f}")
     print(f"  beam:   CER {total_beam['cer']:.4f}   WER {total_beam['wer']:.4f}")
     delta_cer = total_greedy["cer"] - total_beam["cer"]
     delta_wer = total_greedy["wer"] - total_beam["wer"]
-    print(f"  выигрыш: CER {delta_cer:+.4f}   WER {delta_wer:+.4f}")
+    print(f"  выигрыш beam: CER {delta_cer:+.4f}   WER {delta_wer:+.4f}")
+    if total_rescored is not None:
+        print(
+            f"  rescored: CER {total_rescored['cer']:.4f}   "
+            f"WER {total_rescored['wer']:.4f}"
+        )
+        print(
+            f"  выигрыш rescoring поверх beam: "
+            f"CER {total_beam['cer'] - total_rescored['cer']:+.4f}   "
+            f"WER {total_beam['wer'] - total_rescored['wer']:+.4f}"
+        )
+        print(f"  словесная модель изменила победителя в {len(rescore_changes)} строках")
+    if decoder_gap:
+        gap = evaluator.evaluate_pairs(decoder_gap)
+        print(
+            f"\nвлияние символьной LM (greedy -> beam, без эталона): "
+            f"CER {gap['cer']:.4f} WER {gap['wer']:.4f} "
+            f"(то есть LM изменила {gap['cer'] * 100:.1f}% символов)"
+        )
+    if rescore_gap:
+        gap = evaluator.evaluate_pairs(rescore_gap)
+        print(
+            f"влияние словесной LM (beam -> rescored): "
+            f"CER {gap['cer']:.4f} WER {gap['wer']:.4f}"
+        )
     print(f"\nстрок изменено декодером: {len(differences)} из {len(all_greedy)}")
     for page_id, before, after, expected in differences[: args.examples]:
         print(f"  стр.{page_id}: было  {before[:70]!r}")
         print(f"           стало {after[:70]!r}")
         print(f"           эталон {expected[:70]!r}")
+    for page_id, before, after, expected, reason in rescore_changes[: args.examples]:
+        print(f"  [rescoring] стр.{page_id}: {before[:60]!r} -> {after[:60]!r} ({reason})")
 
     if args.json_out:
         Path(args.json_out).write_text(
@@ -442,16 +692,37 @@ def main(argv: list[str] | None = None) -> int:
                     "leave_one_page_out": bool(args.leave_one_page_out),
                     "chronological": bool(args.chronological),
                     "config": config.describe(),
+                    "rescore": {
+                        "general_lm": args.word_lm_general,
+                        "author_dir": args.word_lm_author_dir,
+                        "weights": list(args.word_weights),
+                        "rescore_weight": args.rescore_weight,
+                        "n": args.rescore_n,
+                        "guard": not args.no_rescore_guard,
+                    },
                     "pages": [
                         {
                             "page": page_id,
                             "lines": lines,
                             "greedy": greedy,
                             "beam": beam,
+                            "rescored": rescored,
                         }
-                        for page_id, lines, greedy, beam in rows
+                        for page_id, lines, greedy, beam, rescored in rows
                     ],
-                    "total": {"greedy": total_greedy, "beam": total_beam},
+                    "total": {
+                        "greedy": total_greedy,
+                        "beam": total_beam,
+                        "rescored": total_rescored,
+                    },
+                    "lm_effect": {
+                        "char_lm_cer": evaluator.evaluate_pairs(decoder_gap)["cer"] if decoder_gap else None,
+                        "char_lm_wer": evaluator.evaluate_pairs(decoder_gap)["wer"] if decoder_gap else None,
+                        "word_lm_cer": evaluator.evaluate_pairs(rescore_gap)["cer"] if rescore_gap else None,
+                        "word_lm_wer": evaluator.evaluate_pairs(rescore_gap)["wer"] if rescore_gap else None,
+                        "lines_changed_by_decoder": len(differences),
+                        "lines_changed_by_rescoring": len(rescore_changes),
+                    },
                 },
                 ensure_ascii=False,
                 indent=2,

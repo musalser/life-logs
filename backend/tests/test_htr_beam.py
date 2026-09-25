@@ -184,3 +184,72 @@ def test_beam_keeps_the_decomposed_text_the_codec_emits():
     search = PrefixBeamSearch(codec=codec, config=BeamSearchConfig(alpha=0.0, beta=0.0))
 
     assert search.decode(matrix) == "и\u0306"
+
+
+# ---------------------------------------------------------------------------
+# N-best output (for two-pass rescoring)
+# ---------------------------------------------------------------------------
+
+
+def test_nbest_returns_distinct_candidates_best_first():
+    codec = _codec("акорв ")
+    lm = CharNGram.build(["корова мычала во дворе. " * 60], order=5, min_count=1)
+    matrix = _confusable_matrix(codec, "корова", wrong="а")
+    search = PrefixBeamSearch(
+        codec=codec, lm=lm, config=BeamSearchConfig(alpha=0.8, beta=0.0, word_bonus=0.0)
+    )
+
+    candidates = search.decode_nbest(matrix, n=5)
+
+    assert 1 < len(candidates) <= 5
+    texts = [candidate.text for candidate in candidates]
+    assert len(texts) == len(set(texts)), "гипотезы должны быть различны"
+    assert texts[0] == search.decode(matrix), "топ-1 N-best совпадает с decode()"
+    assert [candidate.score for candidate in candidates] == sorted(
+        (candidate.score for candidate in candidates), reverse=True
+    )
+
+
+def test_nbest_keeps_the_acoustic_part_separate_from_the_priors():
+    """Rescoring must be able to tell acoustics from the language prior."""
+    codec = _codec("акорв ")
+    lm = CharNGram.build(["корова " * 200], order=5, min_count=1)
+    matrix = _confusable_matrix(codec, "корова", wrong="а")
+    search = PrefixBeamSearch(
+        codec=codec, lm=lm, config=BeamSearchConfig(alpha=0.8, beta=0.0, word_bonus=0.0)
+    )
+
+    candidate = search.decode_nbest(matrix, n=1)[0]
+
+    assert candidate.acoustic <= 0.0, "это log10 вероятности"
+    assert candidate.lm != 0.0, "вклад символьной LM должен быть виден"
+    assert candidate.mean_acoustic == pytest.approx(
+        candidate.acoustic / max(1, len(candidate.text))
+    )
+    # score = acoustic + lm + words; the priors only subtract here
+    assert candidate.score == pytest.approx(
+        candidate.acoustic + candidate.lm + candidate.words
+    )
+
+
+def test_nbest_without_a_language_model_returns_greedy_first():
+    codec = _codec("абв ")
+    matrix = _blank_matrix(codec, "аб в")
+    search = PrefixBeamSearch(codec=codec, config=BeamSearchConfig(alpha=0.0, beta=0.0))
+
+    candidates = search.decode_nbest(matrix, n=3)
+
+    assert candidates[0].text == greedy_text(matrix, codec) == "аб в"
+    assert candidates[0].lm == 0.0
+
+
+def test_nbest_n_larger_than_the_beam_is_not_an_error():
+    codec = _codec("абв ")
+    matrix = _blank_matrix(codec, "а")
+    search = PrefixBeamSearch(
+        codec=codec, config=BeamSearchConfig(alpha=0.0, beta=0.0, beam_width=2)
+    )
+
+    candidates = search.decode_nbest(matrix, n=50)
+
+    assert len(candidates) <= 2, "вернулось не больше, чем выжило гипотез"

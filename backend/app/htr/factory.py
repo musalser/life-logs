@@ -86,6 +86,17 @@ def build_default_model_ref() -> ModelRef:
     return ModelRef(id=settings.htr_default_model_id, path=settings.htr_default_model_path)
 
 
+def build_rescore_config():
+    """Second-pass (word-level) re-ranking settings."""
+    from .infrastructure.lm.word_rescorer import RescoreConfig
+
+    return RescoreConfig(
+        weight=settings.htr_rescore_weight,
+        guard=settings.htr_rescore_guard,
+        min_mean_acoustic=settings.htr_rescore_min_mean_acoustic,
+    )
+
+
 def build_beam_config():
     """Beam-search parameters (imported lazily: the module needs numpy only)."""
     from .infrastructure.kraken.beam import BeamSearchConfig
@@ -116,6 +127,10 @@ def build_recognizer() -> KrakenRecognizer:
         beam_config=build_beam_config(),
         lexicon_path=settings.htr_lexicon_path,
         min_lm_text_chars=settings.htr_lm_min_text_chars,
+        word_lm_path=settings.htr_word_lm_path or None,
+        rescore_config=build_rescore_config(),
+        rescore_n=settings.htr_rescore_n,
+        word_alternatives=settings.htr_word_alternatives,
     )
 
 
@@ -137,6 +152,7 @@ def build_corrector() -> OllamaLineCorrector | None:
         model=settings.htr_correction_model,
         host=settings.ollama_url,
         timeout=settings.htr_correction_timeout_s,
+        connect_timeout=settings.htr_correction_connect_timeout_s,
     )
 
 

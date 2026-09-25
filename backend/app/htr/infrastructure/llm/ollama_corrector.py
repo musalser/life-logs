@@ -25,12 +25,21 @@ class OllamaLineCorrector(TextCorrector):
         model: str,
         host: str,
         timeout: float = 90.0,
+        connect_timeout: float = 5.0,
         keep_alive: str = "10m",
         num_predict: int = 256,
     ):
         self.model = model
         self.host = host
+        #: how long one *generation* may take (a cold 12b model needs ~1 minute)
         self.timeout = timeout
+        #: how long establishing the connection may take, kept separate from
+        #: ``timeout`` on purpose: when Ollama is not running the connection is
+        #: usually not refused but silently dropped (Windows host firewall), so
+        #: one shared budget made every dead attempt cost the whole generation
+        #: timeout — measured, two of them turned a page into three minutes of
+        #: waiting followed by "no proposals".
+        self.connect_timeout = connect_timeout
         self.keep_alive = keep_alive
         self.num_predict = num_predict
         self._client: Any = None
@@ -38,10 +47,36 @@ class OllamaLineCorrector(TextCorrector):
     @property
     def client(self):
         if self._client is None:
-            import ollama  # imported lazily: the HTR module works without it
+            import httpx  # imported lazily: the HTR module works without it
+            import ollama
 
-            self._client = ollama.Client(host=self.host, timeout=self.timeout)
+            self._client = ollama.Client(
+                host=self.host,
+                timeout=httpx.Timeout(
+                    connect=self.connect_timeout,
+                    read=self.timeout,
+                    write=self.timeout,
+                    pool=self.connect_timeout,
+                ),
+            )
         return self._client
+
+    def is_available(self) -> bool:
+        """Is Ollama reachable at all? Cheap: lists models, never generates.
+
+        Loading the correction model is deliberately *not* checked (that costs
+        a minute on a cold 12b model); this only catches what actually wastes
+        the user's time — a stopped Ollama or a stale host address.
+        """
+        try:
+            self.client.list()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "HTR correction: Ollama is not reachable at %s (%s: %s)",
+                self.host, type(exc).__name__, exc,
+            )
+            return False
 
     # ------------------------------------------------------------------
 

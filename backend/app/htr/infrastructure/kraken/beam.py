@@ -56,6 +56,33 @@ class BeamSearchConfig:
 
 
 @dataclass
+class BeamCandidate:
+    """One decoded hypothesis, kept for N-best rescoring.
+
+    ``prefix`` in a CTC prefix beam search is already the *collapsed* label
+    sequence (blanks dropped, repeats merged), so distinct candidates are
+    distinct texts by construction — the dedup below is a safety net, not the
+    main mechanism.
+
+    All scores are log10. ``score`` is the full beam objective (acoustic +
+    character LM + lexicon bonuses, including the reward of the last,
+    space-less word); ``acoustic`` is the raw CTC part, which is what a
+    rescoring layer must leave intact.
+    """
+
+    text: str
+    score: float
+    acoustic: float
+    lm: float
+    words: float
+
+    @property
+    def mean_acoustic(self) -> float:
+        """Acoustic log10 per character: a length-independent confidence."""
+        return self.acoustic / max(1, len(self.text))
+
+
+@dataclass
 class _Beam:
     prefix: tuple[int, ...]
     blank: float = -math.inf
@@ -132,6 +159,40 @@ class PrefixBeamSearch:
     def decode(self, matrix: np.ndarray, temperature: float = 1.0) -> str:
         """Decode one line. ``matrix`` is kraken's record matrix: (classes, time)."""
         probs = self.probabilities(matrix, temperature)
+        scored = self._final_beams(probs)
+        return self.text(scored[0][0].prefix) if scored else ""
+
+    def decode_nbest(
+        self, matrix: np.ndarray, n: int = 10, temperature: float = 1.0
+    ) -> list[BeamCandidate]:
+        """The ``n`` best distinct hypotheses of one line, best first.
+
+        Used for two-pass decoding: the beam optimises the cheap character
+        objective, then a stronger (word-level) model re-ranks this short list.
+        """
+        probs = self.probabilities(matrix, temperature)
+        candidates: list[BeamCandidate] = []
+        seen: set[str] = set()
+        for beam, score in self._final_beams(probs):
+            text = self.text(beam.prefix)
+            if text in seen:
+                continue
+            seen.add(text)
+            candidates.append(
+                BeamCandidate(
+                    text=text,
+                    score=score,
+                    acoustic=beam.prob,
+                    lm=beam.lm,
+                    words=beam.words,
+                )
+            )
+            if len(candidates) >= max(1, n):
+                break
+        return candidates
+
+    def _final_beams(self, probs: np.ndarray) -> list[tuple[_Beam, float]]:
+        """Run the search over ``probs`` and score the survivors, best first."""
         beams = {(): _Beam(prefix=(), blank=0.0)}
         for frame in range(probs.shape[1]):
             column = probs[:, frame]
@@ -141,14 +202,14 @@ class PrefixBeamSearch:
             log_probs = np.log10(np.maximum(column[candidates], 1e-12))
             beams = self._advance(beams, candidates, log_probs)
         if not beams:
-            return ""
+            return []
         # the last word of the line has no trailing space, so its reward is
         # applied here, once, for every surviving beam
-        best = max(
-            beams.values(),
-            key=lambda beam: beam.score + self._word_reward(beam.word),
-        )
-        return self.text(best.prefix)
+        scored = [
+            (beam, beam.score + self._word_reward(beam.word)) for beam in beams.values()
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored
 
     def probabilities(self, matrix: np.ndarray, temperature: float = 1.0) -> np.ndarray:
         """Normalize kraken's matrix into (classes, time) probabilities.

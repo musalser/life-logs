@@ -252,11 +252,21 @@ class FakeCorrector:
     """Stands in for the LLM corrector: maps predictions to corrections."""
 
     model = "fake-llm"
+    host = "http://fake-ollama:11434"
 
-    def __init__(self, mapping: dict[str, str] | None = None, fail: bool = False):
+    def __init__(
+        self,
+        mapping: dict[str, str] | None = None,
+        fail: bool = False,
+        available: bool = True,
+    ):
         self.mapping = dict(mapping or {})
         self.fail = fail
+        self.available = available
         self.calls: list[tuple[str, list[str], Any]] = []
+
+    def is_available(self) -> bool:
+        return self.available
 
     def correct_line(self, text: str, context_lines: list[str], context) -> str | None:
         self.calls.append((text, list(context_lines), context))

@@ -457,6 +457,41 @@ def test_accepting_and_dismissing_proposals_is_logged(env):
     assert dismissed.suggested_text == "на еврея,"
 
 
+def test_word_alternatives_survive_the_round_trip_to_the_database(env):
+    """Alternatives are written once at recognition and read back for the editor."""
+    from app.htr.domain.entities import WordAlternative
+
+    page_service, _, _, _, user, author = env
+    page = page_service.upload_page(user.id, author.id, "page.png", png_bytes())
+    result = recognition_result()
+    first_line = result.lines[0]
+    first_line.words[0].alternatives = [
+        WordAlternative(text="Ужъ", score=-1.5),
+        WordAlternative(text="Уш", score=-2.5),
+    ]
+
+    page = page_service.apply_recognition(page.id, result)
+
+    word = page.lines[0].words[0]
+    assert [item.text for item in word.alternatives] == ["Ужъ", "Уш"]
+    assert word.alternatives[0].score == -1.5
+    # a word without alternatives simply has an empty list
+    assert page.lines[0].words[1].alternatives == []
+
+
+def test_word_alternatives_reach_the_api_response(env):
+    from app.htr.domain.entities import WordAlternative
+
+    page_service, _, _, _, user, author = env
+    page = page_service.upload_page(user.id, author.id, "page.png", png_bytes())
+    result = recognition_result()
+    result.lines[0].words[0].alternatives = [WordAlternative(text="Ужъ", score=-1.5)]
+
+    page = page_service.apply_recognition(page.id, result)
+
+    assert page.lines[0].words[0].alternatives[0].text == "Ужъ"
+
+
 def test_recognition_hands_the_author_vocabulary_to_the_decoder(env):
     """Beam scoring must prefer the author's own words, not just the dictionary."""
     from tests.htr_fakes import FakeRecognizer

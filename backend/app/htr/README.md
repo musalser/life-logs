@@ -145,7 +145,8 @@ never fails because of the LLM step.
 | `htr_correction_enabled` | `true` | expose the suggester (`POST /suggestions`, UI button) |
 | `htr_correction_auto` | `false` | also ask for proposals right after recognition |
 | `htr_correction_model` | `gemma3:12b` | Ollama model (same instance as the chat) |
-| `htr_correction_timeout_s` | `90` | per-line request timeout |
+| `htr_correction_timeout_s` | `90` | per-line *generation* timeout (a cold 12b model needs ~1 minute) |
+| `htr_correction_connect_timeout_s` | `5` | connect timeout, kept separate: a stopped Ollama behind the Windows firewall drops packets, and one shared budget made every dead attempt cost the full 90 s |
 | `htr_correction_context_lines` | `2` | neighbouring lines given as context |
 | `htr_correction_max_lexicon` / `_max_vocabulary` | `200` / `200` | prompt size caps |
 | `htr_correction_max_confusions` / `_max_examples` | `25` / `5` | prompt size caps |
@@ -292,6 +293,107 @@ legitimately contains its text, and the author's own words are known. It only
 proves that the wired path runs end to end and that the vocabulary reaches the
 decoder — the honest estimate is the chronological table.
 
+### How much the LM helps depends on the acoustic model (measured)
+
+Everything above was measured with the **base** acoustic model, which has never
+seen this handwriting. In production the author's own fine-tuned model runs, and
+the language model then has far less to repair. The clean comparison is on two
+pages the fine-tuned models have never seen (23 and 24, uploaded after v13 was
+trained), same character-LM fold, same beam parameters, only the acoustic model
+differs:
+
+| acoustic model | CER vs stored text | WER vs stored text | **characters the LM changed** | lines changed |
+| --- | --- | --- | --- | --- |
+| base | 0.0516 | 0.1842 | **2.51 %** | 37 of 58 |
+| v12 | 0.0290 | 0.0974 | **0.82 %** | 18 |
+| **v13** | **0.0249** | **0.0763** | **0.73 %** | 14 |
+
+The first two columns are *disagreement* with what the pipeline produced for
+those pages (they have no user corrections yet, so there is no ground truth);
+the third column is reference-free — it is the edit distance between the same
+model's greedy and beam output. As the acoustics get sharper the LM's
+intervention shrinks **3.4×**, which is exactly the expected effect: fewer
+ambiguous characters left to fix. The word-level second pass is even smaller —
+0.05 % of characters on v13 — and on those two pages it slightly *worsened* WER
+(0.0763 → 0.0789), which is why it ships disabled.
+
+### Re-tuning the weights on strict ground truth
+
+Two methodological fixes were needed before the weights could be re-tuned:
+
+* **honest acoustic folds** — every page is recognized by the model that existed
+  *before that page was confirmed* (v2/v7/v8/v9/v10/v11/v12 for pages 3, 9, 14,
+  16, 17, 18, 19, 20, 22). Using v12 on pages it was trained on would measure
+  memorization, not recognition. `--model-map` takes the mapping and the matrix
+  cache is keyed by model, so folds never mix;
+* **strict ground truth** — `--only-corrected` counts only the lines the user
+  actually corrected. Without it the reference of an untouched line is the
+  previous model's own output, and the LM is punished for disagreeing with it.
+  That is what had produced the old α = 0.1: on the strict reference 0.1 is
+  consistently worse.
+
+Grid on 142 corrected lines, honest folds (CER / WER):
+
+| acoustic group | α = 0.0 | α = 0.05 | α = 0.1 (old) | α = 0.2 | α = 0.4 |
+| --- | --- | --- | --- | --- | --- |
+| weak (v2: pages 3, 9, 14) | .1047/.3342 | .0964/.3045 | .0887/.2722 | **.0807/.2488** | .0799/.2550 |
+| medium (v7–v9) | .0549/.2167 | .0517/.2031 | .0493/.1920 | **.0460/.1760** | .0460/.1754 |
+| strong (v10–v12) | .0324/.1484 | .0312/.1415 | .0300/.1342 | **.0240/.1053** | .0240/.0987 |
+
+α = 0.2 wins in **every** group — the weight does not have to shrink on sharper
+acoustics; if anything the opposite. Re-tuning the rescoring weight on the same
+strict reference (leave-one-page-out selection, two α values, guard on/off,
+interpolation weights 1.0/0.0 and 0.7/0.3) gives the whole pipeline:
+
+| configuration | CER | WER |
+| --- | --- | --- |
+| α = 0.1, no second pass (what production ran) | 0.0653 | 0.2212 |
+| **α = 0.2**, no second pass | 0.0593 | 0.1998 |
+| **α = 0.2 + second pass** (w = 1.0, guard off, general-only word model) | **0.0577** | **0.1957** |
+
+So the re-tuning is worth **−11.5 % relative WER**, of which the second pass
+contributes only the last 2 % — and it selects `guard=False` and `W_author=0` on
+almost every page, i.e. the guard and the author half both stay out of the way.
+
+```
+.venv/bin/python scripts/measure_htr_decoders.py --pages 3 9 14 16 17 18 19 20 22 \
+    --model-map htr_storage/lm/model_folds.json --chronological --fold-tag chrono_leipzig \
+    --reuse-cache --only-corrected --alpha 0.2 --json-out htr_storage/lm/alpha_grid_a0.2.json
+```
+
+### A real corpus is the biggest single lever (measured)
+
+The three sources above are not equal. Word-form lists carry the letter
+patterns; **only running text teaches what follows a space**, and the author's
+own 9 k characters are far too little. Feeding the model a real corpus is a
+one-flag change (`--extra-text FILE`, or drop files into
+`htr_storage/lm/texts/`) and it was measured with exactly the same protocol,
+matrices and parameters as the table below — only the corpus differs:
+
+| | beam CER | beam WER | vs greedy WER |
+| --- | --- | --- | --- |
+| word forms + author text (9 k chars of running text) | 0.0632 | 0.2297 | −15 % |
+| **+ 40 M characters of Leipzig news text** | **0.0582** | **0.2101** | **−22 %** |
+
+Per page the gain is not uniform, and the pattern is the interesting part:
+
+| page | running text before | beam WER before | beam WER after |
+| --- | --- | --- | --- |
+| 3 | 0 | 0.3015 | **0.2764** |
+| 9 | 1 157 | 0.2388 | 0.2488 |
+| 14 | 2 356 | 0.1700 | **0.1300** |
+| 16 | 3 512 | 0.2539 | **0.2332** |
+| 17 | 4 648 | 0.2461 | **0.2356** |
+| 18 | 5 772 | 0.2701 | **0.2322** |
+| 19 | 6 975 | 0.1869 | **0.1566** |
+| 20 | 8 094 | 0.1667 | 0.1667 |
+
+The first page — the one that previously had *no* usable model and fell back to
+greedy — improves the most, and the two regressions are small. The corpus used
+here is the Leipzig Corpora news collection (`rus_news_2020_1M`, 1 M sentences,
+102 M characters); 40 M characters is the builder's default `--char-budget`, and
+raising it is the cheapest remaining experiment.
+
 ### Measured result (chronological folds, default model, α = 0.1)
 
 Reused CTC matrices, beam width 32, top-k 8, greedy against beam on the *same*
@@ -337,10 +439,16 @@ the system can actually have at the moment it recognizes a page.
 | `htr_lm_path` | `htr_storage/lm/ru_char_lm.npz` | global fallback LM; per-author `author_<id>_char_lm.npz` in the same directory is preferred |
 | `htr_beam_width` | `32` | prefixes kept per step (decode ≈ 1.1 s/line at 32, ≈ 2.7 s at 60) |
 | `htr_beam_top_k` | `8` | characters expanded per prefix |
-| `htr_beam_alpha` | `0.1` | LM weight; higher starts to invent fluent text |
+| `htr_beam_alpha` | `0.2` | LM weight; re-tuned on strict ground truth (see the acoustic-strength section) |
 | `htr_beam_beta` | `0.0` | per-word length bonus |
 | `htr_beam_word_bonus` | `0.8` | bonus per word known to the lexicon |
 | `htr_lm_min_text_chars` | `1000` | below this much running text the decoder stays greedy |
+| `htr_word_lm_path` | *(empty)* | word-level KenLM for the second pass; empty or a missing `kenlm` disables it (single-pass decoding). Measured to be noise-level, so it ships off — see the second-pass section |
+| `htr_rescore_weight` | `0.5` | weight of the word model: `final = beam_score + w · word_score` |
+| `htr_rescore_n` | `10` | hypotheses the beam hands to the second pass |
+| `htr_rescore_guard` | `false` | allow a re-ranking only when the top-1 has an out-of-dictionary word or is unsure (measured a wash; kept for a sharper future model) |
+| `htr_rescore_min_mean_acoustic` | `-0.30` | mean acoustic log10 per character below which the line counts as unsure |
+| `htr_word_alternatives` | `5` | how many alternative readings to keep per word for the editor (`0` = off) |
 
 The fallback is silent by design: a missing artifact, no space in its alphabet,
 or too little running text logs one warning and decodes greedily, so a page
@@ -348,6 +456,122 @@ always comes back. The decoder is chosen per recognition call, and the beam
 result is stored as `predicted_text` exactly like a greedy one — the language
 model never writes into `corrected_text`, and every accepted or rejected
 proposal is logged in `HTRSuggestionEvent` (see point 17 of the overview).
+
+## Word-level KenLM model (two-pass decoding)
+
+The character n-gram is deliberately cheap: it is asked ~52 000 times per line
+and ~1.5 M times per page, so it cannot afford word order. The second pass can:
+the beam hands over its N best hypotheses (`PrefixBeamSearch.decode_nbest`),
+and a **word**-level KenLM model re-ranks them, where word choice and word
+order are visible (`infrastructure/lm/word_rescorer.py`).
+
+### Building the model (KenLM's own tools, no hand-rolled weighting)
+
+`scripts/build_htr_word_lm.py` runs the whole pipeline: two `lmplz` estimations
+in intermediate format (general corpus + the author's own pages),
+`interpolate --just_tune` for the weights, `interpolate` for the final model and
+`build_binary` for the mmap-able artifact. KenLM has to be built first — it is
+not on PyPI as a wheel, and the sdist ships C++ generated by an old Cython that
+does not compile on Python 3.13:
+
+```bash
+# Boost is required by lmplz/interpolate; if the distro packages are missing,
+# build the three needed libraries into a prefix you own (no root needed):
+curl -sL -o boost.tar.gz https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.gz
+tar xzf boost.tar.gz && cd boost_1_83_0
+./bootstrap.sh --with-libraries=program_options,thread,system --prefix=/tmp/boost-install
+./b2 -j4 install
+
+# Eigen is needed by interpolate (header-only, but CMake needs its config):
+cmake /tmp/eigen-3.4.0 -DCMAKE_INSTALL_PREFIX=/tmp/eigen-install && make install
+
+# KenLM itself (the sdist's python/kenlm.cpp must be regenerated on 3.13)
+cython --cplus -3 -o python/kenlm.cpp python/kenlm.pyx
+cmake . -DBOOST_ROOT=/tmp/boost-install -DBoost_NO_SYSTEM_PATHS=ON \
+        -DEigen3_DIR=/tmp/eigen-install/share/eigen3/cmake -DCMAKE_INSTALL_PREFIX=/tmp/kenlm-install
+make -j4 && make install
+```
+
+Then, from `backend`:
+
+```bash
+.venv/bin/python scripts/build_htr_word_lm.py \
+    --general-corpus /path/to/rus_news_2020_1M-sentences.txt --author-id 1 \
+    --weights 0.5 0.5 --kenlm-bin /tmp/kenlm-install/bin
+# one small author model per evaluated page, for an honest measurement
+.venv/bin/python scripts/build_htr_word_lm.py --author-arpa-only --exclude-page 20 --output author_20.arpa
+```
+
+### Measured result: what the second pass actually buys (honest)
+
+Same chronological folds, same matrices, same beam parameters; the word model is
+the general Leipzig model (its author half is measured useless at this corpus
+size, see below), weight 0.5, N = 10:
+
+| | beam | + rescoring |
+| --- | --- | --- |
+| CER, weight chosen on the other pages (leave-one-page-out) | 0.0582 | **0.0579** |
+| WER, same | 0.2101 | **0.2082** (+0.9 %) |
+| CER / WER, best weight chosen on all 8 pages (optimistic) | 0.0582 / 0.2101 | **0.0571 / 0.2032** (+3.3 %) |
+
+So the second pass is a **small** win on this corpus, not a large one — and the
+first measurement said otherwise for an instructive reason.
+
+> **The trap: an interpolated KenLM model cannot be un-mixed at query time.**
+> The first tuning run scored candidates with the *already interpolated*
+> (general 0.5 + author 0.5) binary as its "general" model and then added the
+> author's ARPA on top of it. Because the author's own pages were baked into
+> that binary, lines from those pages scored suspiciously well: WER appeared to
+> drop from 0.2101 to **0.1464**, the optimum weight ran away to the edge of the
+> grid, and the guard looked actively harmful. With two *pure* components
+> (general as one model, a per-page author ARPA built without that page as the
+> other) the same grid gives +1…3 % and the optimum sits at a weight of ~0.5.
+> This is the same leakage that already invalidated one character-LM table
+> earlier in this document — a page must never be scored by a model that has
+> seen it.
+
+The changes the second pass makes are the ones a character model cannot see
+(word boundaries, endings, `годе → года`), but on 239 lines they move about one
+word in five hundred. The infrastructure is in place and one setting turns it
+off; the honest recommendation is to re-tune it when there is more author text,
+or to replace the word model with a stronger one (a real corpus for the author
+half, or a neural re-ranker).
+
+### Two findings worth knowing
+
+* **`lmplz` refuses to build the author half without `--discount_fallback`.**
+  With 235 lines / 1 581 tokens / 991 types, modified Kneser-Ney estimates a
+  negative discount and the tool aborts: *"2-gram discount out of range for
+  adjusted count 3: -0.79 ... rerun with --discount_fallback"*. The fallback is
+  KenLM's documented escape hatch for tiny corpora and the script always passes
+  it for the author model (the general model does not need it).
+* **`interpolate --just_tune` returns `nan` on the author's own text.** 235
+  sentences are not enough to tune two weights by likelihood; the resulting ARPA
+  contains `NaN` and `build_binary` refuses it. The script detects this and
+  either fails loudly or uses explicit `--weights`. The honest way to pick the
+  weights here is a grid on the *decoding* metric (leave-one-page-out), the same
+  way α was tuned — the tuning data is far too small for a likelihood criterion.
+
+### The guard: what it is for, and what it measured
+
+A word-level model is trained on general news text, so it pulls towards frequent
+words; applied without care it can trade «Судиславль» for a common word. The
+guard in `WordRescorer` allows a re-ranking **only** when the first pass is
+unsure — the top-1 contains a word the dictionary does not know, or its mean
+acoustic confidence is below `min_mean_acoustic`. A confident, fully known top-1
+is kept and the word model is not even queried.
+
+Measured on the honest (pure-component) grid the guard is a wash: the best
+guarded configuration gives WER 0.2044, the best unguarded 0.2032, and the
+leave-one-page-out selection chooses unguarded on most pages. It is kept as an
+option (`htr_rescore_guard`) rather than a default because it costs nothing to
+have and protects a case the corpus is still too small to show — a rare name
+inside an otherwise confident line.
+
+For the measurement the two halves are kept apart (the general binary plus a
+per-page author ARPA built without that page's text) and combined with the same
+weights; production uses the single interpolated binary. **Both inputs must be
+pure** — see the trap above.
 
 ## Provisioning (WSL2 / Linux)
 
@@ -612,23 +836,30 @@ Every version is kept, so a bad activation is reversible:
 
 ### When does training start?
 
-Fine-tuning runs after every confirmed page, but only once the author's
-confirmed corpus is large enough for training to be worthwhile. A single page
-(~30 lines) is not, so the threshold is configurable:
+Training is a **manual, explicit** step: the user presses «Обучить модель» in the
+«Рукописи» tab, which calls `POST /htr/authors/{id}/train`. Confirming a page
+only turns it into ground truth — otherwise confirming several pages in a row
+would pay for a full fine-tune (minutes) after each one.
+
+A fine-tune is still skipped while the author's confirmed corpus is too small to
+be worth it. A single page (~30 lines) is not, so the threshold is configurable:
 
 | setting | default | meaning |
 | --- | --- | --- |
 | `htr_min_training_lines` | `50` | confirmed lines required before fine-tuning |
 | `htr_min_training_words` | `0` | optional second threshold; `0` disables it |
 
-Below the threshold, confirmation still succeeds and the confirm response
-returns `training.outcome = "INSUFFICIENT_DATA"` with
-`lines_collected`/`lines_required` (and `words_*`), so the UI can explain when
-the next fine-tune will happen. No model version is created for a skipped run.
+Below the threshold the training call returns `outcome = "INSUFFICIENT_DATA"`
+with `lines_collected`/`lines_required` (and `words_*`), so the UI can explain
+what is still missing. No model version is created for a skipped run.
 
-A second confirmation arriving while the same author is already training gets
+A second training request arriving while the same author is already training gets
 `outcome = "BUSY"` immediately (a process-local per-author lock; a worker queue
 replaces it later).
+
+Because every run rebuilds the corpus from the confirmed pages that exist at
+that moment, a page confirmed after the last run is simply not in that model —
+press «Обучить модель» again to include it.
 
 ### Keeping bad pages out of training
 
@@ -754,8 +985,10 @@ The application layer never imports kraken; a second backend only needs a new
 
 | endpoint | purpose |
 | --- | --- |
-| `POST /htr/authors/{id}/pages` | upload a page image (EXIF orientation is applied) |
-| `GET /htr/authors/{id}/pages` | page list (id, status, line count, dates, prediction CER, dictionary misses) for the sidebar |
+| `POST /htr/authors/{id}/pages` | upload a page image (EXIF orientation is applied). An optional `source_path` form field keeps the client-side path of a folder upload; the file name becomes the page label |
+| `GET /htr/authors/{id}/pages` | page list (id, file name, stored order, status, line count, dates, prediction CER, dictionary misses) for the sidebar |
+| `PUT /htr/authors/{id}/pages/order` | store the order the user dragged the pages into (`page_ids`, ids the client did not send keep their relative order at the end) |
+| `PATCH /htr/pages/{id}/name` | rename the displayed file name of a page (drops the client-side `source_path`) |
 | `POST /htr/pages/{id}/recognize` | **run recognition**, store lines/words |
 | `POST /htr/pages/{id}/recognition-result` | import a result produced by an external tool (geometry is validated; it does not recognize anything) |
 | `GET /htr/pages/{id}` | read page + lines + words + confidence levels + `in_lexicon` / `oov_count` / `lexicon_available` |
@@ -766,12 +999,89 @@ The application layer never imports kraken; a second backend only needs a new
 | `PUT …/lines/{line}/suggestion`, `DELETE …/lines/{line}/suggestion` | accept / dismiss one whole proposal |
 | `PUT …/lines/{line}/suggestion/changes/{index}` | accept a single proposed word, the rest of the proposal stays |
 | `POST /htr/pages/{id}/suggestions/accept` | accept every proposal whose changes the dictionary confirms |
-| `POST /htr/pages/{id}/confirm` | confirm ground truth, measure prediction CER/WER, then fine-tune (or report `INSUFFICIENT_DATA`) |
-| `POST /htr/authors/{id}/train`, `GET /htr/authors/{id}/models` | manual training / model versions |
+| `POST /htr/pages/{id}/confirm` | confirm ground truth and measure prediction CER/WER (never starts training) |
+| `POST /htr/authors/{id}/train` | fine-tune the author's model on all confirmed pages |
+| `GET /htr/authors/{id}/models` | model versions of the author |
 
-Recognition *and* confirmation/training are synchronous for now (training the
-service is HTTP-agnostic and can move to a Celery worker unchanged; training a
-real corpus already takes minutes, so a worker is the next step).
+Recognition *and* training are synchronous for now (the training service is
+HTTP-agnostic and can move to a Celery worker unchanged; training a real corpus
+already takes minutes, so a worker is the next step).
+
+## Word geometry when the beam and greedy texts disagree
+
+The beam decoder and kraken's own greedy decoder do not always tokenize a line
+the same way: a diary line with ``где -то`` came back from the beam as
+``где-то``. The per-character cuts describe the *greedy* text, so the line's
+words used to be dropped wholesale in that case — a correct transcription with
+no word boxes at all, which reads as an interface bug. Measured on page 26, two
+of 29 lines were in exactly that state.
+
+Now the display text and the greedy text are aligned **character by character**
+(`domain/text.py::map_spans_to_reference`), and every word takes the reference
+range behind it: a merge covers both greedy words, a split gives each half its
+own slice, a letter change maps onto the changed character, and a word the beam
+inserted has no geometry *of its own* while the rest of the line keeps theirs.
+If not a single word can be built, the line says so in the log instead of
+silently returning nothing.
+
+Pages recognized before the fix keep their missing boxes (the geometry comes
+from the CTC matrix, which is not stored). ``scripts/repair_htr_word_geometry.py
+--page-id N`` re-runs recognition on the page image and inserts the missing
+``htr_words`` rows, mapping the geometry onto the **stored** text so nothing the
+user corrected is touched:
+
+```bash
+.venv/bin/python scripts/repair_htr_word_geometry.py --page-id 26 --dry-run
+.venv/bin/python scripts/repair_htr_word_geometry.py --page-id 26
+```
+
+Records are matched to lines by geometry first and, when the page was segmented
+differently, by text similarity (a record carries no ``bbox`` on this path, so
+the text fallback is what does the work in practice). The repair was applied to
+page 22 (line 23) and page 26 (lines 23 and 26) — after it, no line in the
+corpus has a transcription without word boxes. Repaired lines have geometry but
+**no** alternative readings: those come from the CTC matrix of the *stored*
+recognition, which is gone.
+
+## Alternative readings per word
+
+Clicking a word on the page selects it and, in the line's card, shows the other
+readings the recognizer considered for **that** word:
+
+```
+'вечерам' -> 'Вечерам', 'вегерам', 'веерам', 'вечером'
+'девчонки' -> 'девгонки', 'девонки'
+'а' -> 'А', 'я', 'и', 'о', 'Я'
+'завидовали.' -> 'завидовали,', 'завидовали:', 'заведовали.', 'завидовал.'
+```
+
+They come for free from the N-best list the beam search already produces
+(`PrefixBeamSearch.decode_nbest`): the hypotheses that differ in one word
+contribute their variants, aligned with `difflib.SequenceMatcher` so a merge
+(`на зывалось` → `называлось`) or a split is offered as one alternative
+(`domain/text.py::align_word_alternatives`). The list is written once, at
+recognition time (`htr_words.alternatives`), because it derives from the CTC
+matrix, which is not stored; clicking a variant inserts it through the same
+save path a manual edit takes.
+
+**The limitation is the point.** Only what the beam actually considered can
+appear here — a word the acoustic model never produced (a rare surname, a
+dialect spelling) cannot be in the list, however wrong the reading is. This is
+not a replacement for the dictionary check (violet words) or for the LLM
+proposals; it is the cheap "the model itself hesitated between these" layer.
+More caveats, all measured:
+
+* pages recognized **before** this feature have no alternatives (the list is not
+  recomputed, because it comes from the CTC matrix, which is not stored);
+* the list exists only when the beam is active (`htr_decoder=beam`) — greedy
+  decoding has no hypotheses to compare;
+* the **classical (bbox) segmenter path has no CTC matrix at all**. Measured on a
+  real crop, `BBoxOCRRecord.logits` is a list of per-character tuples
+  `(str, int, int, float)`, not a probability matrix, so that path decodes
+  greedily and produces no alternatives. The neural (baseline) segmenter, which
+  is the default, attaches the tensor and works; the recognizer now reports
+  "no CTC matrix" and falls back cleanly instead of failing with a confusing
+  "matrix must be 2-D" warning.
 
 ## Frontend: the «Рукописи» tab (`frontend/pages/manuscripts.vue`)
 
@@ -810,9 +1120,18 @@ overlay, line-by-line transcription).
 * the image viewer supports zoom (`−` / `+` / «по ширине» / 100 %, Ctrl+wheel)
   and drag panning; the page image is fetched with the bearer token and shown as
   an object URL, since `<img>` cannot send an `Authorization` header;
-* after «Подтвердить страницу» the training outcome is shown inline
-  (`SUCCESS` / `INSUFFICIENT_DATA` / `NO_IMPROVEMENT` / `BUSY` / `FAILED`) with
-  CER/WER against the baseline model.
+* «Обучить модель» (in the header, above the author selector) fine-tunes the
+  author's model on all confirmed pages via `POST /htr/authors/{id}/train`; the
+  outcome is shown inline (`SUCCESS` / `INSUFFICIENT_DATA` / `NO_IMPROVEMENT` /
+  `BUSY` / `FAILED`) with CER/WER against the baseline model. Confirming a page
+  never starts training by itself.
+* the sidebar labels a page with the **name of the uploaded file** (not its id);
+  «Загрузить папку» sends every image of a folder and keeps its relative path,
+  so a page from `1975/` and one from `1976/` with the same file name are shown
+  by their **full path** instead of the ambiguous bare name. Pages can be dragged
+  into any order (the server stores `order_index`; sorting by «по словарю»
+  disables dragging until it is switched off) and renamed with the pencil button
+  (`PATCH /htr/pages/{id}/name`).
 
 ## Known remaining work
 

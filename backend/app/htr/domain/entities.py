@@ -73,6 +73,24 @@ class LineGeometry:
     polygon: list[tuple[int, int]] | None = None
 
 
+@dataclass(frozen=True)
+class WordAlternative:
+    """Another reading the decoder considered for one word of a line.
+
+    Comes from the line-level N-best list of the beam search: every hypothesis
+    that differs in this word contributes its own variant. ``score`` is the
+    line's objective (log10, higher is better), so the UI can show the
+    alternatives best-first. The chosen reading itself is never in the list.
+
+    Only what the beam actually considered ends up here. A word the acoustic
+    model never produced at all (a name, a dialect spelling) cannot appear —
+    that is what the dictionary check and the LLM proposals are for.
+    """
+
+    text: str
+    score: float
+
+
 @dataclass
 class RecognizedWord:
     id: str
@@ -81,6 +99,8 @@ class RecognizedWord:
     confidence: float
     # polygon following the (possibly curved) baseline; bbox stays as envelope
     polygon: list[tuple[int, int]] | None = None
+    #: other readings of this word from the line's N-best (best first)
+    alternatives: list[WordAlternative] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +132,10 @@ class WordView:
     confidence: float | None
     corrected_text: str | None = None
     polygon: list[tuple[int, int]] | None = None
+    #: other readings of this word from the recognition N-best, best first.
+    #: Empty for pages recognized before the feature existed (or with the beam
+    #: disabled) — the list is not recomputed, it comes from the CTC matrix.
+    alternatives: list[WordAlternative] = field(default_factory=list)
     # vocabulary check (see app.htr.application.lexicon): True when the word is
     # in the dictionary, False when the user should look at it, None when the
     # check could not run (no dictionary installed) or there is nothing to check
@@ -218,6 +242,12 @@ class PageView:
     recognition_model_version_id: int | None = None
     prediction_cer: float | None = None
     prediction_wer: float | None = None
+    #: name of the uploaded file (basename) as shown in the sidebar
+    file_name: str | None = None
+    #: full client-side path when the upload provided one; disambiguates names
+    source_path: str | None = None
+    #: manual position in the author's list (ascending)
+    order_index: int = 0
     lines: list[LineView] = field(default_factory=list)
     # vocabulary check over the whole page (filled in on read, not stored)
     oov_count: int = 0
@@ -240,6 +270,12 @@ class PageSummary:
     # words missing from the dictionary; None when the check is unavailable
     oov_count: int | None = None
     lexicon_available: bool = False
+    #: name of the uploaded file (basename) as shown in the sidebar
+    file_name: str | None = None
+    #: full client-side path (folder upload) or None; disambiguates equal names
+    source_path: str | None = None
+    #: manual position in the author's list (ascending)
+    order_index: int = 0
 
 
 # ---------------------------------------------------------------------------

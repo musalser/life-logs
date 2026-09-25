@@ -129,7 +129,14 @@ class LineCropper(Protocol):
 
 class PageRepository(Protocol):
     def create_page(
-        self, user_id: int, author_id: int, file_path: str, width: int, height: int
+        self,
+        user_id: int,
+        author_id: int,
+        file_path: str,
+        width: int,
+        height: int,
+        file_name: str | None = None,
+        source_path: str | None = None,
     ) -> PageView: ...
 
     def get_page(self, page_id: int) -> PageView | None: ...
@@ -139,6 +146,18 @@ class PageRepository(Protocol):
         ...
 
     def list_page_summaries(self, author_id: int) -> list[PageSummary]: ...
+
+    def reorder_pages(self, author_id: int, page_ids: list[int]) -> list[PageSummary]:
+        """Store the given order and return the author's rows in it.
+
+        Ids the caller did not mention keep their relative order after the
+        listed ones, so a list built from a stale snapshot never loses a page.
+        """
+        ...
+
+    def rename_page(self, page_id: int, file_name: str) -> PageView:
+        """Set the displayed file name of a page (``source_path`` is dropped)."""
+        ...
 
     def get_confirmed_pages(self, author_id: int) -> list[PageView]: ...
 
