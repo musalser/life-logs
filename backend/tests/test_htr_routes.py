@@ -166,6 +166,38 @@ def test_page_list_reports_oov_totals(lexicon_api):
     assert body[0]["lexicon_available"] is True
 
 
+def test_author_lexicon_lists_confirmed_words_and_can_ignore_them(lexicon_api):
+    client, _, author = lexicon_api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    client.post(f"/htr/pages/{page_id}/confirm")
+
+    listing = client.get(f"/htr/authors/{author.id}/lexicon")
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["available"] is True
+    words = {item["word"]: item for item in body["words"]}
+    assert words["еврея"]["source"] == "author"
+    assert words["еврея"]["count"] == 1
+    # a word the general dictionary already knows is not worth listing: removing
+    # it would not change anything
+    assert "уж" not in words
+
+    # the word is weak evidence, not out-of-vocabulary
+    page = client.get(f"/htr/pages/{page_id}").json()
+    line = next(l for l in page["lines"] if "еврея" in (l["effective_text"] or ""))
+    assert line["oov_count"] == 0
+    assert "еврея" in line["author_only_words"]
+
+
+def test_author_lexicon_without_confirmed_pages_is_empty(lexicon_api):
+    client, _, author = lexicon_api
+    listing = client.get(f"/htr/authors/{author.id}/lexicon")
+    assert listing.status_code == 200
+    # the general dictionary is not "the author's vocabulary"
+    assert listing.json()["words"] == []
+
+
 def test_page_without_a_dictionary_reports_nothing(api):
     client, _, author = api
     page_id = upload(client, author.id)
@@ -196,6 +228,44 @@ def test_recognize_endpoint_stores_lines_and_words(api):
     # curved outlines are exposed so the UI can draw polygons, not boxes
     assert body["lines"][0]["polygon"] is not None
     assert first_word["polygon"] == [[35, 0], [90, 6], [90, 40], [35, 34]]
+
+
+def test_delete_line_removes_it_and_renumbers_the_rest(api):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    lines = client.get(f"/htr/pages/{page_id}").json()["lines"]
+    assert [line["order"] for line in lines] == [0, 1]
+
+    response = client.delete(f"/htr/pages/{page_id}/lines/{lines[0]['id']}")
+
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert [line["id"] for line in page["lines"]] == [lines[1]["id"]]
+    # no gap: the remaining line becomes the first one
+    assert [line["order"] for line in page["lines"]] == [0]
+    assert page["status"] == "EDITING"
+
+
+def test_delete_line_reports_a_missing_line(api):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    response = client.delete(f"/htr/pages/{page_id}/lines/999999")
+
+    assert response.status_code == 404
+
+
+def test_delete_line_refuses_a_confirmed_page(api):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    lines = client.post(f"/htr/pages/{page_id}/recognize").json()["lines"]
+    client.post(f"/htr/pages/{page_id}/confirm")
+
+    response = client.delete(f"/htr/pages/{page_id}/lines/{lines[0]['id']}")
+
+    assert response.status_code == 409
 
 
 def test_recognize_endpoint_reports_backend_failure(api):
@@ -760,3 +830,82 @@ def test_suggestions_endpoint_refuses_a_confirmed_page(api):
     response = client.post(f"/htr/pages/{page_id}/suggestions")
 
     assert response.status_code == 409
+
+
+def test_reopen_endpoint_returns_the_page_to_editing(api):
+    client, service, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    confirmed = client.post(f"/htr/pages/{page_id}/confirm")
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "CONFIRMED"
+    assert confirmed.json()["confirmed_at"] is not None
+
+    response = client.post(f"/htr/pages/{page_id}/reopen")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "EDITING"
+    assert body["confirmed_at"] is None
+    assert body["prediction_cer"] is None
+    assert body["prediction_wer"] is None
+    # the transcription itself is untouched
+    assert body["lines"][0]["predicted_text"] == recognition_result().lines[0].text
+
+
+def test_reopen_endpoint_refuses_an_unconfirmed_page(api):
+    client, service, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    response = client.post(f"/htr/pages/{page_id}/reopen")
+
+    assert response.status_code == 409
+    assert "CONFIRMED" in response.json()["detail"]
+
+
+def test_confirm_reports_the_words_the_page_added_to_the_dictionary(api):
+    """The response says what the confirmation taught, even without a dictionary."""
+    client, service, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    response = client.post(f"/htr/pages/{page_id}/confirm")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "added_author_words" in body
+    assert "author_words_learned" in body
+    # this service has no dictionary wired in, so nothing is reported
+    assert body["added_author_words"] == []
+    assert body["author_words_learned"] == []
+
+
+def test_confirmation_preview_lists_the_words_before_the_write(lexicon_api):
+    """The user sees the words a confirmation is about to teach, page untouched."""
+    client, _, author = lexicon_api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    response = client.get(f"/htr/pages/{page_id}/confirmation-preview")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "дед" in body["author_words_learned"]
+    assert "еврея" in body["author_words_learned"]
+    assert "на" not in body["author_words_learned"], "общий словарь знает «на»"
+    assert "дед" in body["added_author_words"]
+    # looking at the preview must not confirm anything
+    assert client.get(f"/htr/pages/{page_id}").json()["status"] == "RECOGNIZED"
+
+
+def test_confirmation_preview_refuses_an_already_confirmed_page(lexicon_api):
+    client, _, author = lexicon_api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    client.post(f"/htr/pages/{page_id}/confirm")
+
+    response = client.get(f"/htr/pages/{page_id}/confirmation-preview")
+
+    assert response.status_code == 409
+    assert "CONFIRMED" in response.json()["detail"]

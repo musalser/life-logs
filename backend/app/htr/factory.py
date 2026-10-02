@@ -30,6 +30,7 @@ from .infrastructure.model_repository import (
 )
 from .infrastructure.page_repository import SqlAlchemyPageRepository
 from .infrastructure.storage import HTRStorage, PilLineCropper
+from .infrastructure.lm.builder import rebuild_author_char_lm
 
 
 def build_training_config() -> TrainingConfig:
@@ -187,10 +188,16 @@ def build_lexicon_annotator(db: Session) -> LexiconAnnotator:
     """Dictionary check of the recognized words (optionally disabled)."""
     if not settings.htr_lexicon_enabled:
         return LexiconAnnotator(None)
+    base = load_file_lexicon(settings.htr_lexicon_path)
     return LexiconAnnotator(
         SqlAlchemyLexiconProvider(
-            corpus=SqlAlchemyAuthorCorpus(db),
-            base=load_file_lexicon(settings.htr_lexicon_path),
+            # the general dictionary is handed to the corpus so that a word the
+            # writer broke at a line break ("слуша-" + "лась") is not mistaken
+            # for vocabulary the author confirmed. The knowledge base is *not* a
+            # source here: entity extraction produces word pieces, and the panel
+            # must only list words the author confirmed with their own pages.
+            corpus=SqlAlchemyAuthorCorpus(db, base_is_known=lambda word: word in base),
+            base=base,
         )
     )
 
@@ -214,6 +221,13 @@ def build_training_service(db: Session) -> HandwritingTrainingService:
         min_training_lines=settings.htr_min_training_lines,
         min_training_words=settings.htr_min_training_words,
         environment=_environment_snapshot(),
+        # the language models follow the same corpus as the dataset, so they are
+        # rebuilt when a run happens rather than on every single corpus change
+        lm_rebuilder=(
+            (lambda author_id: rebuild_author_char_lm(db, author_id))
+            if settings.htr_training_rebuild_lm
+            else None
+        ),
     )
 
 

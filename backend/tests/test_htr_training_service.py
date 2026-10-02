@@ -265,3 +265,76 @@ def test_metrics_flag_missing_holdout():
     assert result.metrics["holdout_used"] is False
     assert result.metrics["note"] == NO_HOLDOUT_NOTE
     assert result.metrics["validation"] == {"cer": 0.02, "wer": 0.05}
+
+
+# ---------------------------------------------------------------------------
+# the language models follow the training corpus
+# ---------------------------------------------------------------------------
+
+
+def make_service_with_lm(rebuilder, dataset=None, trainer=None, model_repo=None):
+    return HandwritingTrainingService(
+        dataset_builder=FakeDatasetBuilder(dataset=dataset or make_dataset()),
+        model_repository=model_repo or FakeModelRepository(),
+        training_run_repository=FakeTrainingRunRepository(),
+        trainer=trainer or RecordingTrainer(),
+        config=TrainingConfig(),
+        min_training_lines=1,
+        min_training_words=0,
+        lm_rebuilder=rebuilder,
+    )
+
+
+def test_training_rebuilds_the_language_model():
+    """A page returned to editing must leave the LM at the next training run."""
+    calls = []
+
+    def rebuilder(author_id):
+        calls.append(author_id)
+        return "/tmp/author_7_char_lm.npz"
+
+    result = make_service_with_lm(rebuilder).train_author(AUTHOR_ID)
+
+    assert result.outcome == TrainingOutcome.SUCCESS
+    assert calls == [AUTHOR_ID], "LM должен пересобираться ровно один раз за прогон"
+
+
+def test_language_model_is_rebuilt_even_when_the_run_is_rejected():
+    """The corpus changed regardless of the quality gate."""
+    calls = []
+
+    def rebuilder(author_id):
+        calls.append(author_id)
+        return None
+
+    # a worse-than-baseline artifact: the run is rejected, the corpus changed anyway
+    trainer = RecordingTrainer(
+        validation_metrics={"cer": 0.40, "wer": 0.80},
+        baseline_metrics={"cer": 0.10, "wer": 0.20},
+    )
+    result = make_service_with_lm(rebuilder, trainer=trainer).train_author(AUTHOR_ID)
+
+    assert result.outcome == TrainingOutcome.NO_IMPROVEMENT
+    assert calls == [AUTHOR_ID]
+
+
+def test_a_failing_language_model_rebuild_does_not_fail_training():
+    def rebuilder(author_id):
+        raise RuntimeError("нет места на диске")
+
+    result = make_service_with_lm(rebuilder).train_author(AUTHOR_ID)
+
+    assert result.outcome == TrainingOutcome.SUCCESS
+
+
+def test_insufficient_data_does_not_touch_the_language_model():
+    calls = []
+    service = make_service_with_lm(
+        lambda author_id: calls.append(author_id), dataset=make_dataset(n_samples=1)
+    )
+    service.readiness = type(service.readiness)(min_lines=5, min_words=0)
+
+    result = service.train_author(AUTHOR_ID)
+
+    assert result.outcome == TrainingOutcome.INSUFFICIENT_DATA
+    assert calls == [], "без датасета пересобирать LM нечего"

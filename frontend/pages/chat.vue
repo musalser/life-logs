@@ -57,7 +57,7 @@
             <p v-else>Дневник сохранит вашу историю и поддержит тональность {{ toneLabel }}.</p>
             <button
               type="submit"
-              class="inline-flex items-center justify-center rounded-full bg-app-primary px-6 py-2 font-semibold text-app-text transition hover:bg-app-primary/80 disabled:cursor-not-allowed disabled:bg-app-primary/40"
+              class="inline-flex items-center justify-center rounded-full bg-app-primary px-6 py-2 font-semibold text-app-on-primary transition hover:bg-app-primary/80 disabled:cursor-not-allowed disabled:bg-app-primary/40"
               :disabled="chatStore.loading"
             >
               <svg

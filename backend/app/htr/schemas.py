@@ -93,6 +93,8 @@ class WordResponse(BaseModel):
     alternatives: list[WordAlternativeSchema] = []
     # vocabulary check: None when no dictionary is installed / nothing to check
     in_lexicon: bool | None = None
+    # known only from the author's own confirmed pages (weak verdict)
+    author_only: bool = False
 
 
 class SuggestionChangeSchema(BaseModel):
@@ -125,6 +127,9 @@ class LineResponse(BaseModel):
     # words of the transcription that are missing from the dictionary
     oov_count: int = 0
     oov_words: list[str] = []
+    # words known only from the author's own confirmed pages (not OOV)
+    author_only_count: int = 0
+    author_only_words: list[str] = []
 
 
 class ConfidenceThresholdsResponse(BaseModel):
@@ -239,3 +244,59 @@ class SuggestionsResponse(BaseModel):
 
     page: PageResponse
     accepted: int
+
+
+# -- the author's own vocabulary ----------------------------------------------
+
+
+class LexiconOccurrenceResponse(BaseModel):
+    """One place a word of the author dictionary stands."""
+
+    page_id: int
+    line_id: int
+    line_order: int
+    #: the spelling as it appears in the line
+    surface: str = ""
+
+
+class LexiconWordResponse(BaseModel):
+    """One word of the author dictionary panel."""
+
+    word: str
+    # occurrences on the confirmed pages; None for a knowledge-base term
+    count: int | None = None
+    # "author" (from confirmed pages) | "knowledge" (proper noun of the base)
+    source: str = "author"
+    #: up to a few places it occurs, for "show me this word in the text"
+    occurrences: list[LexiconOccurrenceResponse] = []
+
+
+class PageConfirmResponse(PageResponse):
+    """A confirmed page plus the dictionary it just taught.
+
+    ``added_author_words`` is every word that entered the author's vocabulary,
+    ``author_words_learned`` the subset the general dictionary does not know —
+    those are the ones that stop being flagged as unknown from now on.
+    """
+
+    added_author_words: list[str] = []
+    author_words_learned: list[str] = []
+
+
+class ConfirmationPreviewResponse(BaseModel):
+    """What confirming a page would teach the author dictionary.
+
+    The read-only twin of :class:`PageConfirmResponse` with the same two lists:
+    it is computed before the page is written, so the user can review — and fix
+    — the words a confirmation is about to make known.
+    """
+
+    added_author_words: list[str] = []
+    author_words_learned: list[str] = []
+
+
+class AuthorLexiconResponse(BaseModel):
+    available: bool = False
+    words: list[LexiconWordResponse] = []
+
+

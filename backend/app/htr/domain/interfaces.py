@@ -63,7 +63,17 @@ class LexiconChecker(Protocol):
     @property
     def is_available(self) -> bool: ...
 
-    def is_known(self, word: str) -> bool: ...
+    def is_known(self, word: str) -> bool:
+        """Known at all: the general dictionary, the knowledge base or the author."""
+        ...
+
+    def is_strongly_known(self, word: str) -> bool:
+        """Known without counting the author's own confirmed pages."""
+        ...
+
+    def is_author_only(self, word: str) -> bool:
+        """Known only because the author confirmed it on one of their pages."""
+        ...
 
 
 class LexiconProvider(Protocol):
@@ -71,13 +81,15 @@ class LexiconProvider(Protocol):
 
     ``checker`` combines the general dictionary with the words this author
     really writes; ``page_transcriptions`` gives the effective line texts per
-    page so lists can show an OOV total without loading every line.
+    page so lists can show an OOV total without loading every line. The
+    ``*_terms`` pair backs the dictionary panel.
     """
 
     def checker(self, author_id: int) -> LexiconChecker: ...
 
     def page_transcriptions(self, author_id: int) -> dict[int, list[str]]: ...
 
+    def author_terms(self, author_id: int) -> list[dict]: ...
 
 class HTRTrainer(ABC):
     """Fine-tunes a recognition model. Backend-specific code stays behind this."""
@@ -176,6 +188,10 @@ class PageRepository(Protocol):
     ) -> PageView: ...
 
     def apply_line_update(self, page_id: int, line_id: int, corrected_text: str) -> PageView: ...
+
+    def delete_line(self, page_id: int, line_id: int) -> PageView:
+        """Remove one line and renumber the remaining ones without gaps."""
+        ...
 
     def save_line_suggestion(
         self,

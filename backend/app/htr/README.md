@@ -132,8 +132,13 @@ Other rules:
   discarded raw reading would only be noise;
 * a hand edit drops the pending proposal of that line, and confirming a page
   clears the proposals that are still open;
-* `words_stale` is set when a proposal is accepted with a different word count,
-  i.e. when the stored word boxes really stop matching the text.
+* `words_stale` (the «разметка устарела» badge) is raised **only when the number
+  of words changes**: word boxes are built from the whitespace tokens of the
+  recognised line, so a same-length rewrite — an accepted word alternative, a
+  typo fix, an added comma, a hand rewrite — leaves box *i* on word *i* and the
+  geometry stays valid. Splits («на зывалось» → «называлось»), merges and
+  deletions shift every following box and do raise it
+  (`domain/text.alignment_preserved`).
 
 **Best-effort by design**: if Ollama is unavailable, the model is still loading
 or the answer looks unusable (empty, multi-line, or 3× shorter/longer than the
@@ -871,6 +876,194 @@ built from, so the removal stays auditable and already trained models are not
 touched. The UI offers the same action per page (trash icon) with a warning
 that a confirmed page leaves the training set.
 
+### Returning a confirmed page to editing
+
+Confirmation used to be a one-way door. `POST /htr/pages/{id}/reopen` undoes it:
+the page goes back to `EDITING`, so the transcription is editable again and the
+next fine-tune leaves the page out. It is the same state change the UI calls from
+the padlock.
+
+What the rollback does and does not touch:
+
+| | effect |
+|---|---|
+| transcription, corrections | **kept** — the user goes back to editing them |
+| `status` | `CONFIRMED` → `EDITING` |
+| `confirmed_at`, `prediction_cer`, `prediction_wer` | cleared: they described the text as it was frozen |
+| proposals (`suggested_text`) | nothing to keep: confirmation deletes them |
+| training corpus | the page is out of the next run (`dataset_hash` of past runs is unchanged) |
+| author vocabulary / OOV highlighting | out immediately — the corpus cache is invalidated |
+| language-model artifacts | refreshed at the **next training run**, not on every rollback |
+| already trained models | untouched: a fine-tune cannot be untrained (v13 keeps whatever it learned) |
+
+The operation is refused with `409` when the page is not `CONFIRMED`, and while a
+training run for that author is in flight — otherwise the run would read a corpus
+that changes under it. The in-process registry that answers that question lives in
+`application/training_service.py` (`author_training_in_progress`); it is module
+level, unlike the old per-instance lock, because every HTTP request builds its own
+service instance.
+
+The language-model refresh is wired through `htr_training_rebuild_lm` (default on)
+and `infrastructure/lm/builder.py`: the same three corpus sources as
+`scripts/build_htr_lm.py` (confirmed pages ×30, the Leipzig prose in
+`htr_storage/lm/texts/`, the dictionary's word forms), written to
+`htr_storage/lm/author_<id>_char_lm.npz`. It runs after the trainer returns, so it
+also happens for a rejected run (`NO_IMPROVEMENT`) — the corpus changed either way
+— and a failure is logged instead of failing the training. Measured cost on the
+current corpus: ≈40 s and ≈10 MB of artifact.
+
+### What a confirmation teaches the dictionary
+
+Confirming a page is the moment its words enter the author's vocabulary, so that
+is the moment the user is told about it — *before* it happens. Pressing
+«Подтвердить страницу» opens a modal that asks
+`GET /htr/pages/{id}/confirmation-preview`; the read-only twin of the write
+returns the same two lists: `added_author_words` (everything the page would
+contribute) and `author_words_learned` (the subset the general dictionary does
+**not** know, i.e. exactly what stops being flagged as unknown). The modal shows
+the counts and the second list as chips, and only `POST .../confirm` writes.
+After the confirmation the words are no longer shown: the report belonged to the
+decision.
+
+`preview_confirmation` and `confirm_page_report` share `_dictionary_delta`, so the
+preview promises exactly what the write delivers. The projection comes from
+`SqlAlchemyAuthorCorpus.author_words_with_page`, which runs the candidate page
+through the same line-break rules as a stored one; the check is then rebuilt on
+the *projected* vocabulary (`SqlAlchemyLexiconProvider.checker_with_words`),
+because on the stored one the words under review would look unknown instead of
+the author's own.
+
+Two details worth knowing:
+
+* only words actually written on the page are reported. The vocabulary also holds
+  *lookup variants* — confirming «еврея» drags in «евреё» through the old-ending
+  rule — and a report that mentions a spelling nobody typed is not checkable;
+* a word that was already in the general dictionary is still "added" to the
+  author layer, but it is not news, so it stays out of the list (the panel's
+  filter uses the same rule, `is_author_only`).
+
+Each chip of the confirmation modal opens the line the word stands in
+(`showPreviewWord`): the places are looked up on the page itself, because the word
+is not in the author dictionary yet. Once a page is confirmed, each word of the
+panel carries where it stands: `LexiconOccurrenceResponse` (`page_id`, `line_id`,
+`line_order`, `surface`), collected while the corpus snapshot is built and only
+for words the general dictionary does not know (a place for every «и» would be
+collected for nothing). Up to 8 places per word and 30 000 words; the panel then
+opens the page, scrolls to the line and puts the cursor on the word
+(`showLexiconWordInText`), falling back to selecting the token in the textarea
+when the line has no geometry for it. Measured on the current corpus: 142 words in
+the panel, 47 of them with places, none without.
+
+Returning a confirmed page to editing is a modal too (`REOPEN_CONSEQUENCES`): the
+consequences are a list, not a wall of text in a native `confirm()`.
+
+### Why the transcription uses a monospace font
+
+The two layers can only agree if bold and regular text advance identically: in a
+proportional font the bold word of the layer is wider, so the layer wraps a line
+earlier, the highlighted word slides to a second line (where the layer is clipped)
+and the caret — which the browser maps through the **textarea's own** layout —
+lands on the wrong word. Measured with Inter: a click on «минингита)» put the
+caret on the first word of the line. Monospace keeps the advance width of both
+weights the same, and the two layouts agree character for character (verified:
+layer and textarea report the same content height for every line).
+
+Two more details that are easy to miss:
+
+* the browser paints selected text in its own colour, which doubled the glyphs
+  over the coloured word — the editor therefore sets ``::selection`` to a
+  transparent foreground, so only the highlight block belongs to the textarea;
+* the mark rules need ``:deep()``: elements inserted with ``v-html`` never carry
+  the scoped-style attribute, and without it the browser draws its own yellow
+  ``<mark>`` (that is exactly what happened first). The marks are also the only
+  part of the layer with ``pointer-events: auto`` — that is what makes their
+  tooltip work, while the rest of the field still places the caret;
+* a growing textarea must be ``overflow: hidden``: on Windows a classic scrollbar
+  appears on a one-pixel overflow, takes ~17px of width, the text wraps one line
+  further and the scrollbar stays — the box both clipped the text and grew taller
+  than its content. Linux overlay scrollbars hide the bug completely, so the
+  check is an invariant (``scrollHeight <= clientHeight`` for every line) rather
+  than a look.
+
+Reference screenshots live in ``docs/screenshots/``
+(``transcription-lines.png``, ``transcription-word-variants.png``,
+``transcription-confirmed-line.png``).
+
+### Where the author dictionary comes from
+
+The dictionary has exactly **two** sources, and nothing else:
+
+* the **Russian word list** (`htr_storage/lexicon/ru_lexicon.bloom`, 2.4M forms);
+* the words of the author's **confirmed** pages, which is what the panel lists —
+  and only those the Russian list does *not* know (`is_author_only`), because a
+  word the general dictionary has changes nothing.
+
+An author with no confirmed page therefore shows an **empty** panel, however many
+pages are uploaded and recognized.
+
+**The knowledge base is deliberately not a source.** It used to be one (its terms
+were the "strong" layer), and that was wrong twice over. First, the terms do not
+come from the manuscript: they are entities of the diary pipeline, so an author
+with zero confirmed pages showed a list anyway. Second, that pipeline stores
+WordPiece pieces — measured on a real base: of 81 entities **35 were debris**
+(`"##ang"`, `"##отчик"`, `"##овского"`, `"Gol"`, `"Vu"`, `"Prom"`,
+`"##eus Grafana"` next to `"Golang"`, `"Vue"`, `"Prometheus"`, `"Grafana"`), which
+made fragments like `ang`, `sk`, `vu` count as known Russian words. The knowledge
+vocabulary is still fed to the LLM corrector (`CorrectionContextBuilder`), where
+names and places help the model — it is simply not a dictionary.
+
+There is also **no "ignore this word" feature any more**. It existed to override
+the general dictionary (measured: «иро» is a real entry of the 2.4M-form list, so
+a wrong reading could be "known" forever), but the dictionary is meant to be the
+Russian language, not a per-user blacklist. The `htr_lexicon_ignore` table is left
+in place with whatever it held; nothing reads it.
+
+### Words broken by a line break
+
+Diaries break words at the right margin, and the recognizer reads each line on
+its own, so the author's vocabulary used to collect both halves as if the writer
+had used them: «слуша-» + «лась», «звакуи» + «ровать», «рела», «лись». They are
+not words, and they taught the OOV highlighting that a fragment is vocabulary.
+
+`domain/text.py::line_break_analysis` decides otherwise, and it needs **two
+different signals** because the dictionary alone cannot answer either question:
+
+* **is the join a word?** — the general dictionary (Bloom artifact), including
+  the hyphen case («слуша-» + «лась» → «слушалась») and a single recognition slip
+  (measured: «зажитог» + «ным» is зажиточным, «звакуи» + «ровать» is
+  эвакуировать). Confusions are only tried at the **seam** and at the first
+  letter of the fragment, where such slips actually happen;
+* **is a half a word of its own?** — the corpus, not the dictionary: a form that
+  appears somewhere *inside* a line is a word («ямы», «было», «она»), a form that
+  only ever touches a line edge is not. The dictionary cannot be asked this: it
+  answers "yes" to roughly one random string in a hundred, and it also contains
+  morphemes («ным», «ровать»), so «ямыво» and «онане» would pass as words.
+
+A fragment is never rewritten in the text — the two lines stay as recognized.
+Only the vocabulary is corrected: both halves leave `author_words` (unless a half
+is a word, e.g. «строительном» in «домо-» + «строительном») and the joined form
+enters it, so the *complete* word is now known. A join found only through a
+recognition slip is not added: the joined form carries the error that hid it from
+the dictionary, and the user should fix the text instead.
+
+Measured on the current corpus (12 confirmed pages, 351 lines): 12 joins found,
+17 fragment forms removed, 9 complete words added — «лась», «лись», «рела» and
+«звакуи» included. **One of the twelve is a false positive** («пастбища» +
+«стадо»): the Bloom artifact answers "yes" to «настбищастадо» once in ~2500
+lookups. A second filter with a different seed would make that vanish; the cost
+so far is one real word leaving the vocabulary.
+
+The check needs the general dictionary, so `SqlAlchemyAuthorCorpus` takes
+`base_is_known` (wired in `factory.build_lexicon_annotator`); without it the raw
+corpus is returned untouched. The snapshot also carries `line_breaks` for
+inspection.
+
+The dictionary artifact itself was rebuilt with `--false-positive-rate 0.0001`
+(0.96 % → 0.04 % false "yes", 2.9 MB → 5.8 MB); the old one is kept next to it as
+`ru_lexicon.bloom.fp1pct.bak`. Because the false-positive rate also drives the
+OOV highlighting, `scripts/calibrate_htr_lexicon.py` can be re-run if the
+thresholds need re-tuning.
+
 ### Metrics and holdout
 
 Each run stores training and validation metrics in the model metadata. The
@@ -930,6 +1123,7 @@ segmenter the CPU path is noticeably slower, so set `cuda:0` when a GPU exists.
 | `htr_training_normalization` | `NFD` | Unicode normalization of training text (must match the codec) |
 | `htr_training_height` / `htr_training_max_width` | `96` / `2560` | line geometry (informational: the loaded checkpoint overrides the height — it declares 96, see the height section) |
 | `htr_training_height_override` | `0` | force a different line height after loading (`0` = trust the checkpoint); A/B with `scripts/measure_htr_height.py` |
+| `htr_training_rebuild_lm` | `true` | rebuild `author_<id>_char_lm.npz` during a training run (≈40 s), so pages returned to editing leave the language model; failures never fail the run |
 | `htr_training_variant` | `medium` | PP-OCRv6 size if training from scratch |
 | `htr_training_precision` | `32-true` | Lightning precision |
 | `htr_training_num_workers` | `0` | dataloader workers (`0` = in-process) |
@@ -995,13 +1189,16 @@ The application layer never imports kraken; a second backend only needs a new
 | `DELETE /htr/pages/{id}` | delete a page (with its image and crops); it leaves every future training corpus |
 | `GET /htr/pages/{id}/image` | the raw page image (the frontend fetches it with the bearer token and renders it as a blob) |
 | `PATCH …/lines/{line}/words/{word}`, `PUT …/lines/{line}` | corrections (`corrected_text` is the single source of truth) |
+| `DELETE …/lines/{line}` | delete a line the segmenter invented; the remaining lines are renumbered (editable pages only) |
 | `POST /htr/pages/{id}/suggestions` | ask the LLM for fixes; they are stored as proposals, the transcription is untouched |
 | `PUT …/lines/{line}/suggestion`, `DELETE …/lines/{line}/suggestion` | accept / dismiss one whole proposal |
 | `PUT …/lines/{line}/suggestion/changes/{index}` | accept a single proposed word, the rest of the proposal stays |
 | `POST /htr/pages/{id}/suggestions/accept` | accept every proposal whose changes the dictionary confirms |
-| `POST /htr/pages/{id}/confirm` | confirm ground truth and measure prediction CER/WER (never starts training) |
+| `POST /htr/pages/{id}/confirm` | confirm ground truth and measure prediction CER/WER (never starts training); the response lists the words the confirmation added to the author's vocabulary |
+| `POST /htr/pages/{id}/reopen` | undo the confirmation: back to `EDITING`, metrics cleared, the next training run ignores the page (`409` if it is not confirmed or a run is in flight) |
 | `POST /htr/authors/{id}/train` | fine-tune the author's model on all confirmed pages |
 | `GET /htr/authors/{id}/models` | model versions of the author |
+| `GET /htr/authors/{id}/lexicon` | the words the author's confirmed pages contributed (weak vocabulary) + the removed ones |
 
 Recognition *and* training are synchronous for now (the training service is
 HTTP-agnostic and can move to a Celery worker unchanged; training a real corpus
@@ -1097,30 +1294,102 @@ overlay, line-by-line transcription).
   thresholds configurable) — grey outline, amber, red; the scan is light paper,
   so every polygon also carries a dark halo (drop-shadow);
 * words the dictionary does not know are filled **violet** (a channel of their
-  own, the confidence outline stays amber/red), the line gets a
-  «не в словаре: N» badge and a chip per word — clicking a chip selects the word
-  on the page. The sidebar shows each page's count and can sort by it
-  («по словарю»); the selected word is outlined in white, so it is visible on
-  top of every fill colour;
+  own, the confidence outline stays amber/red); the selected word is outlined in
+  white, so it is visible on top of every fill colour;
+* a word the **general** dictionary does not know, but the author's own
+  confirmed pages do, is *not* out-of-vocabulary: it gets a dotted violet
+  outline, because a name or dialect word looks exactly like a typo that was
+  confirmed once. The «Словарь автора» panel lists those words with their
+  occurrence counts; removing one makes it unknown again on every page
+  (the ability to declare a word "not a word" was removed: the dictionary is the
+  Russian language, not a per-user blacklist);
 * clicking a word polygon scrolls to its line and selects the token in the
   textarea (only while the line's word alignment is still valid);
 * transcriptions are per-line textareas; a line is saved on blur via
-  `PUT /htr/pages/{id}/lines/{line_id}`. After a save the server marks
-  `words_stale`, and the UI shows a «разметка устарела» badge and dims/dashes
-  that line's polygons instead of pretending the old geometry still matches;
-* «Предложить правки» shows the model's fixes *under* the line, as
-  `было → стало` chips coloured by the dictionary verdict (green verified,
-  violet unknown); each chip is clickable and applies only that word, while
-  «Принять всё» / «Скрыть» work per line and «Принять проверенные (N)» works for
-  the whole page — the textarea keeps showing the kraken output until something
-  is accepted;
+  `PUT /htr/pages/{id}/lines/{line_id}`. The server raises `words_stale` only
+  when the edit changed the word count (see above); then the UI shows a
+  «разметка устарела» badge and dims/dashes that line's polygons instead of
+  pretending the old geometry still matches. A same-length edit — including an
+  accepted word alternative — leaves the polygons valid and shows no badge.
+  the transcription box carries the dictionary verdict **and the confidence on
+  the words themselves**: the text is drawn by a layer with the same characters,
+  while the textarea above it is transparent and only owns the caret and the
+  selection. Unknown words are fuchsia and bold, the author's own words are violet
+  and bold with a dotted underline, a word below the warning threshold is amber
+  and below the critical one red — the same two colours the scan uses, so the
+  card's left edge and the words inside it agree. Colour carries the strongest
+  signal (critical → warning → not in dictionary → author's word) and a word with
+  two keeps the second as an underline (a doubtful dictionary miss: amber text,
+  fuchsia underline). Hovering a coloured word explains it in a tooltip — «нет в
+  словаре — проверьте слово · уверенность 77 % — ниже порога 0.9» — and clicking it
+  selects the word and offers the variants, exactly like clicking it on the scan.
+  The box grows with its content, so nothing scrolls inside a line. Clicking a word *in the text* does
+  what clicking it on the scan does — the word is selected in the textarea, it
+  lights up white on the scan and the variants the decoder considered appear
+  under the line (chips only, no caption; the panel closes with its ✕);
+  **there is no line header**: the confidence is the colour of the card's left
+  edge (quiet green → amber → red), the line number lives in its tooltip, and
+  «copy» / «delete» sit in a narrow column right of the box. Only states that ask
+  for an action — a pending proposal, a stale markup, a save in flight — add a
+  second row to a card. Measured on a 29-line page: 11.2 lines visible instead of
+  8.2 before the redesign;
+  deleting a line (with confirmation,
+  editable pages only) calls `DELETE …/lines/{line}`, and the panel header has a
+  **copy-all** button that puts the whole transcription (unsaved drafts
+  included, one line per row) on the clipboard;
+* the page header has **one** padlock control: an open padlock confirms the page,
+  a closed one returns it to editing, with the consequences spelled out in the
+  dialog (corrections kept, page out of the next training run, words drop out of
+  the author's vocabulary, metrics cleared, already trained models untouched).
+  The page list repeats the padlock per row, so a page can be reopened without
+  opening it first. `readOnly` is derived from `status === 'CONFIRMED'`, so
+  reopening restores editing and brightens the markup with no extra state;
+* LLM proposals are still shown *under* the line as `было → стало` chips coloured
+  by the dictionary verdict (green verified, violet unknown); each chip is
+  clickable and applies only that word, while «Принять всё» / «Скрыть» work per
+  line and «Принять проверенные (N)» works for the whole page — the textarea
+  keeps showing the kraken output until something is accepted. The **launch**
+  button («Предложить правки») was removed from the UI: `POST
+  /htr/pages/{id}/suggestions` is still there, proposals that are already stored
+  keep being offered, and bringing the button back is one `v-if` — the automatic
+  correction was already off by default;
 * «Распознать заново» also works for a page in `EDITING` (e.g. to pick up the
   new segmenter); it asks for confirmation because the corrections of that page
   are replaced (`?force=true`);
-* the image viewer supports zoom (`−` / `+` / «по ширине» / 100 %, Ctrl+wheel)
-  and drag panning; the page image is fetched with the bearer token and shown as
-  an object URL, since `<img>` cannot send an `Authorization` header;
-* «Обучить модель» (in the header, above the author selector) fine-tunes the
+* the image viewer opens a page **fitted to the window**, and that fitted view is
+  what the badge calls **100 %**. The label is relative on purpose: a diary scan is
+  ~3000 px wide against a ~700 px column, so the same view is 24 % of its natural
+  size — a number that tells the reader nothing about whether they are seeing too
+  much or too little. The absolute scale is still what the transform and the stroke
+  widths use; only the label is rebased, and the base is recomputed when the image
+  or the window changes (a fitted view stays fitted while the window resizes, still
+  reading 100 %). Zooming is a **plain wheel** around the pointer, dragging pans,
+  and double-click returns to the fitted 100 % view. The percentage appears in a
+  corner badge **only while it changes** (fading out ~1.1 s after the glide
+  settles), so it never sits on the scan as decoration. Reference:
+  `docs/screenshots/viewer-fit-100.png`. The zoom **glides**: the wheel only
+  moves a target and one animation frame loop eases the visible scale towards it
+  (time-based, `1 - exp(-dt / 90 ms)`, so 60 Hz and 144 Hz screens feel the same).
+  The point under the cursor is the anchor and the pan is recomputed from it on
+  every frame, so the handwriting grows around the pointer: measured, one notch
+  gives 15 distinct scales over 34 frames with the anchored pixel drifting 0.1 px,
+  and six notches in a row land exactly on the accumulated factor (×2.46). The
+  stroke widths follow the zoom through a CSS variable on the `<svg>` instead of
+  per-polygon bindings, so a frame touches one element rather than hundreds;
+  dragging cancels the glide (no fighting the pointer), `prefers-reduced-motion`
+  skips it, and double-click glides to the fitted page, ending exactly at offset
+  zero. A **confirmed** page is frozen, so its markup is drawn faintly
+  (`opacity 0.16`, the legend dimmed) instead of competing with the handwriting;
+  the page image is fetched with the bearer token and shown as an object URL,
+  since `<img>` cannot send an `Authorization` header;
+* the header is a **single toolbar row** (measured 55 px against three rows
+  before): title, the author everything below works in (`автор` selector, «+ автор»,
+  «Словарь автора») and the actions on the right. The long explanation moved into
+  the title's tooltip and the shouting uppercase label became a small muted one,
+  because a toolbar is not a landing page. «Обучить модель» is deliberately a
+  quiet green outline rather than a second filled button: uploading a page is what
+  this screen is for, training is the rare, expensive step (see
+  `docs/screenshots/toolbar.png`). «Обучить модель» fine-tunes the
   author's model on all confirmed pages via `POST /htr/authors/{id}/train`; the
   outcome is shown inline (`SUCCESS` / `INSUFFICIENT_DATA` / `NO_IMPROVEMENT` /
   `BUSY` / `FAILED`) with CER/WER against the baseline model. Confirming a page
@@ -1128,10 +1397,14 @@ overlay, line-by-line transcription).
 * the sidebar labels a page with the **name of the uploaded file** (not its id);
   «Загрузить папку» sends every image of a folder and keeps its relative path,
   so a page from `1975/` and one from `1976/` with the same file name are shown
-  by their **full path** instead of the ambiguous bare name. Pages can be dragged
-  into any order (the server stores `order_index`; sorting by «по словарю»
-  disables dragging until it is switched off) and renamed with the pencil button
-  (`PATCH /htr/pages/{id}/name`).
+  by their **full path** instead of the ambiguous bare name. Hovering a name
+  shows the path it was uploaded from (the server-side storage path is never
+  shown). Pages can be dragged into any order (the server stores `order_index`)
+  and renamed with the pencil button (`PATCH /htr/pages/{id}/name`);
+* the lock in a sidebar row is the page status: a closed green padlock means
+  confirmed ground truth (clicking it returns the page to editing), a grey open
+  one means editable. The page id, line count, upload date and prediction CER of
+  the **open** page sit in the info line under the image.
 
 ## Known remaining work
 

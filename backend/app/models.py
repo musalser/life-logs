@@ -475,3 +475,27 @@ class HTRTrainingRun(Base):
     status = Column(String(32), nullable=False, default="RUNNING", index=True)
     error = Column(Text, nullable=True)
     metrics = Column(Text, nullable=True)  # JSON
+
+
+class HTRLexiconIgnore(Base):
+    """A word the user took out of their own vocabulary.
+
+    The vocabulary check treats the words of the author's confirmed pages as
+    known, so their names and dialect words are not flagged. The flip side is
+    that a typo confirmed once becomes "known" everywhere. This table is the
+    escape hatch: an ignored word is subtracted from the author's vocabulary
+    (and from the knowledge terms), so it is flagged again as unknown.
+    """
+
+    __tablename__ = "htr_lexicon_ignores"
+    __table_args__ = (
+        UniqueConstraint("author_id", "word", name="uq_htr_lexicon_ignore_author_word"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    author_id = Column(
+        Integer, ForeignKey("htr_authors.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # normalized (casefolded) surface form, length covers any real word
+    word = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

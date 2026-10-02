@@ -2,6 +2,143 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * ---------------------------------------------------------------------------
+ * THEME TOKENS
+ * ---------------------------------------------------------------------------
+ * Every colour of the app is a CSS variable on <html>, so switching the theme
+ * is one attribute (`data-theme="light|dark"`), not a rebuild of the markup.
+ *
+ * Two dark/light palettes:
+ *   light — Solarized Light (the exact VS Code palette: base3 page, base2
+ *           panels, base01 text, base1 comments, base0 body, blue/cyan/violet
+ *           accents).  #fdf6e3 #eee8d5 #93a1a1 #839496 #586e75 #657b83 #268bd2
+ *   dark  — the palette the app shipped with, unchanged.
+ *
+ * The neutral scale is taken from VS Code's Solarized Light theme:
+ *   page          #fdf6e3   (base3, editor.background)
+ *   panel/surface #eee8d5   (base2, sideBar.background)
+ *   input         #e4ddc8   — pushed a touch off base2 so a field reads as a field
+ *   text          #586e75   (base01 — VS Code's editor.foreground)
+ *   muted/dim     #7c8c8d   — the palette's base1 (#93a1a1), darkened just
+ *                            enough to stay readable as small comment text
+ *   border        #d3cbb7   (base2 stepped down)
+ *   accent        #268bd2   (blue)
+ * ---------------------------------------------------------------------------
+ */
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* neutrals */
+  --c-bg: 2 6 23;
+  --c-surface: 15 23 42;
+  --c-panel: 17 24 39;
+  --c-border: 31 41 55;
+  --c-input: 2 6 23;
+  --c-text: 248 250 252;
+  --c-muted: 148 163 184;
+  --c-dim: 100 116 139;
+  --c-soft: 30 41 59;
+  --c-line: 148 163 184;
+  --c-on-surface: 226 232 240;
+
+  /* accents */
+  --c-primary: 99 102 241;
+  --c-on-primary: 255 255 255;
+  --c-accent: 165 180 252;
+  --c-accent-strong: 199 210 254;
+  --c-user: 79 70 229;
+  --c-assistant: 30 41 59;
+  --c-error: 248 113 113;
+
+  /* status: ok / warning / oov / author */
+  --c-ok: 16 185 129;
+  --c-ok-text: 167 243 208;
+  --c-ok-text-soft: 110 231 183;
+  --c-ok-strong: 52 211 153;
+  --c-ok-on: 5 46 34;
+  --c-warn: 245 158 11;
+  --c-warn-text: 251 191 36;
+  --c-oov: 167 139 250;
+  --c-oov-text: 221 214 254;
+  --c-magenta: 232 121 249;
+
+  /* status chips in the template (bg-emerald-500/15 & co) */
+  --c-chip-ok-bg: 16 185 129;
+  --c-chip-ok-border: 52 211 153;
+  --c-chip-ok-text: 167 243 208;
+  --c-chip-ok-text-soft: 233 255 245;
+  --c-chip-warn: 251 191 36;
+  --c-chip-oov-text: 196 181 253;
+
+  /* the transcription editor and the word overlay on the scan */
+  --c-overlay-soft: 148 163 184;
+  --c-overlay-strong: 226 232 240;
+  --c-ink: 248 250 252;
+  --c-line-poly: 148 163 184;
+  --c-word-normal: 148 163 184;
+  --c-word-edge: 71 85 105;
+  --c-overlay-line: 148 163 184;
+}
+
+:root[data-theme='light'],
+[data-theme='light'] {
+  color-scheme: light;
+
+  /* Solarized Light */
+  --c-bg: 253 246 227; /* base3 */
+  --c-surface: 238 232 213; /* base2 */
+  --c-panel: 238 232 213; /* base2 */
+  --c-border: 211 203 183;
+  --c-input: 228 221 200;
+  --c-text: 88 110 117; /* base01 */
+  --c-muted: 124 140 141;
+  --c-dim: 147 161 161; /* base1 */
+  --c-soft: 228 221 200;
+  --c-line: 190 183 164;
+  --c-on-surface: 88 110 117;
+
+  --c-primary: 38 139 210; /* blue */
+  --c-on-primary: 253 246 227;
+  --c-accent: 38 139 210;
+  --c-accent-strong: 42 161 152; /* teal */
+  --c-user: 38 139 210;
+  --c-assistant: 238 232 213;
+  --c-error: 203 75 22; /* orange */
+
+  --c-ok: 133 153 0; /* green */
+  --c-ok-text: 88 110 117;
+  --c-ok-text-soft: 133 153 0;
+  --c-ok-strong: 88 110 117;
+  --c-ok-on: 253 246 227;
+  --c-warn: 181 137 0; /* yellow */
+  --c-warn-text: 181 137 0;
+  --c-oov: 108 113 196; /* violet */
+  --c-oov-text: 108 113 196;
+  --c-magenta: 211 54 130; /* magenta */
+
+  --c-chip-ok-bg: 133 153 0;
+  --c-chip-ok-border: 133 153 0;
+  --c-chip-ok-text: 71 82 0;
+  --c-chip-ok-text-soft: 71 82 0;
+  --c-chip-warn: 181 137 0;
+  --c-chip-oov-text: 108 113 196;
+
+  /*
+   * The word overlay deliberately keeps its dark-theme palette in the light
+   * theme: it is painted on the scan, which is light paper whatever the app
+   * chrome looks like, so the boxes stay dark-on-paper.
+   */
+  --c-overlay-soft: 148 163 184;
+  --c-overlay-strong: 226 232 240;
+  --c-ink: 248 250 252;
+  --c-line-poly: 148 163 184;
+  --c-word-normal: 148 163 184;
+  --c-word-edge: 71 85 105;
+  --c-overlay-line: 148 163 184;
+}
+
 @layer base {
   body {
     @apply font-body bg-app-bg text-app-text antialiased;
@@ -11,6 +148,23 @@
   h2,
   h3 {
     @apply font-heading;
+  }
+
+  /*
+   * Native widgets follow the theme, so a select, a scrollbar and autofill do
+   * not stay dark on the Solarized page.
+   */
+  ::placeholder {
+    color: rgb(var(--c-dim) / 0.9);
+  }
+
+  * {
+    scrollbar-color: rgb(var(--c-border)) transparent;
+  }
+
+  select option {
+    background: rgb(var(--c-surface));
+    color: rgb(var(--c-text));
   }
 }
 

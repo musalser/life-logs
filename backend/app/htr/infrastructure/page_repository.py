@@ -19,6 +19,7 @@ from ..domain.entities import (
     WordView,
 )
 from ..domain.errors import NotFoundError
+from ..domain.text import alignment_preserved
 from .lexicon import AuthorCorpusCache, author_corpus_cache
 
 
@@ -362,10 +363,29 @@ class SqlAlchemyPageRepository:
             raise NotFoundError(f"Line {line_id} not found on page {page_id}")
         line.corrected_text = corrected_text
         line.corrected_by = "user"
-        # tokenization may have changed; word alignment is no longer trusted
-        line.words_stale = True
+        # only a different word count shifts the boxes; a same-length rewrite
+        # (typo, punctuation, an accepted alternative) keeps the alignment
+        line.words_stale = not alignment_preserved(len(line.words), corrected_text)
         line.suggested_text = None
         line.suggested_by = None
+        page.status = PageStatus.EDITING.value
+        self.db.commit()
+        self._invalidate_corpus(page.author_id)
+        return _to_page_view(self._get_orm_page(page_id))
+
+    def delete_line(self, page_id: int, line_id: int) -> PageView:
+        """Remove one line (and its words) and keep the remaining order gapless."""
+        page = self._get_orm_page(page_id)
+        line = next((l for l in page.lines if l.id == line_id), None)
+        if line is None:
+            raise NotFoundError(f"Line {line_id} not found on page {page_id}")
+        # drop it from the collection too, otherwise the in-memory order would
+        # keep pointing at the deleted row
+        page.lines.remove(line)
+        self.db.delete(line)
+        # the UI numbers lines by position, so a gap would read as "Строка 30, 32"
+        for index, remaining in enumerate(page.lines):
+            remaining.order_index = index
         page.status = PageStatus.EDITING.value
         self.db.commit()
         self._invalidate_corpus(page.author_id)
@@ -395,8 +415,12 @@ class SqlAlchemyPageRepository:
                 continue
             line.corrected_text = line.suggested_text
             line.corrected_by = "user"
-            # accepting changes the tokenization as often as typing does
-            line.words_stale = True
+            # a proposal that keeps the word count (the usual case: a typo, a
+            # missing comma, a corrected letter) leaves every box on its word;
+            # only a merge/split really invalidates the geometry
+            line.words_stale = not alignment_preserved(
+                len(line.words), line.corrected_text
+            )
             line.suggested_text = None
             line.suggested_by = None
             page.status = PageStatus.EDITING.value
@@ -410,8 +434,9 @@ class SqlAlchemyPageRepository:
         line = self._line(page, line_id)
         line.corrected_text = corrected_text
         line.corrected_by = "user"
-        # a single accepted word changes the tokenization as much as typing
-        line.words_stale = True
+        # accepting one word of a proposal is a same-length rewrite unless the
+        # alternative is a merge/split, so the boxes usually stay valid
+        line.words_stale = not alignment_preserved(len(line.words), corrected_text)
         page.status = PageStatus.EDITING.value
         self.db.commit()
         self._invalidate_corpus(page.author_id)
@@ -458,6 +483,24 @@ class SqlAlchemyPageRepository:
             )
         )
         self.db.commit()
+
+    def reopen_page(self, page_id: int) -> PageView:
+        """Undo a confirmation: the page leaves the ground-truth corpus.
+
+        Corrections stay (the user may want to keep editing them), while the
+        confirmation timestamp and the prediction metrics are dropped: they
+        described the transcription as it was frozen, not the page now. The
+        author corpus cache is invalidated, so the page's words stop counting as
+        the author's vocabulary immediately.
+        """
+        page = self._get_orm_page(page_id)
+        page.status = PageStatus.EDITING.value
+        page.confirmed_at = None
+        page.prediction_cer = None
+        page.prediction_wer = None
+        self.db.commit()
+        self._invalidate_corpus(page.author_id)
+        return _to_page_view(self._get_orm_page(page_id))
 
     def confirm_page(
         self,

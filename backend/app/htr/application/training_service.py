@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from ..domain.entities import (
@@ -43,6 +45,32 @@ NO_HOLDOUT_NOTE = (
 )
 
 
+#: Training is synchronous, so two runs for the same author would otherwise
+#: fight over the GPU. The registry lives at module level because every HTTP
+#: request builds its own service instance — an instance attribute guarded
+#: nothing across requests. A worker queue replaces this later.
+_AUTHOR_LOCKS: dict[int, threading.Lock] = {}
+_AUTHOR_LOCKS_GUARD = threading.Lock()
+
+
+def author_training_lock(author_id: int) -> threading.Lock:
+    with _AUTHOR_LOCKS_GUARD:
+        return _AUTHOR_LOCKS.setdefault(author_id, threading.Lock())
+
+
+def author_training_in_progress(author_id: int) -> bool:
+    """Is a training run for this author running in this process right now?
+
+    Operations that change the training corpus (returning a confirmed page to
+    editing, for instance) refuse to run while a fine-tune is reading it.
+    """
+    lock = author_training_lock(author_id)
+    if lock.acquire(blocking=False):
+        lock.release()
+        return False
+    return True
+
+
 class HandwritingTrainingService:
     def __init__(
         self,
@@ -54,6 +82,7 @@ class HandwritingTrainingService:
         min_training_lines: int = 50,
         min_training_words: int = 0,
         environment: dict[str, Any] | None = None,
+        lm_rebuilder: Callable[[int], Path | None] | None = None,
     ):
         self.dataset_builder = dataset_builder
         self.model_repository = model_repository
@@ -64,15 +93,29 @@ class HandwritingTrainingService:
             min_lines=min_training_lines, min_words=min_training_words
         )
         self.environment = environment or {}
-        # Training is synchronous, so two confirmations arriving together would
-        # otherwise train the same author concurrently (and fight over the GPU).
-        # The guard is process-local; a worker queue replaces it later.
-        self._author_locks: dict[int, threading.Lock] = {}
-        self._author_locks_guard = threading.Lock()
+        #: Rebuilds the author's language-model artifacts from the current
+        #: confirmed corpus. Injected, so the application layer stays free of
+        #: infrastructure imports; None disables the refresh.
+        self.lm_rebuilder = lm_rebuilder
+
+    def _refresh_language_model(self, author_id: int) -> None:
+        """Best effort: a failure here must never fail a training run."""
+        if self.lm_rebuilder is None:
+            return
+        try:
+            path = self.lm_rebuilder(author_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "HTR language model rebuild failed for author_id=%s: %s", author_id, exc
+            )
+            return
+        if path is not None:
+            logger.info(
+                "HTR language model rebuilt: author_id=%s path=%s", author_id, path
+            )
 
     def _author_lock(self, author_id: int) -> threading.Lock:
-        with self._author_locks_guard:
-            return self._author_locks.setdefault(author_id, threading.Lock())
+        return author_training_lock(author_id)
 
     def train_author(self, author_id: int) -> TrainingResult:
         lock = self._author_lock(author_id)
@@ -160,6 +203,11 @@ class HandwritingTrainingService:
                 config=self.config,
             )
             metrics = self._build_metrics(run_result)
+            # The character/word models are built from the same confirmed pages
+            # as the dataset, so they are refreshed here — at training time —
+            # rather than on every corpus change: a page returned to editing must
+            # disappear from them, a newly confirmed one must appear.
+            self._refresh_language_model(author_id)
             improved, reason = self._beats_baseline(run_result)
             if not improved:
                 # Training worked, but the artifact is worse than the model it

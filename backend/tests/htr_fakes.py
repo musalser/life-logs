@@ -291,19 +291,28 @@ class FakeWordList:
 
 
 class FakeLexiconProvider:
-    """Stands in for the dictionary: only ``known`` words are in the lexicon."""
+    """Stands in for the dictionary: only ``known`` words are in the lexicon.
+
+    ``author`` holds words known only from the author's confirmed pages (the
+    weak verdict), while ``known`` is the strong dictionary/knowledge set.
+    """
 
     def __init__(
         self,
         known: Iterable[str] = (),
         texts: dict[int, list[str]] | None = None,
         available: bool = True,
+        author: Iterable[str] = (),
     ):
         from app.htr.infrastructure.lexicon import LayeredLexiconChecker
 
+        self._known = {word.casefold() for word in known}
+        self._author_words = {word.casefold() for word in author}
+        self._available = available
         self._checker = LayeredLexiconChecker(
             base=None,
-            extra={word.casefold() for word in known},
+            extra=set(self._known),
+            author=set(self._author_words),
             available=available,
         )
         self.texts = texts or {}
@@ -311,8 +320,48 @@ class FakeLexiconProvider:
     def checker(self, author_id: int):
         return self._checker
 
+    def checker_with_words(self, author_words):
+        """The check as the confirmation preview needs it: an explicit author layer."""
+        from app.htr.infrastructure.lexicon import LayeredLexiconChecker
+
+        return LayeredLexiconChecker(
+            base=None,
+            extra=set(self._known),
+            author={word.casefold() for word in author_words},
+            available=self._available,
+        )
+
     def page_transcriptions(self, author_id: int):
         return self.texts
+
+    def author_words(self, author_id: int) -> frozenset[str]:
+        return frozenset(self._author_words)
+
+    def author_words_with_page(self, author_id: int, page_id: int, page_texts):
+        """The vocabulary as if the page were confirmed (fake: union of words)."""
+        from app.htr.infrastructure.lexicon.words import words_of
+
+        words = set(self._author_words)
+        for text in page_texts:
+            words |= words_of(text)
+        return frozenset(words)
+
+    def author_terms(self, author_id: int):
+        return [
+            {"word": word, "count": 1, "source": "author"}
+            for word in sorted(self._author_words)
+        ]
+
+    def ignored_words(self, author_id: int):
+        return []
+
+    def ignore_word(self, author_id: int, word: str):
+        self._author_words.discard(word.casefold())
+        return []
+
+    def unignore_word(self, author_id: int, word: str):
+        self._author_words.add(word.casefold())
+        return []
 
 
 class FakeRecognizer(HTRRecognizer):

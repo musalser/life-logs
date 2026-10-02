@@ -1,5 +1,11 @@
 <template>
   <div class="min-h-screen overflow-x-clip bg-obsidian font-serif text-marble antialiased selection:bg-gold/30">
+    <!--
+      The landing page is a single dark composition (four photographs, gold on
+      obsidian), so it does not follow the light theme: switching it would mean
+      re-shooting the section, not re-tinting it. The toggle is therefore not
+      rendered here; inside the app it switches Solarized Light on and off.
+    -->
     <slot />
   </div>
 </template>

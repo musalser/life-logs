@@ -140,6 +140,10 @@ class WordView:
     # in the dictionary, False when the user should look at it, None when the
     # check could not run (no dictionary installed) or there is nothing to check
     in_lexicon: bool | None = None
+    # True when the word is known *only* from the author's own confirmed pages:
+    # a name or dialect word, but also a typo that was confirmed once. It is not
+    # counted as out-of-vocabulary, but the UI marks it weakly.
+    author_only: bool = False
 
     @property
     def effective_text(self) -> str | None:
@@ -190,6 +194,10 @@ class LineView:
     oov_count: int = 0
     # the same misses as text, in reading order (badge and list must agree)
     oov_words: list[str] = field(default_factory=list)
+    # words known only from the author's own confirmed pages: not OOV, but worth
+    # a second look because a confirmed typo looks exactly like this
+    author_only_count: int = 0
+    author_only_words: list[str] = field(default_factory=list)
 
     @property
     def geometry(self) -> LineGeometry:

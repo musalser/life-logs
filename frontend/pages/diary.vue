@@ -10,7 +10,7 @@
           <div class="flex items-center gap-2">
             <button
               type="button"
-              class="inline-flex items-center justify-center rounded-full bg-app-primary px-5 py-2 text-sm font-semibold text-app-text transition hover:bg-app-primary/80 disabled:cursor-not-allowed disabled:bg-app-primary/40"
+              class="inline-flex items-center justify-center rounded-full bg-app-primary px-5 py-2 text-sm font-semibold text-app-on-primary transition hover:bg-app-primary/80 disabled:cursor-not-allowed disabled:bg-app-primary/40"
               :disabled="!markdown.trim() || saving"
               @click="save"
             >
@@ -236,7 +236,7 @@ watch(
 
 .prose-preview :deep(p) {
   margin: 0.5rem 0;
-  color: #f8fafc;
+  color: rgb(var(--c-text));
 }
 
 .prose-preview :deep(ul) {
@@ -258,19 +258,19 @@ watch(
 .prose-preview :deep(code) {
   padding: 0.1rem 0.25rem;
   border-radius: 0.375rem;
-  background: rgba(2, 6, 23, 0.6);
+  background: rgb(var(--c-input) / 0.6);
 }
 
 .prose-preview :deep(pre) {
   overflow: auto;
   padding: 0.75rem;
   border-radius: 0.75rem;
-  border: 1px solid rgba(31, 41, 55, 0.4);
-  background: rgba(2, 6, 23, 0.6);
+  border: 1px solid rgb(var(--c-border) / 0.4);
+  background: rgb(var(--c-input) / 0.6);
 }
 
 .prose-preview :deep(a) {
-  color: #a5b4fc;
+  color: rgb(var(--c-accent));
   text-decoration: underline;
 }
 </style>

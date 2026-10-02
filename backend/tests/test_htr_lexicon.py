@@ -74,6 +74,34 @@ def test_words_of_normalizes_a_transcription():
     assert "стоит" in forms
 
 
+def test_normalize_word_composes_the_decomposed_text_the_codec_emits():
+    """The codec writes «й» as «и» + U+0306; the dictionary only holds «й».
+
+    Dropping that mark used to turn «строгий» into the non-word «строгии», which
+    was then flagged as unknown and taught the author's dictionary a mistake.
+    """
+    breve = "\u0306"  # combining breve: NFC("и" + breve) == "й"
+    assert normalize_word("строгии" + breve) == "строгий"
+    assert normalize_word("другои" + breve) == "другой"
+    assert "строгий" in word_variants("строгии" + breve)
+    # a mark with nothing left to compose it is a stray stress mark, not a letter
+    assert normalize_word(breve + "час") == "час"
+    assert normalize_word("дейст" + breve + "вительно") == "действительно"
+
+
+def test_iter_words_keeps_combining_marks_so_the_word_stays_whole():
+    breve = "\u0306"
+    assert iter_words("Был строгии" + breve + ", я") == ["Был", "строгии" + breve, "я"]
+    assert "строгий" in word_variants(iter_words("строгии" + breve)[0])
+
+
+def test_checker_accepts_a_decomposed_word():
+    decomposed = "строгии\u0306"
+    checker = LayeredLexiconChecker(base=frozenset({"строгий"}))
+    assert checker.is_known(decomposed)
+    assert checker.verdict(decomposed) == "known"
+
+
 # ---------------------------------------------------------------------------
 # Bloom filter artifact
 # ---------------------------------------------------------------------------
@@ -163,6 +191,35 @@ def test_checker_uses_the_author_vocabulary_before_the_dictionary():
     assert not checker.is_known("Паровоз")
 
 
+def test_checker_separates_strong_knowledge_from_the_authors_own_words():
+    checker = LayeredLexiconChecker(
+        base=frozenset({"дом"}),
+        extra={"шпалозавод"},          # knowledge base: strong
+        author={"вообице"},            # confirmed page: weak
+    )
+
+    # a real dictionary word / a proper noun of the base: strong
+    assert checker.is_strongly_known("Домъ")
+    assert checker.is_strongly_known("Шпалозавод")
+    assert not checker.is_author_only("Шпалозавод")
+
+    # known only because the author confirmed it once: weak, but still "known"
+    assert checker.is_known("Вообице")
+    assert checker.is_author_only("Вообице")
+    assert not checker.is_strongly_known("Вообице")
+
+    # nobody knows this one
+    assert checker.verdict("карова") == "unknown"
+
+
+def test_checker_hyphenated_word_is_weak_when_one_part_is():
+    checker = LayeredLexiconChecker(
+        base=frozenset({"кто"}), author={"то"}
+    )
+    assert checker.is_known("кто-то")
+    assert checker.is_author_only("кто-то")
+
+
 def test_checker_without_a_dictionary_is_unavailable_but_never_crashes():
     checker = LayeredLexiconChecker(base=None)
     assert checker.is_available is False
@@ -202,6 +259,23 @@ def test_annotate_marks_words_and_counts_the_line():
     assert page.lines[0].oov_count == 1
     assert page.lines[0].oov_words == ["дед"]
     assert page.oov_count == 1
+
+
+def test_annotate_marks_a_word_known_only_from_the_authors_own_pages():
+    page = _page_with_words()
+    # "дед" is not in the dictionary, but the author confirmed it once before
+    annotator = LexiconAnnotator(FakeLexiconProvider(known={"уж", "очень"}, author={"дед"}))
+
+    annotator.annotate(page)
+
+    assert page.lexicon_available is True
+    assert [word.in_lexicon for word in page.lines[0].words] == [True, True, True]
+    assert [word.author_only for word in page.lines[0].words] == [False, False, True]
+    # weak evidence is not out-of-vocabulary, but the line reports it separately
+    assert page.lines[0].oov_count == 0
+    assert page.lines[0].author_only_count == 1
+    assert page.lines[0].author_only_words == ["дед"]
+    assert page.oov_count == 0
 
 
 def test_annotate_falls_back_to_the_word_text_when_the_line_was_rewritten():
@@ -336,18 +410,4 @@ def test_corpus_page_texts_follow_an_edit(db_session, page_repo, shared_cache, u
     assert corpus.page_texts(author.id)[page.id][0] == "Совсем другой текст"
 
 
-def test_corpus_includes_knowledge_vocabulary(db_session, shared_cache, user, author):
-    from app.models import Entity
 
-    db_session.add(
-        Entity(
-            user_id=user.id,
-            entity_type="PLACE",
-            canonical_name="Шпалозавод",
-            normalized_name="шпалозавод",
-        )
-    )
-    db_session.commit()
-
-    corpus = SqlAlchemyAuthorCorpus(db_session, cache=shared_cache)
-    assert "шпалозавод" in corpus.known_words(author.id)

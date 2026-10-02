@@ -31,14 +31,18 @@ from ..htr.domain.errors import (
 from ..htr.schemas import (
     WordAlternativeSchema,
     AuthorCreateRequest,
+    AuthorLexiconResponse,
     AuthorResponse,
     BoundingBoxSchema,
     ConfidenceThresholdsResponse,
+    ConfirmationPreviewResponse,
+    LexiconWordResponse,
     LineResponse,
     LineUpdateRequest,
     ModelVersionResponse,
     PageNameRequest,
     PageOrderRequest,
+    PageConfirmResponse,
     PageResponse,
     PageSummaryResponse,
     PageUploadResponse,
@@ -135,6 +139,8 @@ def _to_page_response(page: PageView) -> PageResponse:
                 suggestion_verified=line.suggestion_verified,
                 oov_count=line.oov_count,
                 oov_words=line.oov_words,
+                author_only_count=line.author_only_count,
+                author_only_words=line.author_only_words,
                 words=[
                     WordResponse(
                         id=word.id,
@@ -151,6 +157,7 @@ def _to_page_response(page: PageView) -> PageResponse:
                             for item in word.alternatives
                         ],
                         in_lexicon=word.in_lexicon,
+                        author_only=word.author_only,
                     )
                     for word in line.words
                 ],
@@ -311,6 +318,40 @@ def reorder_author_pages(
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     return [_to_page_summary(s) for s in summaries]
+
+
+# ---------------------------------------------------------------------------
+# The author's own vocabulary (dictionary panel)
+# ---------------------------------------------------------------------------
+
+
+def _to_lexicon_response(payload: dict) -> AuthorLexiconResponse:
+    return AuthorLexiconResponse(
+        available=bool(payload.get("available")),
+        words=[LexiconWordResponse(**item) for item in payload.get("words", [])],
+            )
+
+
+@router.get(
+    "/authors/{author_id}/lexicon",
+    response_model=AuthorLexiconResponse,
+    summary="Words the author's confirmed pages contributed to the dictionary",
+)
+def get_author_lexicon(
+    author_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """The author's own vocabulary, most frequent first, plus the removed words.
+
+    These are the words the check treats as known *because the author wrote
+    them on a confirmed page*: names and dialect words, but also a typo that was
+    confirmed once. Removing a word here makes it unknown again on every page.
+    """
+    user = _get_user(db, username)
+    _get_author(db, author_id, user)
+    return _to_lexicon_response(page_service.author_dictionary(author_id))
 
 
 @router.get(
@@ -659,9 +700,97 @@ def update_line(
     return _to_page_response(page)
 
 
+@router.delete(
+    "/pages/{page_id}/lines/{line_id}",
+    response_model=PageResponse,
+    summary="Delete one line from the page (renumbers the rest)",
+)
+def delete_line(
+    page_id: int,
+    line_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """Removes a line the segmenter invented, or one that holds no text.
+
+    The remaining lines are renumbered, because the UI numbers them by
+    position. Only editable pages are accepted: a confirmed page is frozen
+    ground truth and must be re-recognized to change its lines.
+    """
+    user = _get_user(db, username)
+    _get_owned_page(page_service, page_id, user)
+    try:
+        page = page_service.delete_line(page_id, line_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except PageStateError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return _to_page_response(page)
+
+
+@router.post(
+    "/pages/{page_id}/reopen",
+    response_model=PageResponse,
+    summary="Return a confirmed page to editing (leaves the training corpus)",
+)
+def reopen_page(
+    page_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """Undo a confirmation.
+
+    The page leaves the ground-truth corpus: the next training run ignores it and
+    its words stop counting as the author's vocabulary. Corrections are kept, the
+    transcription becomes editable again, and the prediction metrics of the
+    confirmation are dropped. A model already trained on the page is untouched —
+    a fine-tune cannot be undone.
+    """
+    user = _get_user(db, username)
+    _get_owned_page(page_service, page_id, user)
+    try:
+        page = page_service.reopen_page(page_id)
+    except PageStateError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return _to_page_response(page)
+
+
+@router.get(
+    "/pages/{page_id}/confirmation-preview",
+    response_model=ConfirmationPreviewResponse,
+    summary="What confirming the page would add to the author dictionary",
+)
+def preview_confirmation(
+    page_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """The words a confirmation is about to make known, without writing anything.
+
+    The UI opens this before confirming: a word that is about to be taught to the
+    dictionary by mistake is much easier to fix now than to meet later as an
+    unexpected "known". The lists are the same ones ``POST .../confirm`` returns.
+    """
+    user = _get_user(db, username)
+    _get_owned_page(page_service, page_id, user)
+    try:
+        preview = page_service.preview_confirmation(page_id)
+    except InvalidTranscriptionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except PageStateError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return ConfirmationPreviewResponse(
+        added_author_words=list(preview.added_author_words),
+        author_words_learned=list(preview.learned_words),
+    )
+
+
 @router.post(
     "/pages/{page_id}/confirm",
-    response_model=PageResponse,
+    response_model=PageConfirmResponse,
     summary="Confirm the page as ground truth (does not trigger training)",
 )
 def confirm_page(
@@ -675,16 +804,22 @@ def confirm_page(
     Training is deliberately *not* started here: confirming several pages in a
     row must not pay for a fine-tune each time. The client calls
     ``POST /htr/authors/{author_id}/train`` when it wants a new model version.
+
+    The response also lists the words the confirmation added to the author's own
+    vocabulary, because that is the moment those words stop being unknown.
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
     try:
-        page = page_service.confirm_page(page_id)
+        report = page_service.confirm_page_report(page_id)
     except InvalidTranscriptionError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except PageStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    return _to_page_response(page)
+    response = PageConfirmResponse(**_to_page_response(report.page).model_dump())
+    response.added_author_words = list(report.added_author_words)
+    response.author_words_learned = list(report.learned_words)
+    return response
 
 
 # ---------------------------------------------------------------------------

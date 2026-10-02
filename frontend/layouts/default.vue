@@ -17,45 +17,49 @@
             </nav>
           </div>
 
-          <div class="relative">
-            <button
-              type="button"
-              class="user-btn"
-              aria-label="Меню пользователя"
-              @click="menuOpen = !menuOpen"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="h-5 w-5">
-                <path d="M20 21a8 8 0 00-16 0"></path>
-                <circle cx="12" cy="8" r="4"></circle>
-              </svg>
-            </button>
+          <div class="flex items-center gap-2">
+            <ThemeToggle />
 
-            <div v-if="menuOpen" class="menu-card">
-              <p v-if="isAuthenticated" class="menu-user">{{ authUser }}</p>
+            <div class="relative">
               <button
-                v-if="!isAuthenticated"
                 type="button"
-                class="menu-action"
-                @click="openAuthModal('login')"
+                class="user-btn"
+                aria-label="Меню пользователя"
+                @click="menuOpen = !menuOpen"
               >
-                Войти
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="h-5 w-5">
+                  <path d="M20 21a8 8 0 00-16 0"></path>
+                  <circle cx="12" cy="8" r="4"></circle>
+                </svg>
               </button>
-              <button
-                v-if="!isAuthenticated"
-                type="button"
-                class="menu-action"
-                @click="openAuthModal('register')"
-              >
-                Зарегистрироваться
-              </button>
-              <button
-                v-if="isAuthenticated"
-                type="button"
-                class="menu-action"
-                @click="handleLogout"
-              >
-                Выйти
-              </button>
+
+              <div v-if="menuOpen" class="menu-card">
+                <p v-if="isAuthenticated" class="menu-user">{{ authUser }}</p>
+                <button
+                  v-if="!isAuthenticated"
+                  type="button"
+                  class="menu-action"
+                  @click="openAuthModal('login')"
+                >
+                  Войти
+                </button>
+                <button
+                  v-if="!isAuthenticated"
+                  type="button"
+                  class="menu-action"
+                  @click="openAuthModal('register')"
+                >
+                  Зарегистрироваться
+                </button>
+                <button
+                  v-if="isAuthenticated"
+                  type="button"
+                  class="menu-action"
+                  @click="handleLogout"
+                >
+                  Выйти
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -362,17 +366,17 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   border-radius: 9999px;
-  border: 1px solid rgba(99, 102, 241, 0.45);
+  border: 1px solid rgb(var(--c-primary) / 0.45);
   width: 2.25rem;
   height: 2.25rem;
-  color: #e2e8f0;
-  background: rgba(15, 23, 42, 0.55);
+  color: rgb(var(--c-on-surface));
+  background: rgb(var(--c-surface) / 0.55);
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .user-btn:hover {
-  background: rgba(30, 41, 59, 0.75);
-  border-color: rgba(99, 102, 241, 0.7);
+  background: rgb(var(--c-soft) / 0.75);
+  border-color: rgb(var(--c-primary) / 0.7);
 }
 
 .menu-card {
@@ -382,20 +386,21 @@ onBeforeUnmount(() => {
   z-index: 20;
   width: 12rem;
   border-radius: 0.75rem;
-  border: 1px solid rgba(99, 102, 241, 0.35);
-  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgb(var(--c-primary) / 0.35);
+  background: rgb(var(--c-surface) / 0.97);
   padding: 0.4rem;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.25);
 }
 
 .menu-user {
   margin: 0;
   padding: 0.45rem 0.55rem;
   font-size: 0.78rem;
-  color: #93c5fd;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  color: rgb(var(--c-accent));
+  border-bottom: 1px solid rgb(var(--c-line) / 0.25);
 }
 
 .menu-action {
@@ -403,12 +408,12 @@ onBeforeUnmount(() => {
   border-radius: 0.5rem;
   padding: 0.5rem 0.6rem;
   text-align: left;
-  color: #e2e8f0;
+  color: rgb(var(--c-on-surface));
   background: transparent;
 }
 
 .menu-action:hover {
-  background: rgba(99, 102, 241, 0.24);
+  background: rgb(var(--c-primary) / 0.24);
 }
 
 .nav-link {
@@ -416,36 +421,36 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   border-radius: 0.75rem;
-  border: 1px solid rgba(31, 41, 55, 0.4);
+  border: 1px solid rgb(var(--c-border) / 0.4);
   padding: 0.5rem 0.85rem;
   font-size: 0.875rem;
-  color: #f8fafc;
-  background: rgba(15, 23, 42, 0.3);
+  color: rgb(var(--c-text));
+  background: rgb(var(--c-surface) / 0.3);
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .nav-link:hover {
-  background: rgba(15, 23, 42, 0.6);
-  border-color: rgba(99, 102, 241, 0.4);
+  background: rgb(var(--c-surface) / 0.6);
+  border-color: rgb(var(--c-primary) / 0.4);
 }
 
 .nav-link--active {
-  background: rgba(99, 102, 241, 0.18);
-  border-color: rgba(99, 102, 241, 0.55);
+  background: rgb(var(--c-primary) / 0.18);
+  border-color: rgb(var(--c-primary) / 0.55);
 }
 
 .auth-input {
   width: 100%;
   border-radius: 0.75rem;
-  border: 1px solid rgba(148, 163, 184, 0.45);
-  background: rgba(15, 23, 42, 0.45);
-  color: #f8fafc;
+  border: 1px solid rgb(var(--c-line) / 0.45);
+  background: rgb(var(--c-surface) / 0.45);
+  color: rgb(var(--c-text));
   padding: 0.65rem 0.85rem;
 }
 
 .auth-input:focus {
   outline: none;
-  border-color: rgba(99, 102, 241, 0.8);
+  border-color: rgb(var(--c-primary) / 0.8);
 }
 
 .auth-primary,
@@ -457,8 +462,8 @@ onBeforeUnmount(() => {
 }
 
 .auth-primary {
-  background: rgba(99, 102, 241, 0.95);
-  color: #fff;
+  background: rgb(var(--c-primary) / 0.95);
+  color: rgb(var(--c-on-primary));
 }
 
 .auth-primary:disabled {
@@ -466,8 +471,8 @@ onBeforeUnmount(() => {
 }
 
 .auth-secondary {
-  background: rgba(15, 23, 42, 0.5);
-  border-color: rgba(148, 163, 184, 0.4);
-  color: #e2e8f0;
+  background: rgb(var(--c-surface) / 0.5);
+  border-color: rgb(var(--c-line) / 0.4);
+  color: rgb(var(--c-on-surface));
 }
 </style>

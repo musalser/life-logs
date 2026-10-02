@@ -106,10 +106,14 @@ class Settings(BaseSettings):
     htr_rescore_guard: bool = False
     htr_rescore_min_mean_acoustic: float = -0.30
     #: How many alternative readings to keep per recognized word for the editor
-    #: (0 = keep none). They come from the same N-best list the second pass
-    #: uses, so this costs nothing beyond the search that already runs; the
-    #: variants are only what the beam considered, not a dictionary search.
-    htr_word_alternatives: int = 5
+    #: (0 = keep none), and — because it sets how many hypotheses the beam is
+    #: asked for — how many words get any alternative at all. Measured on pages
+    #: 23/24 (382 words, v13): 5 hypotheses cover 42 % of words, 10 cover 56 %,
+    #: 16 cover 65 %. Confidence does not explain the rest (mean confidence of
+    #: words with variants 0.9885 against 0.9867 without): a word has no
+    #: alternatives when *every* hypothesis spells it the same way, which is
+    #: what happens when the beam spent its diversity elsewhere in the line.
+    htr_word_alternatives: int = 10
 
     # HTR recognition (inference)
     # Device string understood by kraken/lightning: 'cpu', 'cuda:0', 'auto'.
@@ -195,6 +199,12 @@ class Settings(BaseSettings):
     # The pretrained weights of this project expect 96, so 128 trains in a
     # different scale; use it only for a deliberate A/B.
     htr_training_height_override: int = 0
+    # Rebuild the author's character language model during a training run: it is
+    # built from the same confirmed pages as the dataset, so a page returned to
+    # editing has to disappear from it. Building reads tens of millions of
+    # characters (tens of seconds), which is why it happens here and not on every
+    # corpus change; failures are logged and never fail the training itself.
+    htr_training_rebuild_lm: bool = True
     htr_training_max_width: int = 2560          # max line width after height normalization
     htr_training_variant: str = "medium"        # ppocrv6: tiny | small | medium
     htr_training_precision: str = "32-true"

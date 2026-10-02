@@ -33,7 +33,12 @@ from app.htr.infrastructure.model_repository import (
 )
 from app.htr.infrastructure.page_repository import SqlAlchemyPageRepository
 from app.htr.infrastructure.storage import HTRStorage, PilLineCropper
-from tests.htr_fakes import FakeCorrector, FakeLexiconProvider, RecordingTrainer
+from tests.htr_fakes import (
+    FakeCorrector,
+    FakeLexiconProvider,
+    FakeRecognizer,
+    RecordingTrainer,
+)
 
 PIL = pytest.importorskip("PIL")
 from PIL import Image  # noqa: E402
@@ -140,9 +145,10 @@ def test_full_training_workflow(env):
     # word edit rebuilt the canonical line transcription
     assert page.lines[0].corrected_text == "Уж очень дед был похож"
     assert page.lines[0].words_stale is False
-    # line edit marked word alignment stale
+    # line edit only added punctuation: the word count is unchanged, so the
+    # boxes still sit on their words and the layout is not flagged as stale
     assert page.lines[1].corrected_text == "на еврея,"
-    assert page.lines[1].words_stale is True
+    assert page.lines[1].words_stale is False
 
     result = training_service.train_author(author.id)
     assert result.outcome == TrainingOutcome.SUCCESS
@@ -216,6 +222,36 @@ def test_deleted_confirmed_page_leaves_the_training_corpus(env):
     dataset = training_service.dataset_builder.build_for_author(author.id)
     assert {s.page_id for s in dataset.samples} == {first.id}
     assert page_service.page_repository.get_page(second.id) is None
+
+
+def test_replacing_one_word_keeps_the_word_boxes(env):
+    page_service, _, _, _, user, author = env
+    page = page_service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = page_service.apply_recognition(page.id, recognition_result())
+    line = page.lines[0]
+    word = line.words[0]
+
+    page = page_service.update_word(page.id, line.id, word.id, "Ужъ")
+
+    edited = page.lines[0]
+    assert edited.corrected_text == "Ужъ очен дед был похож"
+    # one word replaced by one word: box i still points at token i
+    assert edited.words_stale is False
+
+
+def test_splitting_one_word_marks_the_box_layout_stale(env):
+    page_service, _, _, _, user, author = env
+    page = page_service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = page_service.apply_recognition(page.id, recognition_result())
+    line = page.lines[0]
+    word = line.words[0]
+
+    page = page_service.update_word(page.id, line.id, word.id, "Уж очень")
+
+    edited = page.lines[0]
+    assert edited.corrected_text == "Уж очень очен дед был похож"
+    # the line now has one word more than the stored boxes
+    assert edited.words_stale is True
 
 
 def test_recognition_polygons_round_trip_through_the_database(env):
@@ -325,8 +361,8 @@ def test_accepting_a_proposal_moves_it_into_the_transcription(env):
     assert first.suggested_text is None          # the proposal has been used
     assert first.predicted_text == "Уж очен дед был похож"
     assert accepted.status == PageStatus.EDITING
-    # accepting rewrites the line, so the word boxes may no longer match
-    assert first.words_stale is True
+    # a proposal that only fixes a word keeps the boxes on their words
+    assert first.words_stale is False
     # the other line had no proposal and stays recognised
     assert accepted.lines[1].corrected_text is None
 
@@ -393,6 +429,9 @@ def test_accepting_one_word_keeps_the_rest_of_the_proposal(env):
     assert first.corrected_text == "Уж очень дед был похож"
     assert first.corrected_by == "user"
     assert first.predicted_text == "Уж очен дед был похож"
+    # the accepted word replaces exactly one word, so box i still points at
+    # token i and the layout is not marked stale
+    assert first.words_stale is False
     # the remaining proposal is still there, now with a single change
     assert first.suggested_text == "Уж очень дед был похож всегда"
     assert first.has_suggestion is True
@@ -401,6 +440,8 @@ def test_accepting_one_word_keeps_the_rest_of_the_proposal(env):
     # ... and taking it too finishes the line
     page = page_service.accept_suggestion_change(page.id, line.id, 0)
     assert page.lines[0].corrected_text == "Уж очень дед был похож всегда"
+    # this one *inserts* a word, so every following box would shift
+    assert page.lines[0].words_stale is True
     assert page.lines[0].has_suggestion is False
     assert page.lines[0].suggested_text == "Уж очень дед был похож всегда"
 
@@ -630,3 +671,272 @@ def test_suggestions_are_refused_for_a_confirmed_page(env):
     assert fresh.status == PageStatus.CONFIRMED
     assert [line.corrected_text for line in fresh.lines] == ["Уж очень дед был похож", "на еврея,"]
     assert [line.suggested_text for line in fresh.lines] == [None, None]
+
+
+# ---------------------------------------------------------------------------
+# returning a confirmed page to editing
+# ---------------------------------------------------------------------------
+
+
+def test_reopen_returns_the_page_to_editing_and_clears_the_metrics(env):
+    """The reverse of confirmation: the page leaves the ground-truth corpus."""
+    page_service, _, _, _, user, author = env
+    page = run_page_cycle(page_service, user, author)
+    assert page.status == PageStatus.CONFIRMED
+    assert page.confirmed_at is not None
+    assert page.prediction_cer is not None
+    corrections = {
+        line.id: line.corrected_text for line in page.lines if line.corrected_text
+    }
+
+    reopened = page_service.reopen_page(page.id)
+
+    assert reopened.status == PageStatus.EDITING
+    assert reopened.confirmed_at is None
+    assert reopened.prediction_cer is None
+    assert reopened.prediction_wer is None
+    # the user's corrections are the whole point of going back to editing
+    assert {
+        line.id: line.corrected_text for line in reopened.lines if line.corrected_text
+    } == corrections
+
+
+def test_reopen_drops_the_page_from_the_author_corpus(env):
+    """Its words stop counting as the author's vocabulary immediately."""
+    from app.htr.infrastructure.lexicon import SqlAlchemyAuthorCorpus
+
+    page_service, _, _, _, user, author = env
+    page = run_page_cycle(page_service, user, author)
+    db = page_service.page_repository.db
+    before = SqlAlchemyAuthorCorpus(db).known_words(author.id)
+
+    page_service.reopen_page(page.id)
+
+    after = SqlAlchemyAuthorCorpus(db).known_words(author.id)
+    assert len(after) < len(before), "слова откатанной страницы должны уйти из лексикона"
+
+
+def test_reopen_refuses_a_page_that_is_not_confirmed(env):
+    page_service, _, _, _, user, author = env
+    page = page_service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = page_service.apply_recognition(page.id, recognition_result())
+
+    with pytest.raises(PageStateError):
+        page_service.reopen_page(page.id)
+
+
+def test_reopen_is_refused_while_training_runs(env, monkeypatch):
+    """The training corpus must not change under a running fine-tune."""
+    from app.htr.application import page_service as page_service_module
+
+    page_service, _, _, _, user, author = env
+    page = run_page_cycle(page_service, user, author)
+    monkeypatch.setattr(
+        page_service_module, "author_training_in_progress", lambda author_id: True
+    )
+
+    with pytest.raises(PageStateError):
+        page_service.reopen_page(page.id)
+
+
+def test_reopened_page_can_be_confirmed_again(env):
+    page_service, _, _, _, user, author = env
+    page = run_page_cycle(page_service, user, author)
+    page_service.reopen_page(page.id)
+
+    again = page_service.confirm_page(page.id)
+
+    assert again.status == PageStatus.CONFIRMED
+    assert again.prediction_cer is not None
+
+
+# ---------------------------------------------------------------------------
+# what a confirmation teaches the dictionary
+# ---------------------------------------------------------------------------
+
+
+class _SetWordList:
+    """A stand-in for the general dictionary artifact (``WordList``)."""
+
+    def __init__(self, words):
+        self._words = {word.casefold() for word in words}
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def __contains__(self, word) -> bool:
+        return word in self._words
+
+
+def _service_with_dictionary(db_session, tmp_path, storage, page_repo, model_repo, base_words):
+    """A page service whose lexicon counts the confirmed pages, like production."""
+    from app.htr.application.lexicon import LexiconAnnotator
+    from app.htr.infrastructure.lexicon import (
+        SqlAlchemyAuthorCorpus,
+        SqlAlchemyLexiconProvider,
+    )
+
+    base = _SetWordList(base_words)
+    provider = SqlAlchemyLexiconProvider(
+        corpus=SqlAlchemyAuthorCorpus(db_session, base_is_known=lambda w: w in base),
+        base=base,
+    )
+    return HandwritingPageService(
+        page_repository=page_repo,
+        model_repository=model_repo,
+        image_store=storage,
+        recognizer=FakeRecognizer(result=recognition_result()),
+        lexicon_annotator=LexiconAnnotator(provider),
+    ), provider
+
+
+def test_confirming_reports_the_words_that_entered_the_author_dictionary(
+    db_session, tmp_path, user, author
+):
+    from app.htr.infrastructure.storage import HTRStorage
+
+    storage = HTRStorage(tmp_path / "htr")
+    page_repo = SqlAlchemyPageRepository(db_session)
+    model_repo = SqlAlchemyModelRepository(db_session, storage, DEFAULT)
+    service, provider = _service_with_dictionary(
+        db_session, tmp_path, storage, page_repo, model_repo, base_words={"на", "еврея"}
+    )
+    page = service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = service.apply_recognition(page.id, recognition_result())
+    word = page.lines[0].words[1]
+    page = service.update_word(page.id, page.lines[0].id, word.id, "очень")
+
+    report = service.confirm_page_report(page.id)
+
+    assert report.page.status == PageStatus.CONFIRMED
+    # the corrected text is what enters the dictionary, never the raw prediction
+    assert "очень" in report.added_author_words
+    assert "очен" not in report.added_author_words
+    assert "очень" in report.learned_words, (
+        "слова, которых нет в общем словаре, — то, что реально изменилось"
+    )
+    assert "на" not in report.learned_words, "общий словарь его и так знал"
+    assert "еврея" not in report.learned_words
+
+
+def test_the_dictionary_panel_points_at_the_line_a_word_stands_in(
+    db_session, tmp_path, user, author
+):
+    from app.htr.infrastructure.storage import HTRStorage
+
+    storage = HTRStorage(tmp_path / "htr")
+    page_repo = SqlAlchemyPageRepository(db_session)
+    model_repo = SqlAlchemyModelRepository(db_session, storage, DEFAULT)
+    service, provider = _service_with_dictionary(
+        db_session, tmp_path, storage, page_repo, model_repo, base_words={"на"}
+    )
+    page = service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = service.apply_recognition(page.id, recognition_result())
+    word = page.lines[0].words[1]
+    page = service.update_word(page.id, page.lines[0].id, word.id, "очень")
+    service.confirm_page(page.id)
+
+    terms = {term["word"]: term for term in provider.author_terms(author.id)}
+
+    assert "очень" in terms
+    places = terms["очень"]["occurrences"]
+    assert places, "у слова автора должно быть место, куда прыгнуть"
+    assert places[0]["page_id"] == page.id
+    line = next(line for line in page.lines if "очень" in (line.effective_text or ""))
+    assert places[0]["line_id"] == line.id
+    assert places[0]["line_order"] == line.order
+    assert places[0]["surface"] == "очень"
+
+
+def test_words_the_dictionary_already_knows_are_not_reported_as_learned(
+    db_session, tmp_path, user, author
+):
+    from app.htr.infrastructure.storage import HTRStorage
+
+    storage = HTRStorage(tmp_path / "htr")
+    page_repo = SqlAlchemyPageRepository(db_session)
+    model_repo = SqlAlchemyModelRepository(db_session, storage, DEFAULT)
+    service, _provider = _service_with_dictionary(
+        db_session,
+        tmp_path,
+        storage,
+        page_repo,
+        model_repo,
+        base_words={"на", "еврея", "очень", "дед", "был", "похож", "уж"},
+    )
+    page = service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = service.apply_recognition(page.id, recognition_result())
+    word = page.lines[0].words[1]
+    page = service.update_word(page.id, page.lines[0].id, word.id, "очень")
+
+    report = service.confirm_page_report(page.id)
+
+    assert "очень" in report.added_author_words
+    assert report.learned_words == (), "общий словарь знает все слова страницы"
+
+
+def test_confirmation_preview_promises_exactly_what_confirming_reports(
+    db_session, tmp_path, user, author
+):
+    """The preview is the same computation as the report, without the write."""
+    from app.htr.infrastructure.storage import HTRStorage
+
+    storage = HTRStorage(tmp_path / "htr")
+    page_repo = SqlAlchemyPageRepository(db_session)
+    model_repo = SqlAlchemyModelRepository(db_session, storage, DEFAULT)
+    service, _provider = _service_with_dictionary(
+        db_session, tmp_path, storage, page_repo, model_repo, base_words={"на", "еврея"}
+    )
+    page = service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = service.apply_recognition(page.id, recognition_result())
+    word = page.lines[0].words[1]
+    page = service.update_word(page.id, page.lines[0].id, word.id, "очень")
+
+    preview = service.preview_confirmation(page.id)
+
+    # nothing was written: the page is still editable and its words are unknown
+    assert page_repo.get_page(page.id).status == PageStatus.EDITING
+    assert "очень" in preview.added_author_words, "слово страницы попадёт в словарь"
+    assert "очень" in preview.learned_words, "общий словарь его не знает"
+    assert "на" not in preview.learned_words, "общий словарь его и так знал"
+
+    report = service.confirm_page_report(page.id)
+
+    assert preview.added_author_words == report.added_author_words
+    assert preview.learned_words == report.learned_words
+
+
+def test_confirmation_preview_skips_a_word_broken_over_a_line_break(
+    db_session, tmp_path, user, author
+):
+    """The preview must not offer the halves of a word the writer split."""
+    from app.htr.infrastructure.storage import HTRStorage
+
+    storage = HTRStorage(tmp_path / "htr")
+    page_repo = SqlAlchemyPageRepository(db_session)
+    model_repo = SqlAlchemyModelRepository(db_session, storage, DEFAULT)
+    service, _provider = _service_with_dictionary(
+        db_session,
+        tmp_path,
+        storage,
+        page_repo,
+        model_repo,
+        base_words={"на", "еврея", "уж", "дед", "был", "похож", "слушалась"},
+    )
+    page = service.upload_page(user.id, author.id, "page.png", png_bytes())
+    page = service.apply_recognition(page.id, recognition_result())
+    # the writer ran out of the line in the middle of «слушалась»
+    page = service.update_line(page.id, page.lines[0].id, "Уж очень дед слуша-")
+    page = service.update_line(page.id, page.lines[1].id, "лась на еврея")
+
+    preview = service.preview_confirmation(page.id)
+
+    assert "слуша" not in preview.added_author_words, "осколок переноса — не слово"
+    assert "лась" not in preview.added_author_words
+    assert "слушалась" not in preview.added_author_words, "склейки нет в тексте страницы"
+
+    report = service.confirm_page_report(page.id)
+
+    assert preview.added_author_words == report.added_author_words
+    assert preview.learned_words == report.learned_words

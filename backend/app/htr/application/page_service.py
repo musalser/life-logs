@@ -15,6 +15,7 @@ whose every change the dictionary confirms).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -25,6 +26,7 @@ from ..domain.errors import (
     PageStateError,
     RecognitionError,
 )
+from ..domain.text import alignment_preserved, iter_words, normalize_word
 from ..domain.interfaces import (
     HTRRecognizer,
     ModelRepository,
@@ -35,8 +37,34 @@ from .correction_context import CorrectionContextBuilder
 from .lexicon import LexiconAnnotator
 from .metrics import MetricsEvaluator
 from .suggestions import apply_change, build_changes
+from .training_service import author_training_in_progress
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ConfirmationReport:
+    """The confirmed page plus the vocabulary its confirmation taught."""
+
+    page: PageView
+    #: words that entered the author's vocabulary with this page
+    added_author_words: tuple[str, ...] = ()
+    #: subset the general dictionary does not know: they stop being OOV marks
+    learned_words: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfirmationPreview:
+    """What confirming a page *would* teach the author's vocabulary.
+
+    Computed without writing anything, so the user can be shown the words a
+    confirmation is about to make known — and fix the ones that should not be.
+    """
+
+    #: words that would enter the author's vocabulary with this page
+    added_author_words: tuple[str, ...] = ()
+    #: subset the general dictionary does not know: they would stop being OOV
+    learned_words: tuple[str, ...] = ()
 
 # A model that reports "no answer" twice in a row is treated as unavailable:
 # otherwise a hanging Ollama would cost one timeout per line of the page.
@@ -132,6 +160,14 @@ class HandwritingPageService:
         """Rename the displayed file name of one page."""
         self.page_repository.rename_page(page_id, file_name)
         return self.get_page(page_id)
+
+    # ------------------------------------------------------------------
+    # The author's own vocabulary (the dictionary panel)
+
+    def author_dictionary(self, author_id: int) -> dict:
+        """Words taken from the author's confirmed pages (+ knowledge terms)."""
+        payload = self.lexicon_annotator.dictionary(author_id)
+        return payload or {"available": False, "words": [], "ignored": []}
 
     def _annotate(self, page: PageView) -> PageView:
         if self.lexicon_annotator is None:
@@ -273,6 +309,33 @@ class HandwritingPageService:
             f"Ollama недоступна{where} — запустите её и повторите; "
             "распознанный текст не изменялся"
         )
+
+    def reopen_page(self, page_id: int) -> PageView:
+        """Return a confirmed page to editing — the reverse of ``confirm_page``.
+
+        The page stops being ground truth: the next training run leaves it out
+        and its words stop counting as the author's vocabulary (the corpus cache
+        is invalidated), while every correction the user made is kept and
+        editing works again. A model already trained on the page is *not*
+        changed: untraining is impossible, only the next run is affected.
+        """
+        page = self._get_page(page_id)
+        if page.status != PageStatus.CONFIRMED:
+            raise PageStateError(
+                f"Page {page_id} is {page.status}; only a CONFIRMED page can be "
+                "returned to editing"
+            )
+        if author_training_in_progress(page.author_id):
+            raise PageStateError(
+                "A training run for this author is in progress; wait for it to "
+                "finish before returning the page to editing"
+            )
+        page = self.page_repository.reopen_page(page_id)
+        logger.info(
+            "HTR page reopened for editing: user_id=%s author_id=%s page_id=%s",
+            page.user_id, page.author_id, page_id,
+        )
+        return self._annotate(page)
 
     def suggest_corrections(self, page_id: int) -> PageView:
         """Ask the LLM for corrections and store them as *proposals*.
@@ -517,8 +580,9 @@ class HandwritingPageService:
         # line transcription is canonical: rebuild it from effective word texts
         parts = [w.effective_text for w in sorted(line.words, key=lambda w: w.order)]
         line_text = " ".join(p for p in parts if p)
-        # split/merge (spaces or deletion) breaks word-bbox alignment
-        words_stale = line.words_stale or (" " in corrected_text.strip()) or corrected_text == ""
+        # replacing one word with another keeps box i on token i; only a split
+        # («не знаю» typed into one box) or a deletion invalidates the geometry
+        words_stale = not alignment_preserved(len(line.words), line_text)
         return self._annotate(
             self.page_repository.apply_word_update(
                 page_id, line_id, word_id, corrected_text, line_text, words_stale
@@ -532,9 +596,80 @@ class HandwritingPageService:
             self.page_repository.apply_line_update(page_id, line_id, corrected_text)
         )
 
+    def delete_line(self, page_id: int, line_id: int) -> PageView:
+        """Drop a line the segmenter invented (or that is not text at all)."""
+        page = self._get_editable_page(page_id)
+        self._find_line(page, line_id)
+        logger.info(
+            "HTR line deleted: user_id=%s author_id=%s page_id=%s line_id=%s",
+            page.user_id, page.author_id, page_id, line_id,
+        )
+        return self._annotate(self.page_repository.delete_line(page_id, line_id))
+
     # ------------------------------------------------------------------
 
     def confirm_page(self, page_id: int) -> PageView:
+        """Confirm the page (kept for callers that only need the page itself)."""
+        return self.confirm_page_report(page_id).page
+
+    def preview_confirmation(self, page_id: int) -> ConfirmationPreview:
+        """What confirming the page would add to the author's dictionary.
+
+        The read-only twin of :meth:`confirm_page_report`: the same computation
+        on the same vocabulary, but nothing is written. The UI opens it when the
+        user asks to confirm a page, so a word that is about to be taught to the
+        dictionary by mistake can still be fixed.
+        """
+        page = self._get_confirmable_page(page_id)
+        vocabulary_before = self.lexicon_annotator.author_words(page.author_id)
+        vocabulary_after = self.lexicon_annotator.author_words_after_confirming(page)
+        added, learned = self._dictionary_delta(page, vocabulary_before, vocabulary_after)
+        return ConfirmationPreview(added_author_words=added, learned_words=learned)
+
+    def confirm_page_report(self, page_id: int) -> ConfirmationReport:
+        """Confirm the page and report what its words added to the dictionary.
+
+        A confirmation is what puts a page's words into the author's vocabulary,
+        so it is the moment to show them: the user can spot a word the page
+        taught by mistake while it is still fresh, rather than meeting it later
+        as an unexpected "known" word.
+        """
+        page = self._get_confirmable_page(page_id)
+        # Prediction quality on this page vs. the user's ground truth (section 19).
+        pairs = [(line.effective_text or "", line.predicted_text or "") for line in page.lines]
+        metrics = self.metrics_evaluator.evaluate_pairs(pairs) if pairs else None
+        vocabulary_before = self.lexicon_annotator.author_words(page.author_id)
+        page = self.page_repository.confirm_page(
+            page_id,
+            confirmed_at=datetime.now(timezone.utc),
+            prediction_cer=metrics["cer"] if metrics else None,
+            prediction_wer=metrics["wer"] if metrics else None,
+        )
+        vocabulary_after = self.lexicon_annotator.author_words(page.author_id)
+        added, learned = self._dictionary_delta(page, vocabulary_before, vocabulary_after)
+        if learned:
+            logger.info(
+                "HTR author vocabulary grew: page_id=%s added=%s learned=%s",
+                page_id, len(added), list(learned[:20]),
+            )
+        logger.info(
+            "HTR page confirmed: user_id=%s author_id=%s page_id=%s "
+            "prediction_cer=%s prediction_wer=%s",
+            page.user_id, page.author_id, page_id,
+            page.prediction_cer, page.prediction_wer,
+        )
+        return ConfirmationReport(
+            page=self._annotate(page),
+            added_author_words=added,
+            learned_words=learned,
+        )
+
+    def _get_confirmable_page(self, page_id: int) -> PageView:
+        """A page in an editable state whose every line has a transcription.
+
+        Shared by the confirmation and its preview, so the preview cannot offer
+        words the confirmation would then refuse to take.
+        """
         page = self._get_editable_page(page_id)
         for line in page.lines:
             if not line.has_valid_transcription:
@@ -542,22 +677,41 @@ class HandwritingPageService:
                     f"Line {line.id} has an empty transcription that was not explicitly "
                     "confirmed by the user"
                 )
-        # Prediction quality on this page vs. the user's ground truth (section 19).
-        pairs = [(line.effective_text or "", line.predicted_text or "") for line in page.lines]
-        metrics = self.metrics_evaluator.evaluate_pairs(pairs) if pairs else None
-        page = self.page_repository.confirm_page(
-            page_id,
-            confirmed_at=datetime.now(timezone.utc),
-            prediction_cer=metrics["cer"] if metrics else None,
-            prediction_wer=metrics["wer"] if metrics else None,
+        return page
+
+    def _dictionary_delta(
+        self,
+        page: PageView,
+        before: frozenset[str] | None,
+        after: frozenset[str] | None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The words a page adds to the author dictionary and what they change.
+
+        ``before`` / ``after`` are the author vocabularies around the write; the
+        preview projects ``after`` instead of confirming. Returns the words the
+        page contributes and the subset the general dictionary does not know —
+        the ones that stop being flagged as unknown.
+        """
+        if before is None or after is None:
+            return (), ()
+        # only the words actually written on the page: the vocabulary also holds
+        # lookup variants ("еврея" brings "евреё" along), and showing those would
+        # confuse the very report meant to be checkable by eye
+        page_words = {
+            normalize_word(token)
+            for line in page.lines
+            for token in iter_words(line.effective_text or "")
+            if any(character.isalpha() for character in token)
+        }
+        new_words = sorted(word for word in after - before if word in page_words)
+        # built on the *after* vocabulary: those words are the author's own now,
+        # so only `is_author_only` can tell them from the general dictionary's
+        checker = self.lexicon_annotator.checker_with_words(after)
+        added = tuple(new_words)
+        learned = tuple(
+            word for word in new_words if checker is not None and checker.is_author_only(word)
         )
-        logger.info(
-            "HTR page confirmed: user_id=%s author_id=%s page_id=%s "
-            "prediction_cer=%s prediction_wer=%s",
-            page.user_id, page.author_id, page_id,
-            page.prediction_cer, page.prediction_wer,
-        )
-        return self._annotate(page)
+        return added, learned
 
     # ------------------------------------------------------------------
 

@@ -13,7 +13,10 @@ The check is deliberately read-only and best-effort:
   (``in_lexicon = None``, ``lexicon_available = False``) so the UI can say so
   instead of marking the whole page;
 * the author's own confirmed transcriptions and knowledge-base terms count as
-  known, so their names and dialect words are not flagged.
+  known, so their names and dialect words are not flagged. A word that only the
+  author's pages vouch for is marked ``author_only`` instead of being silently
+  accepted: it may be a name — or a typo that was confirmed once. Such words are
+  not part of ``oov_count``, and the dictionary panel can remove them.
 """
 from __future__ import annotations
 
@@ -48,6 +51,78 @@ class LexiconAnnotator:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("HTR lexicon: no checker for author %s: %s", author_id, exc)
             return None
+
+    def author_words(self, author_id: int) -> frozenset[str] | None:
+        """The author's own vocabulary, or None when there is no dictionary.
+
+        Used to tell the user what confirming a page just taught the dictionary.
+        """
+        provider = self.provider
+        getter = getattr(provider, "author_words", None) if provider else None
+        if getter is None:
+            return None
+        try:
+            return frozenset(getter(author_id))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("HTR lexicon: no vocabulary for author %s: %s", author_id, exc)
+            return None
+
+    def author_words_after_confirming(self, page: PageView) -> frozenset[str] | None:
+        """The vocabulary the author would have if ``page`` were confirmed.
+
+        The read-only twin of :meth:`author_words`: the confirmation preview
+        asks what a page is about to teach, so nothing is written.
+        """
+        provider = self.provider
+        getter = getattr(provider, "author_words_with_page", None) if provider else None
+        if getter is None:
+            return None
+        try:
+            # reading order matters: the line-break rules join the tail of one
+            # line to the head of the next
+            texts = [
+                line.effective_text or ""
+                for line in sorted(page.lines, key=lambda item: item.order)
+            ]
+            return frozenset(getter(page.author_id, page.id, texts))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "HTR lexicon: no projected vocabulary for page %s: %s", page.id, exc
+            )
+            return None
+
+    def checker_with_words(self, author_words) -> LexiconChecker | None:
+        """A check whose author layer is given explicitly (confirmation preview).
+
+        ``None`` when the provider cannot build one; callers then report nothing
+        rather than guessing which words the general dictionary knows.
+        """
+        provider = self.provider
+        getter = getattr(provider, "checker_with_words", None) if provider else None
+        if getter is None:
+            return None
+        try:
+            return getter(author_words)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("HTR lexicon: no preview check: %s", exc)
+            return None
+
+    # -- the author dictionary panel ------------------------------------
+
+    def dictionary(self, author_id: int) -> dict | None:
+        """The author's own vocabulary + the words they removed.
+
+        None when the provider cannot list words (no dictionary configured or a
+        provider without the panel methods).
+        """
+        provider = self.provider
+        if provider is None or not hasattr(provider, "author_terms"):
+            return None
+        return {
+            "available": self.is_available,
+            "words": provider.author_terms(author_id),
+        }
+
 
     # ------------------------------------------------------------------
 
@@ -114,8 +189,11 @@ class LexiconAnnotator:
         if not available or checker is None:
             line.oov_count = 0
             line.oov_words = []
+            line.author_only_count = 0
+            line.author_only_words = []
             for word in words:
                 word.in_lexicon = None
+                word.author_only = False
             return 0
 
         tokens = iter_words(line.effective_text)
@@ -124,17 +202,30 @@ class LexiconAnnotator:
         aligned = not line.words_stale and len(tokens) == len(words)
         for index, word in enumerate(words):
             if aligned:
-                word.in_lexicon = checker.is_known(tokens[index])
+                token = tokens[index]
+                word.in_lexicon = checker.is_known(token)
+                word.author_only = checker.is_author_only(token)
             else:
                 own = iter_words(word.effective_text)
                 word.in_lexicon = (
                     all(checker.is_known(token) for token in own) if own else None
+                )
+                # a box is weak when it is known at all, but only the author's
+                # own pages vouch for it
+                word.author_only = (
+                    bool(own)
+                    and all(checker.is_known(token) for token in own)
+                    and any(checker.is_author_only(token) for token in own)
                 )
 
         # the badge and the list follow the transcription the user sees, even
         # when the (stale) word boxes no longer match it
         line.oov_words = [token for token in tokens if not checker.is_known(token)]
         line.oov_count = len(line.oov_words)
+        line.author_only_words = [
+            token for token in tokens if checker.is_author_only(token)
+        ]
+        line.author_only_count = len(line.author_only_words)
         return line.oov_count
 
     @staticmethod
