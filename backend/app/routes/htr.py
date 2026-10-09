@@ -6,7 +6,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..deps import get_current_user, get_db
+from ..deps import get_current_user, get_db, get_knowledge_source_service
+from ..services.knowledge_source_service import KnowledgeSourceService
 from ..htr import factory
 from ..htr.application.confidence import ConfidencePolicy
 from ..htr.application.page_service import HandwritingPageService
@@ -22,6 +23,7 @@ from ..htr.domain.entities import (
 )
 from ..htr.domain.errors import (
     CorruptImageError,
+    DuplicatePageError,
     HTRError,
     InvalidTranscriptionError,
     NotFoundError,
@@ -257,6 +259,8 @@ async def upload_page(
         )
     except CorruptImageError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except DuplicatePageError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return PageUploadResponse(page_id=page.id, status=page.status.value)
 
 
@@ -739,6 +743,7 @@ def reopen_page(
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
+    source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
     """Undo a confirmation.
 
@@ -747,6 +752,9 @@ def reopen_page(
     transcription becomes editable again, and the prediction metrics of the
     confirmation are dropped. A model already trained on the page is untouched —
     a fine-tune cannot be undone.
+
+    Its knowledge goes too: the text is not ground truth any more, so what was
+    read from it must not be shown (spec 6.3).
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
@@ -754,6 +762,12 @@ def reopen_page(
         page = page_service.reopen_page(page_id)
     except PageStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    try:
+        source = source_service.get("htr", page_id, user.id)
+        if source is not None:
+            source_service.mark_pending(source)
+    except Exception:
+        logger.exception("Could not reset the knowledge of page %s", page_id)
     return _to_page_response(page)
 
 
@@ -798,6 +812,7 @@ def confirm_page(
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
+    source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
     """Marks the page as confirmed ground truth and measures its prediction error.
 
@@ -807,6 +822,10 @@ def confirm_page(
 
     The response also lists the words the confirmation added to the author's own
     vocabulary, because that is the moment those words stop being unknown.
+
+    The confirmed text also becomes a knowledge source and is extracted (spec 6.3):
+    sync mode runs the pipeline before the response, async mode queues it and the
+    UI polls ``GET /knowledge/sources/htr/{page_id}/status``.
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
@@ -819,6 +838,16 @@ def confirm_page(
     response = PageConfirmResponse(**_to_page_response(report.page).model_dump())
     response.added_author_words = list(report.added_author_words)
     response.author_words_learned = list(report.learned_words)
+
+    try:
+        source, created, changed = source_service.refresh_from_htr_page(report.page)
+        extraction = source_service.request_extraction_sync(source)
+        logger.info(
+            "Knowledge source for page %s: created=%s changed=%s %s",
+            page_id, created, changed, extraction,
+        )
+    except Exception:
+        logger.exception("Knowledge extraction could not be started for page %s", page_id)
     return response
 
 

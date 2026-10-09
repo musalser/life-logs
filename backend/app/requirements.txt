@@ -6,12 +6,20 @@ pydantic-settings
 httpx
 python-dotenv
 psycopg[binary]
+# Vector columns for knowledge deduplication and RAG. Needs the `vector`
+# extension in Postgres, which the pgvector/pgvector:pg16 image ships.
+pgvector
 celery[redis]
 redis
 llama-cpp-python
 ollama
 PyJWT
-transformers
+# Embeddings (deduplication + RAG) run in-process: google/embeddinggemma-2 is a
+# Hugging Face SentenceTransformer, not an Ollama model. >=6.1.0 is what the
+# model card requires, and its `embedding_gemma2` architecture needs
+# transformers>=5.19 (older versions refuse to load the checkpoint).
+sentence-transformers>=6.1.0
+transformers>=5.19.0
 torch
 pillow
 python-multipart

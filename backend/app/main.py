@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.deps import get_ollama_adapter
+from app.deps import get_embedding_service, get_ollama_adapter
 from app.logging_utils import configure_logging, log_requests
 
 from .config import settings
@@ -22,6 +22,9 @@ async def lifespan(app: FastAPI):
     ai_adapter = get_ollama_adapter()
     logger.info("Starting application warmup")
     await ai_adapter.warmup()
+    # no-op unless EMBEDDING_WARMUP_ENABLED is set: loading the embedding
+    # weights at startup saves the first request a few seconds
+    await get_embedding_service().warmup()
     logger.info("Application warmup completed")
     yield
     

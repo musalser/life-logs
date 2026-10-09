@@ -136,6 +136,30 @@ def test_training_starts_once_line_threshold_is_reached():
     assert model_repo.get_active_model(AUTHOR_ID) is not None
 
 
+def test_a_tiny_corpus_trains_when_the_threshold_is_disabled():
+    """The default is no size gate: confirmed pages are the user's own decision."""
+    model_repo = FakeModelRepository()
+    service = make_service(dataset=make_dataset(n_samples=2), min_lines=0,
+                           model_repo=model_repo)
+
+    result = service.train_author(AUTHOR_ID)
+
+    assert result.outcome == TrainingOutcome.SUCCESS
+    assert result.lines_collected == 2
+    assert result.lines_required == 0
+    assert model_repo.get_active_model(AUTHOR_ID) is not None
+
+
+def test_without_a_threshold_an_empty_corpus_is_still_refused():
+    service = make_service(dataset=make_dataset(n_samples=0), min_lines=0)
+
+    result = service.train_author(AUTHOR_ID)
+
+    assert result.outcome == TrainingOutcome.INSUFFICIENT_DATA
+    assert "no confirmed lines" in result.message
+    assert service.trainer.calls == []
+
+
 def test_optional_word_threshold_is_enforced_too():
     run_repo = FakeTrainingRunRepository()
     # 3 lines x 2 words = 6 words: enough lines, not enough words

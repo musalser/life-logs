@@ -198,6 +198,37 @@ class SqlAlchemyPageRepository:
         except NotFoundError:
             return None
 
+    @staticmethod
+    def _page_identity(file_name: str | None, source_path: str | None) -> tuple[str, str]:
+        """What makes two uploads the same page.
+
+        The name, case-folded: ``Page.JPG`` and ``page.jpg`` are one file on every
+        filesystem a browser reads from. The source path, normalised to forward
+        slashes, so the same name from another folder is a *different* page —
+        which is exactly what ``source_path`` is kept for.
+        """
+        name = (file_name or "").strip().casefold()
+        source = (source_path or "").strip().replace("\\", "/").casefold()
+        return name, source
+
+    def find_page_by_name(
+        self, author_id: int, file_name: str, source_path: str | None
+    ) -> PageView | None:
+        wanted = self._page_identity(file_name, source_path)
+        if not wanted[0]:
+            return None
+        # The author's own pages are tens of rows, and the comparison needs the
+        # same normalisation the display uses, which SQL cannot do portably.
+        rows = (
+            self.db.query(HTRPage)
+            .filter(HTRPage.author_id == author_id, HTRPage.file_name.isnot(None))
+            .all()
+        )
+        for page in rows:
+            if self._page_identity(page.file_name, page.source_path) == wanted:
+                return _to_page_view(page)
+        return None
+
     def delete_page(self, page_id: int) -> None:
         page = self._get_orm_page(page_id)
         author_id = page.author_id

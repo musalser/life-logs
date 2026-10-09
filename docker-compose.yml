@@ -13,7 +13,11 @@ services:
       retries: 5
 
   postgres:
-    image: postgres:16-alpine
+    # pgvector ships the `vector` extension in a stock postgres:16 image, so the
+    # knowledge base can store embeddings (deduplication + RAG) in the same
+    # database. The data directory format is the plain postgres:16 one, so the
+    # existing volume keeps working after the image swap.
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres

@@ -21,6 +21,7 @@ from typing import Protocol
 
 from ..domain.entities import PageStatus, PageSummary, PageView, RecognitionResult
 from ..domain.errors import (
+    DuplicatePageError,
     InvalidTranscriptionError,
     NotFoundError,
     PageStateError,
@@ -185,8 +186,18 @@ class HandwritingPageService:
         source_path: str | None = None,
     ) -> PageView:
         width, height = self.image_store.probe_image(content)
-        file_path = self.image_store.save_page_image(user_id, author_id, filename, content)
         file_name, original_path = split_page_path(source_path or filename)
+        # A page is identified by its name *and* where it came from: the same name
+        # from another folder is another page (that is what `source_path` is kept
+        # for), while the same name from the same source is one page uploaded
+        # twice — a duplicate in the corpus, not a new entry. The check runs
+        # before the image is written, so a refused upload leaves no orphan file.
+        duplicate = self.page_repository.find_page_by_name(author_id, file_name, original_path)
+        if duplicate is not None:
+            raise DuplicatePageError(
+                f"Page '{file_name}' from this source is already uploaded (page {duplicate.id})"
+            )
+        file_path = self.image_store.save_page_image(user_id, author_id, filename, content)
         page = self.page_repository.create_page(
             user_id=user_id,
             author_id=author_id,

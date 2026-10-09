@@ -1,13 +1,14 @@
 """Decides whether a confirmed-page corpus is large enough for fine-tuning.
 
-Training is started explicitly by the user, but a single page (a few dozen
-lines) is rarely enough to adapt a model without overfitting it. The dataset
-therefore has to reach a configurable size before a training run does any work;
-until then the request succeeds and the training result reports how much
-material is still missing (``INSUFFICIENT_DATA``).
+Training is started explicitly by the user, and confirming a page is already
+their decision that the material is worth learning from — so the size threshold
+is **disabled by default** (``min_lines = 0``) and any non-empty corpus is
+trained on. A positive ``min_lines`` / ``min_words`` restores the old gate for
+deployments that want it; a single page (a few dozen lines) can overfit a model,
+but that is the user's call, not a hidden refusal.
 
-The threshold is expressed in lines by default. An optional word threshold can
-be enabled as well (``min_words > 0``); both conditions must then hold.
+The one thing that is always required is *some* material: a run over an empty
+corpus cannot produce a model, so it stays ``INSUFFICIENT_DATA`` with a reason.
 """
 from __future__ import annotations
 
@@ -27,11 +28,9 @@ class TrainingReadiness:
 
 
 class TrainingReadinessPolicy:
-    def __init__(self, min_lines: int = 50, min_words: int = 0):
-        if min_lines < 1 and min_words < 1:
-            raise ValueError("at least one training threshold must be positive")
-        self.min_lines = min_lines
-        self.min_words = min_words
+    def __init__(self, min_lines: int = 0, min_words: int = 0):
+        self.min_lines = max(0, min_lines)
+        self.min_words = max(0, min_words)
 
     def evaluate(self, dataset: TrainingDataset) -> TrainingReadiness:
         lines = len(dataset.samples)
@@ -42,6 +41,9 @@ class TrainingReadinessPolicy:
             missing.append(f"{lines}/{self.min_lines} line(s)")
         if self.min_words > 0 and words < self.min_words:
             missing.append(f"{words}/{self.min_words} word(s)")
+        if not missing and lines == 0:
+            # not a threshold but a floor: there is nothing to train on at all
+            missing.append("no confirmed lines at all")
 
         if missing:
             return TrainingReadiness(

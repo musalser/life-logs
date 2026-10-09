@@ -8,6 +8,13 @@
     <NuxtLayout>
       <NuxtPage />
     </NuxtLayout>
+
+    <!--
+      The plate that stages a tab change lives outside the layouts, because the
+      journey it covers starts on the landing page too ("Enter the Temple") and
+      has to survive the layout swap between / and the app sections.
+    -->
+    <CinematicCurtain />
   </div>
 </template>
 

@@ -3,9 +3,10 @@
 Business rules enforced here:
 - the base model is ALWAYS the default model, never a previous custom model;
 - the dataset contains ALL confirmed pages of the author at training time;
-- training only starts once the confirmed corpus reaches a configurable size
-  (per-author lines/words threshold); below it the page stays confirmed and the
-  result is INSUFFICIENT_DATA instead of a failure;
+- the size threshold is disabled by default (any non-empty corpus is trained
+  on); a configurable per-author lines/words threshold can re-enable it, and
+  below it the page stays confirmed and the result is INSUFFICIENT_DATA instead
+  of a failure;
 - every successful run creates a new model version, old versions are kept;
 - a new version becomes active only after a fully successful run;
 - on any failure the previously active model stays active.
@@ -79,7 +80,7 @@ class HandwritingTrainingService:
         training_run_repository: TrainingRunRepository,
         trainer: HTRTrainer,
         config: TrainingConfig,
-        min_training_lines: int = 50,
+        min_training_lines: int = 0,
         min_training_words: int = 0,
         environment: dict[str, Any] | None = None,
         lm_rebuilder: Callable[[int], Path | None] | None = None,

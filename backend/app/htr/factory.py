@@ -123,6 +123,8 @@ def build_recognizer() -> KrakenRecognizer:
         no_hlines=settings.htr_segmentation_no_hlines,
         segmentation_engine=settings.htr_segmentation_engine,
         merge_lines=settings.htr_segmentation_merge_lines,
+        segmentation_rows=settings.htr_segmentation_rows,
+        segmentation_rows_threshold=settings.htr_segmentation_rows_threshold,
         decoder=settings.htr_decoder,
         lm_path=settings.htr_lm_path,
         beam_config=build_beam_config(),

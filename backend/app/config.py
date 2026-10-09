@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 
 
@@ -9,6 +12,83 @@ class Settings(BaseSettings):
     llama_n_ctx: int = 4096
     llama_n_threads: int = 8
     port: int = 8000
+
+    # LLM that serves the chat, diary titles and knowledge extraction.
+    # HTR line correction is a different job with its own model
+    # (htr_correction_model below): it proposes per-line fixes and was tuned for
+    # that, so it deliberately stays on a smaller non-reasoning model.
+    llm_model: str = "qwen3:14b"
+    # qwen3 is a reasoning model. Left on, it spends the answer budget on
+    #  reasoning tokens: a page takes minutes longer and the strict JSON of
+    # the extraction schemas comes back wrapped in prose. Structured calls
+    # always disable it; the chat may keep it on.
+    llm_thinking_enabled: bool = True
+    # Loading a 14b model into VRAM at startup makes the first request fast at
+    # the price of a slow boot; off by default on developer machines.
+    llm_warmup_enabled: bool = False
+
+    # Embeddings: deduplication of extracted knowledge and RAG over the archive.
+    # The weights are a Hugging Face SentenceTransformer, not an Ollama model:
+    # google/embeddinggemma-2 (740m: a 270m text backbone plus loadable vision
+    # and audio encoders) returns 768-dimensional vectors. Loading is in-process,
+    # so an embedding does not compete with the chat model for Ollama's queue.
+    embedding_model: str = "google/embeddinggemma-2"
+    embedding_dim: int = 768
+    #: where the downloaded weights are cached; kept inside the project so the
+    #: archive and its model stay together (htr_storage/ is gitignored)
+    embedding_model_dir: str = "htr_storage/embedding_models"
+    #: 'auto' takes CUDA when torch sees a GPU (the chat model shares it), else CPU
+    embedding_device: str = "auto"
+    #: Task instruction prefix for *symmetric* similarity (deduplication).
+    #: Measured on 20 related + 20 unrelated Russian pairs (see the spec, 4.5):
+    #: the model card's Clustering prompt is the worst choice here — unrelated
+    #: phrases score 0.922 on average and the space collapses into a narrow cone
+    #: (anisotropy 0.956), which is what makes "купить молоко" look like
+    #: "похудеть к лету". SentenceSimilarity is the same symmetric task but keeps
+    #: unrelated pairs at 0.814 (anisotropy 0.900) and ranks best (AUC 0.983).
+    #: RAG passes its own asymmetric prompts: 'SearchQuery' vs 'Document'.
+    embedding_default_prompt: str = "SentenceSimilarity"
+    #: Load only the 270m text encoder: the vision and audio towers of this
+    #: multimodal checkpoint are dead weight for the archive (memory 1.5 GB ->
+    #: ~0.5 GB). Measured: identical vectors, see the spec 4.5.
+    embedding_text_only: bool = True
+    #: how many texts one forward pass sees
+    embedding_batch_size: int = 32
+    #: the checkpoint reports a nonsensical max_seq_length; the model card says
+    #: 8192 tokens, and a sane cap keeps a long chunk from allocating wildly
+    embedding_max_seq_length: int = 8192
+    #: how many embedded strings one process keeps in memory — re-extracting a
+    #: page asks for the same titles again and again
+    embedding_cache_size: int = 1000
+    #: load the weights at startup (~0.5 GB with embedding_text_only) instead of
+    #: on the first request
+    embedding_warmup_enabled: bool = False
+
+    # Knowledge extraction pipeline. `sync` runs it inside the HTTP request
+    # (the development default: no worker to babysit); `async` hands it to
+    # Celery and lets the UI poll the source status.
+    knowledge_processing_mode: str = "sync"
+    # Deduplication. Measured with the default prompt (SentenceSimilarity) on 20
+    # related + 20 unrelated Russian pairs: related 0.961±0.020 (min 0.922),
+    # unrelated 0.814±0.039. No absolute threshold separates them cleanly — the
+    # best one costs ~2 % errors and two *different* birthdays of the same child
+    # still score 0.995 — so the embedding only *retrieves* candidates and the
+    # LLM resolver decides. This floor is how far a candidate may fall before it
+    # is not even shown to the model; it sits just above the unrelated mean, so
+    # it filters noise without dropping a possible duplicate.
+    knowledge_dedup_candidates: int = 5
+    knowledge_dedup_min_similarity: float = 0.88
+
+    # RAG in the chat.
+    rag_enabled_by_default: bool = True
+    rag_top_k: int = 4
+    rag_chunk_max_chars: int = 1200
+    rag_chunk_overlap_chars: int = 200
+
+    # A confirmed manuscript page is extracted with the tail of the previous
+    # page (and the head of the next one) as context: a sentence can start on
+    # one page and end on another.
+    knowledge_neighbor_context_chars: int = 400
 
     # NER
     ner_model: str = "surdan/LaBSE_ner_nerel"
@@ -132,6 +212,15 @@ class Settings(BaseSettings):
     # The segmenter sometimes detaches the first word of a line into its own
     # record; glue such pieces back together before recognition.
     htr_segmentation_merge_lines: bool = True
+    # Additionally group the baselines by the *physical rows* found in the ink
+    # (the horizontal profile of the page): a logbook whose words and numbers
+    # stand far apart arrives as several baselines per row. The geometric merge
+    # above runs first, so the ink can only add merges, never remove one.
+    htr_segmentation_rows: bool = True
+    # Where a row band starts on the smoothed ink profile, as a fraction of its
+    # maximum. Higher = narrower bands (tightly spaced diary rows must not be
+    # glued), lower = wider (very sparse rows).
+    htr_segmentation_rows_threshold: float = 0.4
     htr_segmentation_maxcolseps: int = 2
     htr_segmentation_no_hlines: bool = True
 
@@ -183,8 +272,11 @@ class Settings(BaseSettings):
     htr_confidence_warning_threshold: float = 0.90
     htr_confidence_critical_threshold: float = 0.70
     # Fine-tuning starts only once the confirmed corpus reaches this size.
-    # One page is usually ~30 lines, so the default waits for a second page.
-    htr_min_training_lines: int = 50
+    # 0 disables the threshold: every confirmed page is the user's own decision
+    # to include the material, so any non-empty corpus is trained on. Set it
+    # (one page is usually ~30 lines, so 50 waits for a second page) to keep the
+    # old "not enough data yet" gate.
+    htr_min_training_lines: int = 0
     # Optional second threshold; 0 disables it (lines alone decide).
     htr_min_training_words: int = 0
     # Backend knobs handed to the trainer (kraken reads these keys).
@@ -246,3 +338,12 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Hugging Face keeps both the downloaded weights and its transfer cache under
+# $HF_HOME. Point it inside the project for two reasons: the archive and the
+# model that reads it stay together (htr_storage/ is gitignored), and a machine
+# whose ~/.cache is not writable (a sandbox, a shared box) still works.
+# huggingface_hub resolves this at import time, so it must be set before
+# anything imports transformers/sentence-transformers — config is the first
+# project module every entry point loads, which is why it happens here.
+os.environ.setdefault("HF_HOME", str(Path(settings.embedding_model_dir).resolve()))

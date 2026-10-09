@@ -50,16 +50,56 @@ is projected onto the local baseline direction, and a merge requires
 * roughly parallel local slopes.
 
 The tolerance scale is the **line pitch** estimated from the page
-(`estimate_pitch`: span of the baseline midpoints / gaps), *not* the glyph
-height — the outline of a wavy line can be taller than the line spacing, which
-made an earlier height-based version glue real consecutive lines together
-(23 lines instead of 32 on the development page). Detached words are also
-handled when they end up non-adjacent in reading order: pieces are grouped with
-union-find and the merged record keeps the position of its earliest piece.
+(`estimate_pitch`), *not* the glyph height: the outline of a wavy line can be
+taller than the line spacing, and an earlier height-based version glued real
+consecutive lines together (23 lines instead of 32 on the development page).
+Boundary heights do enter the estimate, but only as the tolerance deciding which
+baseline midpoints belong to the same line; the pitch itself is the median gap
+between those clusters. Measuring it as `span / (n - 1)` counts *segments*, not
+lines: on a page the segmenter split into several pieces per line — a logbook
+whose words and numbers stand far apart — the pitch shrinks by the number of
+pieces per line and the repair threshold rejects the very gaps it should bridge.
+On author «Тренер»'s logbook (page 170) the 56 raw segments carried a 34 px
+"pitch" and stayed ~50 lines; clustered, the pitch is 271 px and they become the
+8 physical lines. The «me» and «Баба Галя» pages keep their 28–32 lines
+unchanged. Detached words are also handled when they end up non-adjacent in
+reading order: pieces are grouped with union-find and the merged record keeps
+the position of its earliest piece.
 
 Measured on the development page: **36 → 32 lines**, `сейчас`/`успевал` are back
 inside their lines, word count unchanged (200 → 199). Disable the step with
 `htr_segmentation_merge_lines = false` if a page ever merges too eagerly.
+
+### The page's physical rows, from the ink
+
+The geometric merge still cannot place every piece: a tiny "+" between two
+words, or a margin number whose baseline is nearly vertical, has no direction to
+match. The **horizontal profile of the page ink** answers the question the
+baselines cannot — where the rows are — because the pieces of one row share a
+band of dark pixels (`infrastructure/kraken/rows.py::row_bands`). The mask is
+built on the image downscaled to 1500 px (Otsu splits the paper from the desk,
+the largest bright region is the page, pixels 25 levels darker than that are
+ink), the profile is smoothed over 1/150 of the height, and a band starts where
+it passes `htr_segmentation_rows_threshold` (default 0.4) of its maximum.
+
+The bands only ever **add** merges: the geometric grouping runs first and groups
+that share one band are unioned, never the other way round. A band that is too
+wide can therefore glue two tightly spaced rows, which is why the threshold
+defaults to the higher end, and why the diary pages must not change
+(`htr_segmentation_rows = false` turns the step off entirely). A piece standing
+inside a longer one joins the outline but is left out of the merged baseline: a
+zigzag through it would misdirect the crop.
+
+Measured: «me»/«Баба Галя» keep their 28–32 rows unchanged (no band ever holds
+two of them), page 170 goes from 8 lines to its 7 physical rows, page 171 from
+10 to 9.
+
+The merge does not fix the *order*: the segmenter numbers the lines as its
+detector found them, which on the logbook page put the first row third, and
+recognition inherits that. `reading_order` sorts the baselines by vertical
+position before recognition (`_merge_split_lines`); the pages of this project are
+one text column, so no column cut is attempted. On page 170 the seven merged rows
+now run top to bottom.
 
 ## Model proposals: the recognition is never overwritten
 
@@ -846,17 +886,21 @@ Training is a **manual, explicit** step: the user presses «Обучить мо�
 only turns it into ground truth — otherwise confirming several pages in a row
 would pay for a full fine-tune (minutes) after each one.
 
-A fine-tune is still skipped while the author's confirmed corpus is too small to
-be worth it. A single page (~30 lines) is not, so the threshold is configurable:
+A size threshold used to be mandatory (a single page, ~30 lines, is not enough to
+be worth a fine-tune). It is **disabled by default**: confirming a page is the
+user's decision that the material is worth learning from, so any non-empty corpus
+trains. A deployment that wants the old gate can re-enable it:
 
 | setting | default | meaning |
 | --- | --- | --- |
-| `htr_min_training_lines` | `50` | confirmed lines required before fine-tuning |
+| `htr_min_training_lines` | `0` | confirmed lines required before fine-tuning; `0` disables the gate |
 | `htr_min_training_words` | `0` | optional second threshold; `0` disables it |
 
-Below the threshold the training call returns `outcome = "INSUFFICIENT_DATA"`
-with `lines_collected`/`lines_required` (and `words_*`), so the UI can explain
-what is still missing. No model version is created for a skipped run.
+Below a configured threshold the training call returns
+`outcome = "INSUFFICIENT_DATA"` with `lines_collected`/`lines_required` (and
+`words_*`), so the UI can explain what is still missing. No model version is
+created for a skipped run. An *empty* corpus (0 lines) is always refused — there
+is nothing to train on — whatever the thresholds are.
 
 A second training request arriving while the same author is already training gets
 `outcome = "BUSY"` immediately (a process-local per-author lock; a worker queue
@@ -1083,6 +1127,29 @@ HTR_RUN_REAL_TRAINING=1 HTR_TEST_DEVICE=cuda:0 \
 It renders a few line images, fine-tunes the real default model for one epoch,
 exports safetensors and checks CER/WER (≈30 s on an RTX 5060 Ti with
 `TORCHDYNAMO_DISABLE=1`). It is skipped unless `HTR_RUN_REAL_TRAINING=1`.
+It needs `/dev/shm`: kraken's dataset creates `multiprocessing`
+shared values and POSIX semaphores there, so a sandbox that only allows writes
+inside the project fails with `PermissionError [Errno 13]` before any training
+maths (this is the environment, not the backend).
+
+### Recognition regression on real pages
+
+Unit tests fake the model and the segmenter, so a dependency bump
+(`torch`, `safetensors`, `transformers` via torchmetrics) or a rebuilt lexicon
+is not caught by them. Re-recognize pages that were already recognized and
+compare with the stored prediction:
+
+```bash
+.venv/bin/python scripts/verify_htr_recognition.py --page-id 23
+.venv/bin/python scripts/verify_htr_recognition.py --all --max-cer 0.05
+```
+
+The script only reads the database. It prints per-page identical lines, CER/WER
+and the differing lines, and exits non-zero above `--max-cer` (or when the line
+count changes). Differences are expected where the author's dictionary grew
+since the page was recognized — the beam decoder deliberately scores words
+against the current vocabulary — and are usually improvements; the script shows
+them instead of hiding them.
 
 ## Settings (`app/config.py`)
 
@@ -1118,7 +1185,7 @@ segmenter the CPU path is noticeably slower, so set `cuda:0` when a GPU exists.
 | `htr_learning_rate` | `0.00001` | initial LR; 1e-4 is what the measurements above use |
 | `htr_validation_split` | `0.1` | share of confirmed lines held out for metrics |
 | `htr_random_seed` | `42` | seeds the run and the deterministic split |
-| `htr_min_training_lines` / `htr_min_training_words` | `50` / `0` | fine-tuning thresholds |
+| `htr_min_training_lines` / `htr_min_training_words` | `0` / `0` | fine-tuning thresholds; `0` disables the gate |
 | `htr_training_resize` | `union` | codec handling when the data has new characters |
 | `htr_training_normalization` | `NFD` | Unicode normalization of training text (must match the codec) |
 | `htr_training_height` / `htr_training_max_width` | `96` / `2560` | line geometry (informational: the loaded checkpoint overrides the height — it declares 96, see the height section) |

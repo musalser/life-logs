@@ -19,7 +19,7 @@ from ..deps import (
     hash_refresh_token,
     rotate_refresh_session,
 )
-from ..models import RefreshSession, User
+from ..models import Entity, KnowledgeState, RefreshSession, User
 from ..schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -127,6 +127,29 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         name=request.name or request.username,
     )
     db.add(user)
+    db.flush()
+
+    # Every account owns one person-object: it is the "Я" of the knowledge tab,
+    # and everything extracted from the diary is attributed to it. The self
+    # object is created with the account rather than on first use, because a
+    # diary page can be written before any other object exists.
+    display_name = (user.name or user.username).strip()
+    self_entity = Entity(
+        user_id=user.id,
+        entity_type="person",
+        canonical_name=display_name[:255],
+        normalized_name=display_name.lower()[:255],
+        first_seen_at=datetime.now(timezone.utc),
+        last_seen_at=datetime.now(timezone.utc),
+    )
+    db.add(self_entity)
+    db.flush()
+    user.self_entity_id = self_entity.id
+    # knowledge_state tracks the version the analytics cache was built from; a
+    # missing row would only mean "version 0", but keeping it explicit makes the
+    # invariant (one row per user) true from the first request
+    db.add(KnowledgeState(user_id=user.id, version=0))
+
     db.commit()
     db.refresh(user)
     return user

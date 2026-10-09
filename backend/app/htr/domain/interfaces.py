@@ -153,6 +153,17 @@ class PageRepository(Protocol):
 
     def get_page(self, page_id: int) -> PageView | None: ...
 
+    def find_page_by_name(
+        self, author_id: int, file_name: str, source_path: str | None
+    ) -> PageView | None:
+        """The author's page with this name from this source, if any.
+
+        Name comparison ignores case and surrounding space; a page without a
+        source is only the same as another page without one, so equal names from
+        different folders stay two pages.
+        """
+        ...
+
     def delete_page(self, page_id: int) -> None:
         """Remove the page and its lines/words (cascade)."""
         ...

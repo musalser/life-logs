@@ -54,39 +54,6 @@
           >
             {{ trainingStarting ? 'Обучение…' : 'Обучить модель' }}
           </button>
-          <button
-            type="button"
-            class="app-ghost"
-            :disabled="!authorId || uploading"
-            title="Загрузить все изображения из папки — имена файлов станут названиями страниц"
-            @click="folderInput?.click()"
-          >
-            Загрузить папку
-          </button>
-          <button
-            type="button"
-            class="app-primary"
-            :disabled="!authorId || uploading"
-            @click="fileInput?.click()"
-          >
-            {{ uploading ? 'Загрузка…' : 'Загрузить страницу' }}
-          </button>
-          <input
-            ref="fileInput"
-            type="file"
-            accept="image/*"
-            class="hidden"
-            @change="onUpload"
-          />
-          <input
-            ref="folderInput"
-            type="file"
-            webkitdirectory
-            directory
-            multiple
-            class="hidden"
-            @change="onUpload"
-          />
         </div>
       </div>
 
@@ -158,61 +125,141 @@
     >
       <!-- pages -->
       <aside class="rounded-2xl border border-app-border/40 bg-app-panel/50 p-3">
-        <div class="mb-2 flex items-center justify-between gap-2">
-          <p class="text-xs uppercase tracking-widest text-app-accent">Страницы</p>
-          <span class="text-xs text-app-muted">{{ pages.length }} шт.</span>
-        </div>
+        <!--
+          Uploading an image belongs to the list of pages, not to the training
+          toolbar: the new page appears right below this button. The panel has no
+          title — the button, the count and the rows say what it is.
+        -->
+        <button
+          type="button"
+          class="app-primary upload-button mb-2 w-full"
+          :disabled="uploading || recognizing"
+          :title="recognizing
+            ? 'Дождитесь распознавания текущей страницы'
+            : 'Изображение страницы — имя файла станет названием страницы'"
+          @click="fileInput?.click()"
+        >
+          {{ uploading && !recognizing ? 'Загрузка…' : 'Загрузить изображение' }}
+        </button>
+        <input
+          ref="fileInput"
+          type="file"
+          accept="image/*"
+          class="hidden"
+          @change="onUpload"
+        />
 
         <p v-if="pagesLoading" class="text-xs text-app-muted">Загрузка…</p>
         <p v-else-if="!pages.length" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-xs text-app-muted">
           Страниц пока нет.
         </p>
+        <p v-else class="mb-1.5 text-right text-xs text-app-muted">{{ pages.length }} шт.</p>
 
-        <div v-else class="no-scrollbar max-h-[70vh] space-y-2 overflow-y-auto pr-1">
-          <div
-            v-for="item in pages"
-            :key="item.page_id"
-            role="button"
-            tabindex="0"
-            :draggable="canReorder"
-            class="page-item w-full cursor-pointer rounded-xl border px-3 py-2 text-left transition"
-            :class="[
-              page?.page_id === item.page_id
-                ? 'border-app-primary/70 bg-app-primary/10'
-                : 'border-app-border/40 bg-app-panel/30 hover:border-app-primary/40 hover:bg-app-panel/50',
-              dragPageId === item.page_id ? 'page-item--dragging' : '',
-              dropTarget && dropTarget.id === item.page_id
-                ? (dropTarget.after ? 'page-item--drop-after' : 'page-item--drop-before')
-                : '',
-            ]"
-            @click="selectPage(item.page_id)"
-            @keydown.enter.prevent="selectPage(item.page_id)"
-            @dragstart="onPageDragStart(item, $event)"
-            @dragover.prevent="onPageDragOver(item, $event)"
-            @drop.prevent="onPageDrop(item)"
-            @dragend="onPageDragEnd"
-          >
-            <div class="flex items-start gap-1.5">
-              <span
-                v-if="canReorder"
-                class="page-grip mt-0.5"
-                title="Перетащите, чтобы изменить порядок"
+        <div v-if="pages.length" class="no-scrollbar max-h-[70vh] space-y-2 overflow-y-auto pr-1">
+          <template v-for="group in pageFolders" :key="group.dir || '__loose'">
+            <!--
+              One header per source folder. Clicking it hides the folder's rows —
+              the label is the tail of the path that makes this folder unique
+              among the author's folders.
+            -->
+            <button
+              v-if="group.dir"
+              type="button"
+              class="page-folder"
+              :title="`${group.dir} — скрыть или показать страницы`"
+              :aria-expanded="!folderCollapsed(group.dir)"
+              @click="toggleFolder(group.dir)"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                class="page-folder__chevron"
+                :class="{ 'page-folder__chevron--closed': folderCollapsed(group.dir) }"
                 aria-hidden="true"
               >
-                <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
-                  <path d="M8 6h2v2H8V6zm6 0h2v2h-2V6zM8 11h2v2H8v-2zm6 0h2v2h-2v-2zM8 16h2v2H8v-2zm6 0h2v2h-2v-2z" />
-                </svg>
-              </span>
-              <div class="min-w-0 flex-1">
-                <div class="flex items-center gap-1">
+                <path d="M16.59 8.59L12 13.17 7.41 8.59 6 10l6 6 6-6z" />
+              </svg>
+              <span class="min-w-0 flex-1 truncate text-left">{{ group.label }}</span>
+              <span class="text-[11px] font-normal text-app-muted">{{ group.items.length }}</span>
+            </button>
+
+            <div v-if="!group.dir || !folderCollapsed(group.dir)" class="space-y-2">
+              <div
+                v-for="item in group.items"
+                :key="item.page_id"
+                role="button"
+                tabindex="0"
+                :draggable="canReorder"
+                class="page-item page-row w-full cursor-pointer rounded-xl border px-3 py-2 text-left transition"
+                :class="[
+                  page?.page_id === item.page_id
+                    ? 'border-app-primary/70 bg-app-primary/10'
+                    : 'border-app-border/40 bg-app-panel/30 hover:border-app-primary/40 hover:bg-app-panel/50',
+                  dragPageId === item.page_id ? 'page-item--dragging' : '',
+                  dropTarget && dropTarget.id === item.page_id
+                    ? (dropTarget.after ? 'page-item--drop-after' : 'page-item--drop-before')
+                    : '',
+                ]"
+                @click="selectPage(item.page_id)"
+                @keydown.enter.prevent="selectPage(item.page_id)"
+                @dragstart="onPageDragStart(item, $event)"
+                @dragover.prevent="onPageDragOver(item, $event)"
+                @drop.prevent="onPageDrop(item)"
+                @dragend="onPageDragEnd"
+              >
+                <div class="flex items-center gap-1.5">
+                  <!--
+                    The grip is the drag handle, so it belongs with the row; it appears on
+                    hover (or when the row has keyboard focus) like the two actions, and
+                    keeps the list itself readable. Rename and delete stand to the right
+                    of the name, the padlock after them: it is page state, not an action,
+                    so it stays visible even when the actions are hidden.
+                  -->
+                  <span
+                    v-if="canReorder"
+                    class="page-grip"
+                    title="Перетащите, чтобы изменить порядок"
+                    aria-hidden="true"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
+                      <path d="M8 6h2v2H8V6zm6 0h2v2h-2V6zM8 11h2v2H8v-2zm6 0h2v2h-2v-2zM8 16h2v2H8v-2zm6 0h2v2h-2v-2z" />
+                    </svg>
+                  </span>
+
                   <p class="min-w-0 flex-1 truncate text-sm font-medium" :title="pageOrigin(item)">
                     {{ pageLabel(item) }}
                   </p>
+
+                  <div class="page-row__controls">
+                    <button
+                      type="button"
+                      class="page-icon"
+                      title="Переименовать страницу"
+                      :disabled="renamingPageId === item.page_id"
+                      @click.stop="renamePage(item)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
+                        <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"></path>
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="page-delete"
+                      title="Удалить страницу"
+                      :disabled="deletingPageId === item.page_id"
+                      @click.stop="deletePage(item)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
+                        <path d="M6 2h12l2 2v2H2V4l2-2zm2 6v12c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V8H8zM10 10h4v10h-4V10z"></path>
+                      </svg>
+                    </button>
+                  </div>
+
                   <!-- closed padlock on a confirmed page: clicking it reopens -->
                   <button
                     v-if="item.status === 'CONFIRMED'"
                     type="button"
-                    class="page-icon text-emerald-300"
+                    class="page-icon ml-0.5 text-emerald-300"
                     title="Страница подтверждена (эталон обучения). Вернуть в редактирование"
                     :disabled="reopeningPageId === item.page_id"
                     @click.stop="reopenPageFromList(item)"
@@ -221,101 +268,32 @@
                   </button>
                   <span
                     v-else
-                    class="page-icon text-app-muted opacity-60"
+                    class="page-icon ml-0.5 text-app-muted opacity-60"
                     title="Страница не подтверждена: правки доступны"
                   >
                     <LockIcon :closed="false" class="h-3.5 w-3.5" />
                   </span>
-                  <button
-                    type="button"
-                    class="page-icon"
-                    title="Переименовать страницу"
-                    :disabled="renamingPageId === item.page_id"
-                    @click.stop="renamePage(item)"
-                  >
-                    <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
-                      <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"></path>
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="page-delete"
-                    title="Удалить страницу"
-                    :disabled="deletingPageId === item.page_id"
-                    @click.stop="deletePage(item)"
-                  >
-                    <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
-                      <path d="M6 2h12l2 2v2H2V4l2-2zm2 6v12c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V8H8zM10 10h4v10h-4V10z"></path>
-                    </svg>
-                  </button>
                 </div>
               </div>
             </div>
-          </div>
+          </template>
         </div>
       </aside>
 
       <!-- image + overlay -->
       <section class="rounded-2xl border border-app-border/40 bg-app-panel/50 p-3">
-        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <div class="flex items-center gap-2">
-            <p class="text-xs uppercase tracking-widest text-app-accent">Изображение</p>
-            <span
-              v-if="readOnly"
-              class="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300"
-              title="Страница подтверждена: разметка показана приглушённо, текст больше не редактируется"
-            >
-              подтверждена · разметка приглушена
-            </span>
-          </div>
-
-          <div class="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              class="app-primary"
-              :disabled="!canRecognize || recognizing"
-              @click="recognize"
-            >
-              {{ recognizing ? 'Распознавание…' : canRecognize && page?.status !== 'UPLOADED' ? 'Распознать заново' : 'Распознать' }}
-            </button>
-            <button
-              v-if="page?.lines.some(hasSuggestion)"
-              type="button"
-              class="app-ghost app-ghost--verify"
-              :disabled="!verifiedSuggestionCount || acceptingSuggestions"
-              :title="verifiedSuggestionCount
-                ? 'Принять только те предложения, где каждое новое слово есть в словаре'
-                : 'Среди предложений нет ни одного полностью проверенного словарём'"
-              @click="acceptVerifiedSuggestions"
-            >
-              {{ acceptingSuggestions ? 'Принятие…' : `Принять проверенные (${verifiedSuggestionCount})` }}
-            </button>
-            <!--
-              One control for both directions: an open padlock confirms the page,
-              a closed one returns it to editing (with the consequences spelled
-              out in the dialog). Confirming is not a one-way door any more.
-            -->
-            <button
-              type="button"
-              :class="readOnly ? 'app-ghost' : 'app-success'"
-              :disabled="(readOnly ? reopening : !canConfirm) || confirming || reopening"
-              :title="readOnly
-                ? 'Страница подтверждена (эталон обучения). Нажмите, чтобы вернуть её в редактирование'
-                : 'Подтвердить страницу как эталон: разметка станет приглушённой, страница войдёт в обучающую выборку'"
-              @click="readOnly ? reopenPage() : confirmPage()"
-            >
-              <LockIcon :closed="readOnly" class="mr-1 inline-block h-3.5 w-3.5 align-[-2px]" />
-              {{
-                confirming
-                  ? 'Подтверждение…'
-                  : reopening
-                    ? 'Возврат…'
-                    : readOnly
-                      ? 'Вернуть в редактирование'
-                      : 'Подтвердить страницу'
-              }}
-            </button>
-          </div>
+        <!--
+          No title and no actions: what is left is the page itself, its legend and
+          its dimensions. Everything that acts on the text lives in the
+          transcription panel, where the text is.
+        -->
+        <div v-if="readOnly" class="mb-2 flex flex-wrap items-center gap-2">
+          <span
+            class="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300"
+            title="Страница подтверждена: разметка показана приглушённо, текст больше не редактируется"
+          >
+            подтверждена · разметка приглушена
+          </span>
         </div>
 
         <div
@@ -374,6 +352,7 @@
           <div
             v-else
             class="absolute left-0 top-0 origin-top-left overflow-hidden rounded-xl"
+            :class="{ 'viewer-content--busy': recognizing }"
             :style="contentStyle"
           >
             <img
@@ -440,6 +419,23 @@
           >
             колесо — масштаб · перетаскивание — сдвиг · двойной клик — вписать по ширине
           </p>
+
+          <!--
+            Recognition is a read of the scan, so the scan stays where it is and
+            only goes soft: the reader keeps their place on the page instead of
+            losing it to a full-screen spinner. The overlay also swallows clicks,
+            so a word cannot be opened while the model is rewriting it.
+          -->
+          <div
+            v-if="recognizing && imageUrl"
+            class="viewer-busy absolute inset-0 z-10 flex flex-col items-center justify-center gap-3"
+            role="status"
+            aria-live="polite"
+          >
+            <span class="viewer-spinner" aria-hidden="true"></span>
+            <p class="text-sm font-semibold text-app-text">Распознавание…</p>
+            <p class="text-xs text-app-muted">модель читает страницу</p>
+          </div>
         </div>
 
         <!-- page metadata moved out of the sidebar: it describes the open page -->
@@ -463,17 +459,68 @@
 
       <!-- transcription -->
       <section class="rounded-2xl border border-app-border/40 bg-app-panel/50 p-3">
+        <!--
+          The text actions live here, with the text: recognising again and
+          confirming the page are judgements about the transcription, not about
+          the scan. The panel has no title — the buttons say what it is.
+        -->
+        <div class="mb-2 flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            class="app-primary"
+            :disabled="!canRecognize || recognizing"
+            @click="recognize"
+          >
+            {{ recognizing ? 'Распознавание…' : canRecognize && page?.status !== 'UPLOADED' ? 'Распознать заново' : 'Распознать' }}
+          </button>
+          <button
+            v-if="page?.lines.some(hasSuggestion)"
+            type="button"
+            class="app-ghost app-ghost--verify"
+            :disabled="!verifiedSuggestionCount || acceptingSuggestions"
+            :title="verifiedSuggestionCount
+              ? 'Принять только те предложения, где каждое новое слово есть в словаре'
+              : 'Среди предложений нет ни одного полностью проверенного словарём'"
+            @click="acceptVerifiedSuggestions"
+          >
+            {{ acceptingSuggestions ? 'Принятие…' : `Принять проверенные (${verifiedSuggestionCount})` }}
+          </button>
+          <!--
+            One control for both directions: an open padlock confirms the page,
+            a closed one returns it to editing (with the consequences spelled
+            out in the dialog). Confirming is not a one-way door any more.
+          -->
+          <button
+            type="button"
+            :class="readOnly ? 'app-ghost' : 'app-success'"
+            :disabled="(readOnly ? reopening : !canConfirm) || confirming || reopening"
+            :title="readOnly
+              ? 'Страница подтверждена (эталон обучения). Нажмите, чтобы вернуть её в редактирование'
+              : 'Подтвердить страницу как эталон: разметка станет приглушённой, страница войдёт в обучающую выборку'"
+            @click="readOnly ? reopenPage() : confirmPage()"
+          >
+            <LockIcon :closed="readOnly" class="mr-1 inline-block h-3.5 w-3.5 align-[-2px]" />
+            {{
+              confirming
+                ? 'Подтверждение…'
+                : reopening
+                  ? 'Возврат…'
+                  : readOnly
+                    ? 'Вернуть в редактирование'
+                    : 'Подтвердить страницу'
+            }}
+          </button>
+        </div>
+
         <div class="mb-2 flex items-center justify-between gap-2">
-          <div class="flex items-center gap-2">
-            <p class="text-xs uppercase tracking-widest text-app-accent">Транскрипция</p>
-            <span
-              v-if="page?.lines.length"
-              class="rounded-full bg-app-input/60 px-2 py-0.5 text-[10px] font-semibold text-app-muted"
-              title="Строк на странице"
-            >
-              {{ page.lines.length }}
-            </span>
-          </div>
+          <span
+            v-if="page?.lines.length"
+            class="rounded-full bg-app-input/60 px-2 py-0.5 text-[10px] font-semibold text-app-muted"
+            title="Строк на странице"
+          >
+            {{ page.lines.length }}
+          </span>
+          <span v-else></span>
           <div class="flex items-center gap-1.5">
             <span v-if="dirtyCount" class="text-[11px] text-amber-300">не сохранено: {{ dirtyCount }}</span>
             <span v-else-if="page" class="text-[11px] text-app-muted">сохранено</span>
@@ -501,57 +548,79 @@
           </div>
         </div>
 
-        <p v-if="!page" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
+        <p v-if="!page" class="py-3 text-sm text-app-muted">
           Выберите страницу, чтобы увидеть текст.
         </p>
-        <p v-else-if="!page.lines.length" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
+        <p v-else-if="!page.lines.length" class="py-3 text-sm text-app-muted">
           Текст ещё не распознан.
         </p>
 
-        <div v-else class="no-scrollbar max-h-[calc(100vh_-_320px)] space-y-2 overflow-y-auto pr-1">
+        <div v-else class="no-scrollbar max-h-[calc(100vh_-_320px)] overflow-y-auto">
+          <!--
+            A line is plain text, one under another: no card, no border, no
+            background. The word colours carry the confidence, the active line is
+            marked by a thin bar on the left (`.line-row--active`), and everything
+            that is not the text itself — state icons and the copy/delete
+            actions — sits in a strip at the end of the row, revealed on hover.
+          -->
           <article
             v-for="line in page.lines"
             :key="`text-${line.id}`"
-            class="line-card rounded-xl border px-2 py-1.5 transition"
-            :class="[
-              activeLineId === line.id
-                ? 'line-card--active border-app-primary/70 bg-app-primary/5'
-                : 'border-app-border/40 bg-app-panel/30',
-              line.words.length ? confidenceEdgeClass(worstConfidence(line)) : '',
-            ]"
+            class="line-row"
+            :class="{ 'line-row--active': activeLineId === line.id }"
             @click="activeLineId = line.id"
           >
-            <!--
-              No header row any more: the confidence is the coloured left edge of
-              the card, the actions sit right of the box, and the rest of the row
-              is given to the transcription. Only states that ask for an action
-              (a pending proposal, a stale markup, a save in flight) ever add a
-              second line to a card.
-            -->
-            <div class="flex items-start gap-1">
-              <div
-                class="line-editor min-w-0 flex-1"
-                :class="readOnly ? 'line-editor--locked' : ''"
-                @mousemove="onEditorMousemove($event)"
-                @mouseleave="hoverTooltip = null"
-              >
-                <div class="line-editor__layer" v-html="lineHighlightHtml(line)"></div>
-                <textarea
-                  :ref="(el) => setTextareaRef(line.id, el)"
-                  :value="drafts[line.id]"
-                  :disabled="readOnly"
-                  rows="1"
-                  spellcheck="false"
-                  class="line-editor__input"
-                  :placeholder="line.predicted_text ? '' : 'пустая строка'"
-                  @input="onDraftInput(line.id, $event.target.value); autoGrow($event.target)"
-                  @focus="activeLineId = line.id"
-                  @blur="saveLine(line)"
-                  @click="onTextareaClick(line, $event)"
-                ></textarea>
-              </div>
+            <div
+              class="line-editor min-w-0 flex-1"
+              :class="readOnly ? 'line-editor--locked' : ''"
+              @mousemove="onEditorMousemove($event)"
+              @mouseleave="onEditorMouseleave"
+            >
+              <div class="line-editor__layer" v-html="lineHighlightHtml(line)"></div>
+              <textarea
+                :ref="(el) => setTextareaRef(line.id, el)"
+                :value="drafts[line.id]"
+                :disabled="readOnly"
+                rows="1"
+                spellcheck="false"
+                class="line-editor__input"
+                :placeholder="line.predicted_text ? '' : 'пустая строка'"
+                @input="onDraftInput(line.id, $event.target.value); autoGrow($event.target)"
+                @focus="activeLineId = line.id"
+                @blur="saveLine(line)"
+                @click="onTextareaClick(line, $event)"
+              ></textarea>
+            </div>
 
-              <div class="line-card__tools flex flex-none flex-col items-center gap-0.5 pt-1">
+            <div class="line-row__aside">
+              <!--
+                The states that used to be chips under the line. Both icons are
+                always shown here: they mark a line that needs a decision, and a
+                decision the reader cannot see is a decision they will not make.
+                The explanation is in the native tooltip, the actions appear on
+                hover.
+              -->
+              <span
+                v-if="line.words_stale"
+                class="line-status line-status--stale"
+                title="Текст изменён, поэтому рамки слов больше не соответствуют разбиению на слова"
+              >
+                <StaleMarkIcon class="h-3.5 w-3.5" />
+              </span>
+              <span
+                v-if="hasSuggestion(line)"
+                class="line-status line-status--suggestion"
+                title="У модели есть предложение по этой строке"
+              >
+                <SuggestionIcon class="h-3.5 w-3.5" />
+              </span>
+              <span v-if="savingLines.has(line.id)" class="line-status" title="Сохранение строки…">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="line-status__spin h-3.5 w-3.5">
+                  <path d="M12 3a9 9 0 1 0 9 9" stroke-linecap="round" />
+                </svg>
+              </span>
+
+              <div class="line-row__tools">
                 <button
                   type="button"
                   class="line-action"
@@ -585,29 +654,6 @@
                   </svg>
                 </button>
               </div>
-            </div>
-
-            <div
-              v-if="hasSuggestion(line) || line.words_stale || savingLines.has(line.id)"
-              class="mt-1 flex flex-wrap items-center gap-1.5"
-            >
-              <span
-                v-if="hasSuggestion(line)"
-                class="line-chip bg-app-primary/20 text-app-accent"
-                title="У модели есть предложение по этой строке"
-              >
-                <span class="line-chip__dot"></span>
-                предложение
-              </span>
-              <span
-                v-if="line.words_stale"
-                class="line-chip bg-amber-400/20 text-amber-300"
-                title="Текст изменён, поэтому рамки слов больше не соответствуют разбиению на слова"
-              >
-                <span class="line-chip__dot"></span>
-                разметка устарела
-              </span>
-              <span v-if="savingLines.has(line.id)" class="text-[10px] text-app-muted">сохранение…</span>
             </div>
 
             <!--
@@ -679,38 +725,6 @@
               </div>
             </div>
 
-            <!--
-              Other readings the decoder considered for the clicked word. No
-              caption: the word is selected in the text and highlighted on the
-              scan, so the chips can only be the variants themselves.
-            -->
-            <div
-              v-if="activeWordAlternatives(line).length"
-              class="mt-1 flex flex-wrap items-center gap-1 rounded-lg border border-app-primary/25 bg-app-primary/5 px-1.5 py-1"
-              title="Варианты, которые рассматривал декодер — нажмите, чтобы подставить"
-            >
-              <button
-                v-for="alternative in activeWordAlternatives(line)"
-                :key="`alt-${line.id}-${alternative.text}`"
-                type="button"
-                class="alt-chip"
-                :disabled="readOnly"
-                :title="`Оценка строки: ${Number(alternative.score ?? 0).toFixed(1)}`"
-                @click.stop="applyAlternative(line, alternative)"
-              >
-                {{ alternative.text }}
-              </button>
-              <button
-                type="button"
-                class="line-action ml-auto"
-                title="Скрыть варианты"
-                @click.stop="activeWordId = null"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" class="h-3 w-3">
-                  <path d="M6 6l12 12M18 6L6 18" />
-                </svg>
-              </button>
-            </div>
           </article>
         </div>
       </section>
@@ -733,7 +747,7 @@
           <div>
             <p class="text-sm font-semibold">Подтвердить страницу?</p>
             <p class="text-[11px] text-app-muted">
-              Страница станет эталоном обучения, а её слова войдут в словарь автора.
+              Страница станет эталоном обучения.
             </p>
           </div>
           <button type="button" class="page-icon" title="Закрыть" @click="confirmPreview = null">
@@ -748,23 +762,16 @@
         </p>
         <template v-else-if="page && page.lexicon_available === false">
           <p class="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-[11px] text-amber-200">
-            Общий словарь не установлен, поэтому заранее показать, какие слова станут новыми,
-            нельзя. При подтверждении слова страницы всё равно войдут в словарь автора.
+            Общий словарь не установлен — новые слова заранее не показать.
           </p>
         </template>
         <template v-else>
-          <p class="text-[11px] text-app-muted">
-            В словарь автора будет добавлено
-            <b>{{ confirmPreview.added.length }}</b>
-            {{ confirmPreview.added.length === 1 ? 'слово' : 'слов' }}<template
-              v-if="confirmPreview.learned.length"
-            >, из них новых для общего словаря: <b>{{ confirmPreview.learned.length }}</b></template>.
-          </p>
-
           <template v-if="confirmPreview.learned.length">
-            <p class="mt-2 text-[11px] text-app-muted">
-              Нажмите на слово, чтобы открыть строку, где оно написано, и исправить
-              (окно закроется):
+            <!-- Only the words the general dictionary does not know: the rest of
+                 the page's words add nothing the reader could act on. -->
+            <p class="text-[11px] text-app-muted">
+              {{ confirmPreview.learned.length === 1 ? 'Новое слово' : 'Новых слов' }}:
+              <b>{{ confirmPreview.learned.length }}</b>
             </p>
             <div class="no-scrollbar mt-1 flex flex-wrap gap-1 overflow-y-auto">
               <button
@@ -778,12 +785,14 @@
                 {{ word }}
               </button>
             </div>
-            <p v-if="confirmPreview.learned.length > 40" class="mt-1 text-[11px] text-app-muted">
-              …и ещё {{ confirmPreview.learned.length - 40 }} — весь список появится в «Словаре автора».
+            <p class="mt-1 text-[11px] text-app-muted">
+              Нажмите слово — откроется строка для редактирования<template
+                v-if="confirmPreview.learned.length > 40"
+              >; остальные — в «Словаре автора»</template>.
             </p>
           </template>
-          <p v-else class="mt-2 text-[11px] text-app-muted">
-            Все слова этой страницы общий словарь уже знает — подсветка не изменится.
+          <p v-else class="text-[11px] text-app-muted">
+            Все слова общий словарь уже знает.
           </p>
         </template>
 
@@ -903,18 +912,62 @@
     </div>
 
     <!--
-      The coloured words of the transcription used to rely on the native `title`
-      tooltip, which forced them to take pointer events -- and that swallowed the
-      click that should have placed the caret. They are click-through now, so a
-      single tooltip element paints the same explanation under the pointer.
+      The coloured words are click-through (see the CSS), so the explanation is
+      painted by this floating card instead of a native `title`. It appears above
+      the word after a short delay and never takes pointer events, otherwise it
+      would swallow the click that has to place the caret.
     -->
-    <div
-      v-if="hoverTooltip"
-      class="word-tooltip"
-      :style="{ left: `${hoverTooltip.x}px`, top: `${hoverTooltip.y}px` }"
-    >
-      {{ hoverTooltip.text }}
-    </div>
+    <Transition name="word-tip">
+      <div
+        v-if="hoverTooltip"
+        ref="tooltipBox"
+        class="word-tooltip"
+        :style="hoverTooltip.style"
+      >
+        {{ hoverTooltip.text }}
+      </div>
+    </Transition>
+
+    <!--
+      Other readings the decoder considered for the clicked word: a floating layer
+      directly under that word, over the line below it. The word is already selected
+      in the text and outlined on the scan, so the chips only ever list the variants.
+      As a block under its line this panel pushed the following lines down and sat
+      far from the word; floating keeps the text still and points at the word.
+    -->
+    <Transition name="word-tip">
+      <div
+        v-if="activeWordAlternatives.length"
+        ref="alternativesBox"
+        class="word-alternatives"
+        :style="alternativesStyle"
+        title="Варианты, которые рассматривал декодер — нажмите, чтобы подставить"
+        @mousedown.stop
+        @click.stop
+      >
+        <button
+          v-for="alternative in activeWordAlternatives"
+          :key="`alt-${alternative.text}`"
+          type="button"
+          class="alt-chip"
+          :disabled="readOnly"
+          :title="`Оценка строки: ${Number(alternative.score ?? 0).toFixed(1)}`"
+          @click.stop="applyAlternative(alternative)"
+        >
+          {{ alternative.text }}
+        </button>
+        <button
+          type="button"
+          class="line-action"
+          title="Скрыть варианты"
+          @click.stop="activeWordId = null"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" class="h-3 w-3">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -954,7 +1007,6 @@ const dragPageId = ref(null)
 const dropTarget = ref(null) // { id, after }
 
 const fileInput = ref(null)
-const folderInput = ref(null)
 const viewport = ref(null)
 const textareaRefs = new Map()
 
@@ -995,7 +1047,18 @@ const reopeningPageId = ref(null)
 const activeLineId = ref(null)
 const activeWordId = ref(null)
 // explanation of a coloured word, shown next to the pointer while hovering it
+/**
+ * The card that explains a coloured word: `text`, the rect of the word it belongs
+ * to, and the measured size of the card itself (for flipping and clamping).
+ */
 const hoverTooltip = ref(null)
+const tooltipBox = ref(null)
+/** The floating layer of decoder variants, and where it currently sits. */
+const alternativesBox = ref(null)
+const alternativesStyle = ref({})
+/** How long the pointer has to rest on a word before the card appears, in ms. */
+const TOOLTIP_DELAY_MS = 160
+let tooltipTimer = 0
 const busySuggestionLine = ref(null)
 const acceptingSuggestions = ref(false)
 // programmatic query updates must not trigger the route watcher twice
@@ -1076,7 +1139,77 @@ const lexiconAvailable = computed(() => page.value?.lexicon_available === true)
 
 // ------------------------------------------------------- sidebar name & order
 
-const canReorder = computed(() => pages.value.length > 1)
+/**
+ * The folder a page came from: the directory part of its source path. Pages
+ * chosen through the file picker have no source at all, and those live outside
+ * every folder — the list shows them first, without a header.
+ */
+const sourceDirectory = (item) => {
+  const path = (item.source_path || '').replace(/\\/g, '/')
+  const cut = path.lastIndexOf('/')
+  return cut > 0 ? path.slice(0, cut) : ''
+}
+
+/**
+ * Folder labels: the last segment of the source path, growing upwards one parent
+ * at a time until every label is unique. Two folders called "1975" read as
+ * "diary/1975" and "letters/1975"; if those still collide, another parent goes on
+ * the front, and a path that runs out of parents keeps its full name.
+ */
+const folderLabels = (directories) => {
+  const segments = new Map(directories.map((dir) => [dir, dir.split('/')]))
+  const depth = new Map(directories.map((dir) => [dir, 1]))
+  const label = (dir) => segments.get(dir).slice(-depth.get(dir)).join('/')
+
+  for (let guard = 0; guard < 32; guard += 1) {
+    const seen = new Map()
+    for (const dir of directories) seen.set(label(dir), (seen.get(label(dir)) || 0) + 1)
+    const ambiguous = directories.filter(
+      (dir) => seen.get(label(dir)) > 1 && depth.get(dir) < segments.get(dir).length
+    )
+    if (!ambiguous.length) break
+    for (const dir of ambiguous) depth.set(dir, depth.get(dir) + 1)
+  }
+  return new Map(directories.map((dir) => [dir, label(dir)]))
+}
+
+const collapsedFolders = ref(new Set())
+const folderCollapsed = (dir) => collapsedFolders.value.has(dir)
+const toggleFolder = (dir) => {
+  const next = new Set(collapsedFolders.value)
+  if (next.has(dir)) next.delete(dir)
+  else next.add(dir)
+  collapsedFolders.value = next
+}
+
+/** The list as it is shown: loose pages first, then one group per source folder. */
+const pageFolders = computed(() => {
+  const groups = new Map()
+  for (const item of pages.value) {
+    const dir = sourceDirectory(item)
+    if (!groups.has(dir)) groups.set(dir, [])
+    groups.get(dir).push(item)
+  }
+  const labels = folderLabels([...groups.keys()].filter(Boolean))
+  return [...groups].map(([dir, items]) => ({ dir, items, label: labels.get(dir) || '' }))
+})
+
+/*
+ * Dragging sets one order for the whole author, which is exactly what the flat
+ * list means. Inside folders a drop between two groups has no single reading —
+ * the page would snap back to its own folder — so the grips are only offered
+ * while the list is one run of rows.
+ */
+const canReorder = computed(() => pages.value.length > 1 && pageFolders.value.length <= 1)
+
+/** Opening a page that sits in a collapsed folder opens the folder with it. */
+watch(page, (current) => {
+  const dir = current ? sourceDirectory(current) : ''
+  if (!dir || !collapsedFolders.value.has(dir)) return
+  const next = new Set(collapsedFolders.value)
+  next.delete(dir)
+  collapsedFolders.value = next
+})
 
 /** File names used by more than one page: those rows must show their full path. */
 const duplicateFileNames = computed(() => {
@@ -1091,8 +1224,9 @@ const duplicateFileNames = computed(() => {
 
 const pageNameOf = (item) => (item.file_name || '').trim()
 /**
- * Where the page was uploaded from. Only a folder upload knows the full path;
- * the server-side storage path is never shown — it says nothing to the user.
+ * Where the page was uploaded from, when the browser knew it (a folder upload
+ * used to; pages uploaded that way still carry it). The server-side storage path
+ * is never shown — it says nothing to the user.
  */
 const pageOrigin = (item) => item.source_path || pageNameOf(item)
 /** What the sidebar shows: the file name, or the upload path when names collide. */
@@ -1101,6 +1235,30 @@ const pageLabel = (item) => {
   if (!name) return `Стр. #${item.page_id}`
   return duplicateFileNames.value.has(name.toLowerCase()) ? pageOrigin(item) : name
 }
+
+/**
+ * The page this file would duplicate, if any.
+ *
+ * A page is identified by its name *and* where it came from: two scans named the
+ * same from different folders are two pages (that is what `source_path` is kept
+ * for), while the same name from the same source is one page uploaded twice.
+ * The server enforces the same rule — this check is here so a 7 MB scan does not
+ * travel across the network just to be refused.
+ */
+const duplicatePageOf = (file) => {
+  const name = file.name.trim().toLowerCase()
+  const source = (file.webkitRelativePath || '').replace(/\\/g, '/').trim().toLowerCase()
+  return pages.value.find(
+    (item) =>
+      pageNameOf(item).toLowerCase() === name &&
+      (item.source_path || '').replace(/\\/g, '/').trim().toLowerCase() === source
+  )
+}
+
+const duplicateNotice = (names) =>
+  names.length === 1
+    ? `Страница «${names[0]}» уже загружена из этого источника.`
+    : `Уже загружены из этого источника: ${names.join(', ')}.`
 
 // the dictionary panel is read whole and filtered in the browser: the list is
 // the author's own words only, which is small enough for that
@@ -1187,18 +1345,6 @@ const confidenceBadgeClass = (value) => {
   if (value >= thresholds.value.warning) return 'bg-emerald-500/15 text-emerald-300'
   if (value >= thresholds.value.critical) return 'bg-amber-400/20 text-amber-300'
   return 'bg-app-error/20 text-app-error'
-}
-/** The confidence of a line as the colour of its left edge (the chip is gone). */
-const confidenceEdgeClass = (value) => {
-  if (value == null) return 'line-card--none'
-  if (value >= thresholds.value.warning) return 'line-card--ok'
-  if (value >= thresholds.value.critical) return 'line-card--warn'
-  return 'line-card--bad'
-}
-
-const worstConfidence = (line) => {
-  const values = line.words.map((w) => w.confidence).filter((v) => v != null)
-  return values.length ? Math.min(...values) : null
 }
 
 /** The text of a miss, not a word box: stale boxes may hold an older reading. */
@@ -1720,12 +1866,16 @@ const selectPage = async (pageId) => {
 
 const IMAGE_FILE = /\.(png|jpe?g|tiff?|bmp|webp|gif|heic|heif)$/i
 
-/** A folder upload may pick up non-images; only images become pages. */
+/** Only images become pages: the picker filters, but the file name is the truth. */
 const isImageFile = (file) => file.type.startsWith('image/') || IMAGE_FILE.test(file.name)
 
 const onUpload = async (event) => {
   const files = Array.from(event.target.files || [])
   event.target.value = ''
+  // The button is disabled while an upload is running, but the change event can
+  // still arrive (a script, a stray drop): one upload at a time, and never a
+  // second one whose messages the first would wipe when it finishes.
+  if (uploading.value) return
   if (!files.length || !authorId.value) return
   uploading.value = true
   error.value = ''
@@ -1733,19 +1883,31 @@ const onUpload = async (event) => {
   let lastPageId = null
   let uploadedCount = 0
   let skippedCount = 0
+  const duplicates = []
   try {
     for (const file of files) {
       if (!isImageFile(file)) {
         skippedCount += 1
         continue
       }
+      // Refused here rather than by the server, so a scan does not travel the
+      // network only to be turned away. The list can be stale (another tab), so
+      // the same refusal also arrives as 409 below.
+      if (duplicatePageOf(file)) {
+        duplicates.push(file.name)
+        continue
+      }
       const form = new FormData()
       form.append('file', file)
-      // a folder upload knows the full client-side path; keeping it is what
-      // lets two equal file names from different folders be told apart
+      // when the browser knows the client-side path, keep it: that is what tells
+      // two equal file names from different folders apart in the list
       const relative = file.webkitRelativePath || ''
       if (relative) form.append('source_path', relative)
       const response = await api(`/htr/authors/${authorId.value}/pages`, { method: 'POST', body: form })
+      if (response.status === 409) {
+        duplicates.push(file.name)
+        continue
+      }
       if (!response.ok) {
         const detail = await response.json().catch(() => null)
         throw new Error(detail?.detail || `Не удалось загрузить «${file.name}»`)
@@ -1755,13 +1917,33 @@ const onUpload = async (event) => {
       uploadedCount += 1
     }
     await loadPages(false)
-    if (lastPageId != null) await selectPage(lastPageId)
-    if (skippedCount) {
+    /*
+     * `uploading` stays true through the recognition that follows. It is what
+     * keeps the button disabled for the whole flow: the gap between "the bytes
+     * are stored" and "the model started" is a second or two, and a second
+     * upload picked inside it would have its own message wiped by this one when
+     * it finishes. The label reads `recognizing` first, so the button does not
+     * claim to be uploading while the model is reading.
+     */
+    if (lastPageId != null) {
+      await selectPage(lastPageId)
+      /*
+       * A page that was just uploaded has no markup at all — reading it is the
+       * only thing anyone would do next, so it happens by itself. The button is
+       * still there for the cases the machine cannot decide (a re-run, a page
+       * whose recognition failed).
+       */
+      if (page.value?.status === 'UPLOADED') await recognize()
+    }
+    // Messages go last: starting a recognition clears them.
+    if (duplicates.length) {
+      error.value = duplicateNotice(duplicates)
+    } else if (skippedCount) {
       notice.value = `Загружено страниц: ${uploadedCount}. Пропущено не-изображений: ${skippedCount}.`
     }
   } catch (err) {
     error.value = err.message || 'Ошибка загрузки страницы'
-    // part of a folder may already be stored: show what made it
+    // the file may already be stored even though the response failed: show what made it
     await loadPages(false)
   } finally {
     uploading.value = false
@@ -1770,6 +1952,12 @@ const onUpload = async (event) => {
 
 const recognize = async () => {
   if (!page.value) return
+  /*
+   * One run at a time. Two overlapping runs would fight over `page` — the slower
+   * response would write its own page back into the viewer — and the single
+   * `recognizing` flag would drop the spinner when the first of them finished.
+   */
+  if (recognizing.value) return
   // re-segmenting an already fixed page drops its corrections / confirmation
   const force = ['EDITING', 'CONFIRMED'].includes(page.value.status)
   if (force) {
@@ -2000,7 +2188,7 @@ const acceptVerifiedSuggestions = async () => {
 const confirmPage = async () => {
   if (!page.value || !canConfirm.value) return
   clearMessages()
-  confirmPreview.value = { added: [], learned: [] }
+  confirmPreview.value = { learned: [] }
   confirmPreviewLoading.value = true
   try {
     await flushPendingSaves()
@@ -2010,10 +2198,9 @@ const confirmPage = async () => {
       throw new Error(detail?.detail || 'Не удалось проверить, что добавит страница')
     }
     const payload = await response.json()
-    confirmPreview.value = {
-      added: payload.added_author_words ?? [],
-      learned: payload.author_words_learned ?? [],
-    }
+    // only the words the general dictionary does not know are shown: the rest of
+    // the page's words are of no use to the reader deciding
+    confirmPreview.value = { learned: payload.author_words_learned ?? [] }
   } catch (err) {
     confirmPreview.value = null
     error.value = err.message || 'Ошибка подготовки подтверждения'
@@ -2069,14 +2256,16 @@ const previewWordPlace = (word) => {
 
 /** Open a word of the confirmation dialog in the line where it stands. */
 const showPreviewWord = async (word) => {
+  // Close the dialog first, unconditionally, and never confirm anything: the
+  // dialog covers the very line it opens, and the click means "show me this
+  // word", not "accept the page". It used to return early when the word was not
+  // found — and then the dialog stayed on screen, so the click looked dead.
+  confirmPreview.value = null
   const place = previewWordPlace(word)
   if (!place) {
-    error.value = `Слово «${word}» не найдено на странице`
+    notice.value = `Слово «${word}» не нашлось в текущем тексте страницы — обновите страницу, если она изменилась в другой вкладке`
     return
   }
-  // the dialog would cover the very line it opens: close it and let the user
-  // fix the word; asking to confirm again shows a list of the current text
-  confirmPreview.value = null
   await showLexiconWordInText({ occurrences: [place] })
 }
 
@@ -2306,6 +2495,7 @@ const onWindowResize = () => {
     centreView(zoom.value)
     cancelZoomGlide()
   }
+  if (activeWordAlternatives.value.length) placeAlternatives()
 }
 
 const zoomBadge = ref(false)
@@ -2328,6 +2518,9 @@ const showZoomBadge = () => {
  */
 const onWheel = (event) => {
   if (!viewport.value) return
+  // the picture is blurred and about to be replaced: panning it would re-rasterise
+  // the blur on every frame for nothing
+  if (recognizing.value) return
   const raw = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaMode === 2 ? event.deltaY * 400 : event.deltaY
   const step = Math.min(Math.max(Math.exp(-raw * 0.0015), 0.8), 1.25)
   const rect = viewport.value.getBoundingClientRect()
@@ -2337,6 +2530,7 @@ const onWheel = (event) => {
 
 const onPointerDown = (event) => {
   if (event.button !== 0) return
+  if (recognizing.value) return // same reason as the wheel: it is a still frame right now
   if (event.target.closest('[data-word]')) return
   cancelZoomGlide() // dragging must be 1:1 with the pointer, not racing a glide
   panning.value = true
@@ -2357,11 +2551,35 @@ const onPointerUp = () => {
 
 // ---------------------------------------------------------------- word <-> text
 
+/**
+ * The word whose centring the current click already scheduled. A click can arrive
+ * from the transcription (`selectWordContext`) and from the scan, the author
+ * dictionary or the confirmation dialog (`onWordClick`); both must centre, but
+ * only one of them may do it per click.
+ */
+let pannedByTextClick = null
+
 const onWordClick = async (word) => {
   const line = wordLineMap.value.get(word.id)
   if (!line) return
   activeLineId.value = line.id
   activeWordId.value = word.id
+
+  /*
+   * Centre the viewer on the word. Every path that reveals a word on the scan
+   * ends up here — a click on the scan itself, a word of the author dictionary,
+   * a word of the confirmation dialog — so this is the one place that has to
+   * make sure the word is actually shown. It used to be done only on the
+   * transcription click, and the words opened from the dialog therefore stayed
+   * off screen, which made those chips look dead: the dialog closed and nothing
+   * visible happened.
+   */
+  if (pannedByTextClick === word.id) {
+    pannedByTextClick = null
+  } else {
+    bringWordIntoView(word)
+  }
+
   await nextTick()
   const textarea = textareaRefs.get(line.id)
   if (!textarea) return
@@ -2379,22 +2597,29 @@ const activeWord = computed(() => {
   return allWords.value.find((word) => word.id === activeWordId.value) || null
 })
 
-/** Alternative readings of the active word, if it belongs to this line. */
-const activeWordAlternatives = (line) => {
+/** Alternative readings of the active word — what the floating layer lists. */
+const activeWordAlternatives = computed(() => activeWord.value?.alternatives || [])
+
+/** The word the user clicked last, wherever it lives on the page. */
+const activeWordLine = computed(() => {
   const word = activeWord.value
-  if (!word || !(line.words || []).some((item) => item.id === word.id)) return []
-  return word.alternatives || []
-}
+  if (!word) return null
+  return wordLineMap.value.get(word.id) || null
+})
 
 /**
  * Replace the active word with one of the readings the recognizer considered.
  * The word keeps its position, so the line's word geometry stays valid, and the
  * new text is saved through the same path a manual edit takes.
  */
-const applyAlternative = async (line, alternative) => {
+const applyAlternative = async (alternative) => {
   if (readOnly.value || !alternative) return
   const word = activeWord.value
-  if (!word) return
+  const line = activeWordLine.value
+  if (!word || !line) return
+  // choosing a reading ends the decision: the layer closes at once, not after the
+  // save comes back (which also made a click on the same text look like a no-op)
+  activeWordId.value = null
   const text = drafts[line.id] ?? effectiveText(line)
   const span = tokenSpan(text, word.order)
   if (!span) return
@@ -2403,8 +2628,6 @@ const applyAlternative = async (line, alternative) => {
   drafts[line.id] = updated
   clearMessages()
   await saveLine(line)
-  // the line is re-read from the server, so its words hold the fresh state
-  activeWordId.value = null
 }
 
 const tokenSpan = (text, index) => {
@@ -2545,10 +2768,34 @@ const selectWordContext = (line, index) => {
     return
   }
   activeWordId.value = word ? word.id : null
-  // the scan and the transcription are two different scroll areas: a word picked
-  // in the text has to be found on the image as well (no-op when it already is)
-  if (word) bringWordIntoView(word)
+  // the floating layer of variants belongs to the word, and a tooltip about the
+  // same word would only cover it
+  hoverTooltip.value = null
+  attachTranscriptScroll()
+  placeAlternatives()
+  if (word) {
+    // the scan and the transcription are two different scroll areas: a word
+    // picked in the text has to be found on the image as well. The centring
+    // itself lives in `onWordClick`; here the word is only claimed so that the
+    // click handler, which runs for the same click, does not schedule it twice
+    pannedByTextClick = word.id
+    bringWordIntoView(word)
+  }
 }
+
+/*
+ * The variant layer is anchored to a word, so it has to follow it: a page scroll or
+ * a re-rendered line moves the word out from under the layer. The anchor is the
+ * word id and the draft text, not the panel's own position, so moving the panel
+ * does not schedule another move.
+ */
+watch([activeWordId, () => drafts[activeWordLine.value?.id ?? -1]], () => {
+  if (activeWordAlternatives.value.length) placeAlternatives()
+})
+
+watch([panX, panY, zoom, activeLineId], () => {
+  if (activeWordAlternatives.value.length) placeAlternatives()
+})
 
 /**
  * Is the word properly inside the viewer? The scan and the transcription are two
@@ -2564,11 +2811,15 @@ const isWordVisible = (word) => {
   const top = y1 * zoom.value + panY.value
   const right = x2 * zoom.value + panX.value
   const bottom = y2 * zoom.value + panY.value
-  const width = right - left
-  const height = bottom - top
-  const insideX = Math.min(right, viewport.value.clientWidth) - Math.max(left, 0)
-  const insideY = Math.min(bottom, viewport.value.clientHeight) - Math.max(top, 0)
-  return insideX >= width * 0.8 && insideY >= height * 0.8
+  // the whole outline has to be inside, not most of it: a word hanging over the
+  // edge counts as "not shown" and gets centred like any other, otherwise a
+  // click on a word the reader cannot fully see leaves the view untouched
+  return (
+    left >= 0 &&
+    top >= 0 &&
+    right <= viewport.value.clientWidth &&
+    bottom <= viewport.value.clientHeight
+  )
 }
 
 /**
@@ -2625,23 +2876,216 @@ const markAtPoint = (editor, x, y) => {
   return null
 }
 
+const clearTooltipTimer = () => {
+  if (tooltipTimer) clearTimeout(tooltipTimer)
+  tooltipTimer = 0
+}
+
+/**
+ * Show the card only once the pointer has rested on the word: reading a page with
+ * the mouse over the text would otherwise flash a card at every word it crosses.
+ * Moving to another word restarts the wait, moving off the text ends it at once.
+ */
 const onEditorMousemove = (event) => {
   const editor = event.currentTarget
   const mark = markAtPoint(editor, event.clientX, event.clientY)
   const text = mark?.getAttribute('title')
   if (!text) {
+    clearTooltipTimer()
     hoverTooltip.value = null
     return
   }
-  if (
-    hoverTooltip.value &&
-    hoverTooltip.value.text === text &&
-    hoverTooltip.value.x === event.clientX &&
-    hoverTooltip.value.y === event.clientY
-  ) {
-    return
+  // already showing this very word: keep the card where it is
+  if (hoverTooltip.value?.text === text) return
+  const rect = mark.getBoundingClientRect()
+  clearTooltipTimer()
+  tooltipTimer = setTimeout(() => {
+    tooltipTimer = 0
+    showTooltipCard(text, rect)
+  }, TOOLTIP_DELAY_MS)
+}
+
+const onEditorMouseleave = () => {
+  clearTooltipTimer()
+  hoverTooltip.value = null
+}
+
+/**
+ * The transcript scrolls under both floating layers: the word tooltip would point
+ * at nothing, and the variant layer would be left behind by the word it belongs to.
+ */
+const onTranscriptScroll = () => {
+  onEditorMouseleave()
+  if (activeWordAlternatives.value.length) placeAlternatives()
+}
+
+/**
+ * A click that closed the variant layer, with the time it happened. The click that
+ * dismisses the layer must not also open the variants of whatever word it landed
+ * on — that is what the capture listener below uses.
+ */
+let closedVariantsAt = 0
+
+/**
+ * Closing by a click outside: the three ways out are now the chosen reading, the
+ * cross, and simply clicking away. The click that closes the layer is swallowed, so
+ * moving on does not open another word's layer in the same gesture — the next click
+ * opens those variants.
+ */
+const onDocumentMousedown = (event) => {
+  if (!activeWordAlternatives.value.length || !alternativesBox.value) return
+  // the layer is portalled to the body, so it is not inside the transcript pane
+  const target = event.target
+  if (target instanceof Node && alternativesBox.value.contains(target)) return
+  closedVariantsAt = performance.now()
+  activeWordId.value = null
+}
+
+const onDocumentClickCapture = (event) => {
+  if (!closedVariantsAt) return
+  const inside = event.target instanceof Node && alternativesBox.value?.contains(event.target)
+  if (inside) return
+  event.stopPropagation()
+  event.preventDefault()
+  closedVariantsAt = 0
+}
+
+/**
+ * Watch the transcript for scrolling. It cannot be done in `onMounted`: the pane
+ * itself only appears once a page is open (the template shows a placeholder until
+ * then), so the listener has to be attached when the rows appear — otherwise the
+ * variant layer stays where it was while its word scrolls away (measured: the word
+ * moved 100px, the layer did not).
+ */
+const transcriptPane = () => document.querySelector('.line-row')?.parentElement || null
+
+const attachTranscriptScroll = () => {
+  const pane = transcriptPane()
+  if (!pane || pane.dataset.scrollBound === '1') return
+  pane.dataset.scrollBound = '1'
+  pane.addEventListener('scroll', onTranscriptScroll, { passive: true })
+}
+
+watch(
+  () => page.value?.lines?.length,
+  async () => {
+    await nextTick()
+    attachTranscriptScroll()
+  },
+)
+
+/**
+ * Where the card goes: centred on the word, above it, flipped under it when there
+ * is no room at the top, and never past the sides of the window. The card is
+ * measured before it is placed, because only the renderer knows how wide the text
+ * turned out.
+ */
+/**
+ * Place the card: centred on the word, above it, under it when the top edge of the
+ * transcription is closer than the card is tall, and never past the sides of the
+ * window.
+ *
+ * The card is measured in the DOM before it is moved, because only the rendered
+ * card knows how wide its text turned out. The arrival animation is opacity-only
+ * for the same reason: with a scale in it the measured width moved by ~14px while
+ * the animation ran, and the centring was computed from the wrong number.
+ */
+const placeTooltip = () => {
+  const current = hoverTooltip.value
+  const box = tooltipBox.value?.getBoundingClientRect()
+  if (!current || !box) return
+  const { rect } = current
+  const gap = 8
+  const margin = 8
+
+  const center = rect.left + rect.width / 2
+  const maxLeft = Math.max(margin, window.innerWidth - box.width - margin)
+  const left = Math.min(Math.max(center - box.width / 2, margin), maxLeft)
+
+  // the card explains a word of the transcription, so it stays over the text
+  // rather than covering the image above it
+  const paneTop = document.querySelector('.line-row')?.parentElement?.getBoundingClientRect().top ?? margin
+  const ceiling = Math.max(margin, paneTop)
+  const above = rect.top - box.height - gap
+  const top = above >= ceiling ? above : rect.bottom + gap
+
+  current.style = { left: `${Math.round(left)}px`, top: `${Math.round(top)}px` }
+}
+
+/**
+ * Show the card for a word: it is laid out invisibly first, then placed.
+ *
+ * A frame is awaited, not just a tick: `nextTick` resolves before the browser has
+ * laid the new content out, and measuring there returns the size of the *previous*
+ * card — measured once as 338px for a card that is 352px wide, which left it 17px
+ * off its word. One frame later the layout is real.
+ */
+const showTooltipCard = async (text, rect) => {
+  hoverTooltip.value = { text, rect, style: { left: '0px', top: '0px', visibility: 'hidden' } }
+  await nextTick()
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+  placeTooltip()
+}
+
+/** Rect of the word as it is *rendered* in the transcription, in page pixels. */
+const activeWordRect = () => {
+  const line = activeWordLine.value
+  const word = activeWord.value
+  if (!line || !word) return null
+  const area = textareaRefs.get(line.id)
+  const editor = area?.parentElement
+  if (!area || !editor) return null
+
+  // measured from the word's own characters, not from a `mark`: only doubtful and
+  // unknown words carry a mark, so an ordinary word has none to measure
+  const text = area.value ?? ''
+  const span = tokenSpan(text, word.order)
+  if (!span) return null
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT)
+  let node = walker.nextNode()
+  let consumed = 0
+  let found = null
+  while (node) {
+    const length = node.textContent.length
+    if (consumed + length > span[0]) {
+      found = { node, offset: span[0] - consumed }
+      break
+    }
+    consumed += length
+    node = walker.nextNode()
   }
-  hoverTooltip.value = { text, x: event.clientX, y: event.clientY }
+  if (!found) return null
+  const range = document.createRange()
+  try {
+    range.setStart(found.node, Math.max(0, Math.min(found.offset, found.node.textContent.length)))
+    range.setEnd(found.node, Math.max(0, Math.min(found.offset + (span[1] - span[0]), found.node.textContent.length)))
+  } catch {
+    return null
+  }
+  const rect = range.getBoundingClientRect()
+  return rect.width || rect.height ? rect : null
+}
+
+/**
+ * Put the variant layer right under the selected word, covering the next line — the
+ * place a popup belongs. Clamped to the window's sides; when the word sits near the
+ * bottom, the layer goes above it so it is never half off screen.
+ */
+const placeAlternatives = async () => {
+  if (!activeWordAlternatives.value.length) return
+  await nextTick()
+  const rect = activeWordRect()
+  const box = alternativesBox.value?.getBoundingClientRect()
+  if (!rect || !box) return
+  const gap = 6
+  const margin = 8
+  const center = rect.left + rect.width / 2
+  const maxLeft = Math.max(margin, window.innerWidth - box.width - margin)
+  const left = Math.min(Math.max(center - box.width / 2, margin), maxLeft)
+  const below = rect.bottom + gap
+  const above = rect.top - box.height - gap
+  const top = below + box.height <= window.innerHeight - margin ? below : Math.max(margin, above)
+  alternativesStyle.value = { left: `${Math.round(left)}px`, top: `${Math.round(top)}px` }
 }
 
 /** Only letters/digits/hyphens, case-insensitive: enough to match a word box. */
@@ -2663,8 +3107,16 @@ const dictionaryForm = (value) =>
     .replace(/[ѣіѳѵ]/g, (letter) => ({ ѣ: 'е', і: 'и', ѳ: 'ф', ѵ: 'и' }[letter]))
     .replace(/ъ$/, '')
 
-/** The word tokens of a line, tokenized the way the backend reads them. */
-const lineWordTokens = (text) => (text || '').match(/[\w'’\-]+/gu) || []
+/**
+ * The word tokens of a line, tokenized the way the backend reads them.
+ *
+ * ``\p{L}\p{N}`` and not ``\w``: JavaScript's ``\w`` is ASCII-only even with the
+ * ``u`` flag, so the Cyrillic transcription matched nothing at all — the only
+ * "word" this pattern ever found on a Russian page was a stray hyphen. That is
+ * what made the words in the confirmation dialog unclickable: the lookup for the
+ * clicked word searched a list of tokens that was always empty.
+ */
+const lineWordTokens = (text) => (text || '').match(/[\p{L}\p{N}_'’\-]+/gu) || []
 
 /** Span of the first token of ``text`` that reads like ``word``. */
 const tokenSpanOf = (text, word) => {
@@ -2729,11 +3181,19 @@ const showLexiconWordInText = async (item) => {
 onBeforeUnmount(() => {
   cancelZoomGlide()
   if (zoomBadgeTimer) clearTimeout(zoomBadgeTimer)
+  if (tooltipTimer) clearTimeout(tooltipTimer)
   window.removeEventListener('resize', onWindowResize)
+  transcriptPane()?.removeEventListener('scroll', onTranscriptScroll)
+  document.removeEventListener('mousedown', onDocumentMousedown, true)
+  document.removeEventListener('click', onDocumentClickCapture, true)
 })
 
 onMounted(async () => {
   window.addEventListener('resize', onWindowResize)
+  // mousedown, not click: the layer closes before the click lands, and the capture
+  // listener then keeps that click from opening another layer
+  document.addEventListener('mousedown', onDocumentMousedown, true)
+  document.addEventListener('click', onDocumentClickCapture, true)
   await loadAuthors()
   if (!authors.value.length) showAuthorForm.value = true
 })
@@ -2874,6 +3334,83 @@ watch(
 
 /* --- sidebar ordering ----------------------------------------------------- */
 
+/*
+ * The two actions of a page row, standing right of the name. Hidden until the row is
+ * hovered or focused, and click-through while hidden so a tap meant for the row
+ * cannot hit an invisible button. The grip is hidden by its own rule below, and the
+ * padlock is not part of this strip at all: it is page state, not an action.
+ */
+.page-row__controls {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.1rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.page-row:hover .page-row__controls,
+.page-row:focus-within .page-row__controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* the drag handle appears with the actions — it is an editing tool too */
+.page-grip {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.page-row:hover .page-grip,
+.page-row:focus-within .page-grip {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* The panel is 240px wide and the label is long: smaller type, tighter sides. */
+.upload-button {
+  padding-left: 0.6rem;
+  padding-right: 0.6rem;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+/*
+ * A source folder in the list. It is a header, not a row: no border, a smaller
+ * type, and a chevron that turns when the folder is hidden. The label is the tail
+ * of the path that makes the folder unique (see folderLabels in the script).
+ */
+.page-folder {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.3rem;
+  border-radius: 0.5rem;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: rgb(var(--c-accent));
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.page-folder:hover {
+  background: rgb(var(--c-primary) / 0.12);
+}
+
+.page-folder__chevron {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex: none;
+  transition: transform 0.15s ease;
+}
+
+.page-folder__chevron--closed {
+  transform: rotate(-90deg);
+}
+
 .page-item[draggable='true'] {
   cursor: grab;
 }
@@ -2921,35 +3458,102 @@ watch(
   cursor: not-allowed;
 }
 
-/* --- transcription lines -------------------------------------------------- */
+/* --- transcription lines: plain text, one under another -------------------- */
 
-.line-card:hover {
-  border-color: rgb(var(--c-line) / 0.65);
+/*
+ * No card: the line is just a row of text. The confidence of the words is in
+ * their colour, so a border and a background here only added noise — 29 rows of
+ * boxes read as a table, not as the page the reader is checking.
+ */
+.line-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.25rem;
+  padding: 0.05rem 0 0.05rem 0.5rem;
+  border-radius: 0.35rem;
+  transition: background 0.12s ease;
 }
 
-/* the active line also gets a quiet accent bar on the left */
-.line-card--active {
-  box-shadow: inset 2px 0 0 0 rgb(var(--c-primary) / 0.9);
+.line-row:hover {
+  background: rgb(var(--c-panel) / 0.35);
 }
 
-.line-chip {
+/* the only marker of the line the reader is editing */
+.line-row--active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.1rem;
+  bottom: 0.1rem;
+  width: 2px;
+  border-radius: 9999px;
+  background: rgb(var(--c-primary) / 0.9);
+}
+
+.line-row--active,
+.line-row:focus-within {
+  background: rgb(var(--c-panel) / 0.35);
+}
+
+/*
+ * Everything that is not the text: state icons and the two actions. Sticky so
+ * they stay beside the first line of a long row, transparent until the pointer
+ * is on the row so they do not compete with the transcription.
+ */
+.line-row__aside {
+  position: sticky;
+  top: 0.1rem;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.15rem;
+  align-self: flex-start;
+}
+
+.line-row__tools {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  opacity: 0;
+  pointer-events: none; /* a hidden button must not swallow a click on the text */
+  transition: opacity 0.12s ease;
+}
+
+.line-row:hover .line-row__tools,
+.line-row:focus-within .line-row__tools {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.line-status {
   display: inline-flex;
   align-items: center;
-  gap: 0.3rem;
-  border-radius: 9999px;
-  padding: 0.05rem 0.5rem;
-  font-size: 0.65rem;
-  font-weight: 600;
-  line-height: 1.5;
-  white-space: nowrap;
+  color: rgb(var(--c-muted));
 }
 
-/* the dot inherits the badge colour, so one look says "how sure" */
-.line-chip__dot {
-  width: 0.35rem;
-  height: 0.35rem;
-  border-radius: 9999px;
-  background: currentColor;
+.line-status--stale {
+  color: rgb(var(--c-warn-text));
+}
+
+.line-status--suggestion {
+  color: rgb(var(--c-accent));
+}
+
+.line-status__spin {
+  animation: line-status-spin 0.9s linear infinite;
+}
+
+@keyframes line-status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .line-status__spin {
+    animation: none;
+  }
 }
 
 .line-action {
@@ -3033,26 +3637,25 @@ watch(
  * dictionary verdict is painted on the word itself ("не в словаре" used to be a
  * counter chip in the line header, which said how many but never which)
  * ------------------------------------------------------------------------ */
+/*
+ * The editor is only a text layout box: the line carries no frame of its own any
+ * more (see `.line-row`), so the text sits directly on the panel.
+ */
 .line-editor {
   position: relative;
-  border: 1px solid rgb(var(--c-line) / 0.28);
-  border-radius: 0.65rem;
-  background: rgb(var(--c-input) / 0.55);
-  transition: border-color 0.12s ease;
 }
 
-.line-editor:hover {
-  border-color: rgb(var(--c-line) / 0.5);
-}
 
-/* the transcription is frozen: a dashed box says so without another badge */
+
+/*
+ * The transcription is frozen (a confirmed page). The old dashed box said so; as
+ * plain text the same "not for editing" reads as a dashed underline under the
+ * words, which does not compete with the coloured word boxes above the baseline.
+ */
 .line-editor--locked {
-  border-style: dashed;
+  border-bottom: 1px dashed rgb(var(--c-line) / 0.45);
 }
 
-.line-editor:focus-within {
-  border-color: rgb(var(--c-primary) / 0.75);
-}
 
 /*
  * Both layers must lay the text out identically, and a proportional font cannot
@@ -3193,64 +3796,78 @@ watch(
  */
 
 /* explanation of a coloured word, pinned to the pointer */
+/*
+ * The card that explains a coloured word. Placed by `placeTooltip` (centred on
+ * the word, above it, flipped below when the top edge is close), so it must not
+ * move itself: no transform here.
+ */
 .word-tooltip {
   position: fixed;
   z-index: 60;
   max-width: 22rem;
   padding: 0.4rem 0.65rem;
-  border-radius: 0.55rem;
-  border: 1px solid rgb(var(--c-line) / 0.4);
-  background: rgb(2 6 23 / 0.94);
+  border-radius: 0.5rem;
+  border: 1px solid rgb(var(--c-border) / 0.6);
+  background: rgb(var(--c-panel) / 0.96);
   color: rgb(var(--c-on-surface));
   font-size: 0.72rem;
   line-height: 1.4;
   white-space: normal;
   pointer-events: none;
-  transform: translate(12px, 14px);
-  box-shadow: 0 6px 18px rgb(0 0 0 / 0.45);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 10px 26px rgb(0 0 0 / 0.28);
 }
 
-/*
- * The confidence the chip used to spell out is now the colour of the card's left
- * edge: readable at a glance, and it costs no vertical space.
- */
-/* quiet for a confident line, louder as the confidence drops: the edge is read
-   at a glance, so the doubtful lines must be the ones that stand out */
-.line-card--ok {
-  border-left: 3px solid rgb(var(--c-ok) / 0.45);
+/* soft arrival, quick exit: the card must never feel like it lags the pointer */
+.word-tip-enter-active {
+  transition: opacity 0.12s ease-out;
 }
 
-.line-card--warn {
-  border-left: 3px solid rgb(var(--c-warn) / 0.9);
+.word-tip-leave-active {
+  transition: opacity 0.08s ease-in;
 }
 
-.line-card--bad {
-  border-left: 3px solid rgb(var(--c-error) / 0.9);
+.word-tip-enter-from,
+.word-tip-leave-to {
+  opacity: 0;
 }
 
-.line-card--none {
-  border-left: 3px solid rgb(var(--c-line) / 0.35);
+@media (prefers-reduced-motion: reduce) {
+  .word-tip-enter-active,
+  .word-tip-leave-active {
+    transition: none;
+  }
 }
 
-/* copy and delete live right of the box, not on a row of their own; the column
-   is narrower than the box would like, so the two buttons are shrunk to keep the
-   text from wrapping (measured: a row beside the box costs 16 wrapped lines) */
-.line-card__tools {
-  opacity: 0.55;
-  transition: opacity 0.12s ease;
-}
-
-.line-card__tools .line-action {
+/* the actions beside the text are kept small: a wide column costs wrapped lines */
+.line-row__tools .line-action {
   width: 1.35rem;
   height: 1.35rem;
 }
 
-.line-card:hover .line-card__tools,
-.line-card:focus-within .line-card__tools {
-  opacity: 1;
+/* a variant the decoder considered, offered under the word it belongs to */
+/*
+ * The floating layer of decoder variants. It is placed by `placeAlternatives`
+ * (under the selected word, clamped to the window), so it must not position itself
+ * — and it is a real popup, not a block in the flow: it covers the next line
+ * instead of pushing it down, which keeps the text from jumping under the reader.
+ */
+.word-alternatives {
+  position: fixed;
+  z-index: 55;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: min(24rem, calc(100vw - 1rem));
+  padding: 0.25rem 0.35rem;
+  border: 1px solid rgb(var(--c-primary) / 0.35);
+  border-radius: 0.55rem;
+  background: rgb(var(--c-panel) / 0.97);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 10px 26px rgb(0 0 0 / 0.28);
 }
 
-/* a variant the decoder considered, offered under the word it belongs to */
 .alt-chip {
   border: 1px solid rgb(var(--c-line) / 0.5);
   border-radius: 9999px;
@@ -3360,6 +3977,45 @@ watch(
 
 .oov-chip:hover {
   background: rgb(var(--c-oov) / 0.35);
+}
+
+/* --- recognition in progress --------------------------------------------- */
+/*
+ * The scan stays where it is and goes soft. The blur is a static filter on a
+ * still frame — the gestures that would move it are switched off while it runs
+ * (see onWheel / onPointerDown), because a filter that has to be re-rasterised
+ * every frame is exactly the kind of thing that makes a slow machine slower.
+ */
+
+.viewer-content--busy {
+  filter: blur(7px) saturate(0.75);
+  opacity: 0.7;
+}
+
+.viewer-busy {
+  background: rgb(var(--c-bg) / 0.3);
+}
+
+.viewer-spinner {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 9999px;
+  border: 3px solid rgb(var(--c-primary) / 0.22);
+  border-top-color: rgb(var(--c-primary));
+  animation: viewer-spin 0.8s linear infinite;
+}
+
+@keyframes viewer-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A ring that does not turn says nothing at all, so it slows down instead. */
+@media (prefers-reduced-motion: reduce) {
+  .viewer-spinner {
+    animation-duration: 2.4s;
+  }
 }
 
 /* --- SVG overlay: polygons follow the text, not the page axes ------------- */

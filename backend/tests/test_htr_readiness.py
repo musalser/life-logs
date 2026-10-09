@@ -1,5 +1,3 @@
-import pytest
-
 from app.htr.application.readiness import TrainingReadinessPolicy
 from app.htr.domain.entities import TrainingDataset, TrainingSample
 
@@ -45,12 +43,18 @@ def test_word_threshold_disabled_by_default():
     assert policy.evaluate(dataset(["раз"])).ready is True
 
 
-def test_at_least_one_threshold_must_be_positive():
-    with pytest.raises(ValueError):
-        TrainingReadinessPolicy(min_lines=0, min_words=0)
+def test_threshold_is_disabled_by_default():
+    """Any non-empty corpus trains: the size gate is off unless configured."""
+    policy = TrainingReadinessPolicy()
+
+    assert policy.min_lines == 0
+    assert policy.evaluate(dataset(["одно слово"])).ready is True
 
 
-def test_empty_dataset_is_not_ready():
-    readiness = TrainingReadinessPolicy(min_lines=50).evaluate(dataset([]))
+def test_empty_dataset_is_not_ready_even_without_a_threshold():
+    """0/0 disables the gate, not the requirement to have something to train on."""
+    readiness = TrainingReadinessPolicy().evaluate(dataset([]))
+
     assert readiness.ready is False
     assert readiness.lines == 0
+    assert "no confirmed lines" in readiness.reason

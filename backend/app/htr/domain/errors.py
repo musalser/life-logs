@@ -18,6 +18,10 @@ class CorruptImageError(HTRError):
     """Image cannot be opened/decoded."""
 
 
+class DuplicatePageError(HTRError):
+    """A page with this name from this source is already in the author's corpus."""
+
+
 class DatasetBuildError(HTRError):
     """Training dataset could not be built."""
 

@@ -72,7 +72,7 @@ class Entry(BaseModel):
 
 class GoalProgressResponse(BaseModel):
     id: int
-    diary_page_id: int
+    source_id: int
     progress_kind: str
     note: str | None = None
     source_text: str | None = None
@@ -111,7 +111,7 @@ class RelationResponse(BaseModel):
 
 class EventResponse(BaseModel):
     id: int
-    diary_page_id: int
+    source_id: int
     title: str
     description: str | None = None
     time_text: str | None = None
@@ -125,7 +125,7 @@ class EventResponse(BaseModel):
 
 class HabitLogResponse(BaseModel):
     id: int
-    diary_page_id: int
+    source_id: int
     note: str | None = None
     source_text: str | None = None
     created_at: datetime

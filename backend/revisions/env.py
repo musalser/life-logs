@@ -70,7 +70,13 @@ def run_migrations_online() -> None:
 
     with connectable.connect() as connection:
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection,
+            target_metadata=target_metadata,
+            # autogenerate must notice a changed column type as well: the
+            # knowledge tables move to pgvector columns (Vector(768)), and
+            # without compare_type such a change is silently rendered as "no
+            # changes" and the migration comes out empty.
+            compare_type=True,
         )
 
         with context.begin_transaction():

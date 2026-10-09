@@ -76,7 +76,9 @@ async def chat(
 
         async def event_generator():
             reply_chunks: List[str] = []
-            async for chunk in ai_adapter.stream_reply(request.message):
+            # тон и история — часть промпта чата: без них модель видела только
+            # голое сообщение, и выбор тональности ни на что не влиял
+            async for chunk in ai_adapter.stream_reply(request.message, request.tone, history_payload):
                 reply_chunks.append(chunk)
                 yield chunk
 

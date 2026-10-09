@@ -5,10 +5,15 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from ..deps import get_current_user, get_db, get_diary_service, get_knowledge_service
+from ..deps import (
+	get_current_user,
+	get_db,
+	get_diary_service,
+	get_knowledge_source_service,
+)
 from ..models import DiaryPage, User
 from app.services.diary_service import DiaryService
-from app.services.knowledge_service import KnowledgeService
+from app.services.knowledge_source_service import KnowledgeSourceService
 from ..schemas import (
 	DiaryPageCreateRequest,
 	DiaryPageResponse,
@@ -37,7 +42,7 @@ async def create_diary_page(
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
 	diary_service: DiaryService = Depends(get_diary_service),
-	knowledge_service: KnowledgeService = Depends(get_knowledge_service),
+	source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
 	logger.info("Creating diary page for user %s", username)
 	user = _get_user_by_username(db, username)
@@ -56,10 +61,15 @@ async def create_diary_page(
 	db.commit()
 	db.refresh(diary_page)
 
-	# Синхронно ради отладки; позже вынести в Celery.
+	# The page becomes a knowledge source; sync mode runs the pipeline here,
+	# async mode hands it to Celery (7.5).
 	try:
-		summary = await knowledge_service.process_diary_page(db, user.id, diary_page)
-		logger.info("Knowledge extraction for page_id=%s: %s", diary_page.id, summary)
+		source, created, changed = source_service.refresh_from_diary_page(diary_page)
+		result = await source_service.request_extraction(source)
+		logger.info(
+			"Knowledge source for page_id=%s: created=%s changed=%s result=%s",
+			diary_page.id, created, changed, result,
+		)
 	except Exception:
 		logger.exception("Knowledge extraction failed for page_id=%s", diary_page.id)
 
@@ -71,7 +81,7 @@ async def extract_page_knowledge(
 	page_id: int,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
-	knowledge_service: KnowledgeService = Depends(get_knowledge_service),
+	source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
 	logger.info("Manual knowledge extraction for page %s by user %s", page_id, username)
 	user = _get_user_by_username(db, username)
@@ -86,7 +96,8 @@ async def extract_page_knowledge(
 			detail="Diary page not found",
 		)
 
-	summary = await knowledge_service.process_diary_page(db, user.id, diary_page)
+	source, _, _ = source_service.refresh_from_diary_page(diary_page)
+	summary = await source_service.request_extraction(source)
 	logger.info("Knowledge extraction for page_id=%s: %s", diary_page.id, summary)
 	return {"page_id": diary_page.id, "summary": summary}
 
@@ -139,6 +150,7 @@ async def update_diary_page(
 	request: DiaryPageUpdateRequest,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
+	source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
 	logger.info("Updating diary page %s for user %s", page_id, username)
 	user = _get_user_by_username(db, username)
@@ -156,6 +168,17 @@ async def update_diary_page(
 	diary_page.content = request.content
 	db.commit()
 	db.refresh(diary_page)
+
+	# An edited page means edited text: the source is refreshed, and a changed
+	# hash marks the old knowledge stale (7.5, переизвлечение при изменении текста)
+	try:
+		source, _, changed = source_service.refresh_from_diary_page(diary_page)
+		result = await source_service.request_extraction(source)
+		logger.info(
+			"Knowledge source for page_id=%s: changed=%s result=%s", diary_page.id, changed, result
+		)
+	except Exception:
+		logger.exception("Knowledge extraction failed for page_id=%s", diary_page.id)
 	return diary_page
 
 
@@ -164,6 +187,7 @@ async def delete_diary_page(
 	page_id: int,
 	db: Session = Depends(get_db),
 	username: str = Depends(get_current_user),
+	source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
 	logger.info("Deleting diary page %s for user %s", page_id, username)
 	user = _get_user_by_username(db, username)
@@ -178,6 +202,10 @@ async def delete_diary_page(
 			detail="Diary page not found",
 		)
 
+	# the source and everything read from it go with the page
+	source = source_service.get("diary", diary_page.id, user.id)
+	if source is not None:
+		source_service.delete_source(source)
 	db.delete(diary_page)
 	db.commit()
 	return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 import threading
 import unicodedata
 from collections import OrderedDict
@@ -48,6 +49,7 @@ from ...domain.errors import CorruptImageError, RecognitionError
 from ...domain.text import align_word_alternatives, map_spans_to_reference
 from ...domain.interfaces import HTRRecognizer
 from ..storage import open_oriented_image
+from .rows import row_bands
 
 logger = logging.getLogger(__name__)
 
@@ -266,12 +268,25 @@ def unit_direction(points: Sequence, at_end: bool) -> tuple[float, float] | None
     return dx / norm, dy / norm
 
 
-def estimate_pitch(baselines: list[list]) -> float | None:
+def estimate_pitch(
+    baselines: list[list], line_heights: Sequence[float] | None = None
+) -> float | None:
     """Rough distance between two consecutive text lines.
 
-    Boundary heights are a bad scale here: the outline of a wavy line can be
+    Boundary heights are a bad *scale* here: the outline of a wavy line can be
     taller than the line pitch. The span of all baseline midpoints divided by
     the number of gaps is stable and needs no image dimensions.
+
+    A baseline segmenter, however, splits one physical line into several pieces
+    when its words stand far apart (a column of numbers, a logbook's wide
+    spacing). Dividing the span by ``len(mids) - 1`` then measures the distance
+    between *pieces* and shrinks the pitch by the number of pieces per line —
+    exactly the scale :func:`is_continuation` needs to bridge those pieces again,
+    so an over-segmented page defeats its own repair. When the line heights are
+    known the midpoints are therefore clustered first: pieces of one line share
+    their midpoint, real lines are a pitch apart. The heights serve only as the
+    clustering tolerance, never as the scale itself, so a wavy outline cannot
+    inflate the pitch.
     """
     mids = sorted(
         (float(points[0][1]) + float(points[-1][1])) / 2
@@ -280,10 +295,32 @@ def estimate_pitch(baselines: list[list]) -> float | None:
     )
     if len(mids) < 4:
         return None
+    heights = [float(height) for height in (line_heights or ()) if height and height > 0]
+    if heights:
+        centers = _cluster_sorted(mids, 0.5 * statistics.median(heights))
+        if len(centers) >= 2:
+            gaps = [later - earlier for earlier, later in zip(centers, centers[1:])]
+            pitch = statistics.median(gaps)
+            if pitch > 0:
+                return pitch
     span = mids[-1] - mids[0]
     if span <= 0:
         return None
     return span / (len(mids) - 1)
+
+
+def _cluster_sorted(values: Sequence[float], tolerance: float) -> list[float]:
+    """Centres of runs of sorted ``values`` no further apart than ``tolerance``."""
+    centers: list[float] = []
+    run = [values[0]]
+    for value in values[1:]:
+        if value - run[-1] <= tolerance:
+            run.append(value)
+        else:
+            centers.append(sum(run) / len(run))
+            run = [value]
+    centers.append(sum(run) / len(run))
+    return centers
 
 
 def is_continuation(
@@ -343,7 +380,8 @@ def group_collinear_lines(lines: list[Any], scale: float | None = None) -> list[
     """
     baselines = [list(getattr(line, "baseline", None) or []) for line in lines]
     if not scale:
-        scale = estimate_pitch(baselines)
+        heights = [line_height(line) for line in lines]
+        scale = estimate_pitch(baselines, [height for height in heights if height])
     if not scale:
         return [[index] for index in range(len(lines))]
 
@@ -368,43 +406,178 @@ def group_collinear_lines(lines: list[Any], scale: float | None = None) -> list[
     return list(groups.values())
 
 
-def merge_collinear_lines(lines: list[Any], scale: float | None = None) -> list[Any]:
-    """Glue split-off pieces back together, keeping the reading order.
+def merge_collinear_lines(
+    lines: list[Any],
+    scale: float | None = None,
+    bands: Sequence[tuple[int, int]] | None = None,
+) -> list[Any]:
+    """Glue split-off pieces back together.
 
     This runs *before* recognition so the model sees the whole line; merging
     afterwards would only hide the split. A merged record keeps the position of
-    its earliest piece.
+    its earliest piece, so the segmenter's order survives here — the reading
+    order is set afterwards by :func:`reading_order`.
+
+    ``bands`` are the page's ink rows (see ``rows.row_bands``): the geometric
+    grouping runs first, then the groups that share one band are unioned. The ink
+    can therefore only *add* merges, never undo a geometric one, and a piece the
+    geometry cannot place (a tiny "+" between two words, a margin number whose
+    baseline is nearly vertical) still joins the row whose ink surrounds it.
     """
     groups = group_collinear_lines(lines, scale)
+    if bands:
+        groups = _union_band_groups(lines, groups, bands)
     if all(len(group) == 1 for group in groups):
         return list(lines)
-
-    from copy import copy
 
     merged: list[Any] = []
     for group in groups:
         if len(group) == 1:
             merged.append(lines[group[0]])
             continue
-        pieces = sorted(
-            (lines[index] for index in group),
-            key=lambda line: baseline_ends(line)[0],
-        )
-        baseline = [
-            (int(round(point[0])), int(round(point[1])))
-            for piece in pieces
-            for point in (piece.baseline or [])
-        ]
-        boundary = merged_boundary(pieces, baseline)
-        logger.info(
-            "HTR segmentation: merged %s segment(s) into one line (%s..%s)",
-            len(pieces), baseline[0][0] if baseline else "?", baseline[-1][0] if baseline else "?",
-        )
-        merged_line = copy(pieces[0])
-        merged_line.baseline = baseline
-        merged_line.boundary = boundary
-        merged.append(merged_line)
+        merged.append(_merge_group([lines[index] for index in group]))
     return merged
+
+
+def _merge_group(pieces: list[Any]) -> Any:
+    """One line out of its pieces: concatenated baseline, hull of the outlines."""
+    from copy import copy
+
+    pieces = sorted(pieces, key=lambda line: baseline_ends(line)[0])
+    # A piece that stands *inside* the span of a longer one (a tiny "+" between
+    # two words, a stray mark) must not fold its own baseline into the merged one
+    # — the resulting zigzag would misdirect the crop. It still joins the line's
+    # outline, which is what contains the mark.
+    spans = [baseline_ends(line) for line in pieces]
+    kept: list[Any] = []
+    for index, span in enumerate(spans):
+        if span is None:
+            kept.append(pieces[index])
+            continue
+        x0, x1 = span[0], span[2]
+        covered = any(
+            other_span is not None
+            and other != index
+            and other_span[0] <= x0
+            and other_span[2] >= x1
+            and (other_span[2] - other_span[0]) > (x1 - x0)
+            for other, other_span in enumerate(spans)
+        )
+        if not covered:
+            kept.append(pieces[index])
+    if not kept:
+        kept = list(pieces)
+
+    baseline = [
+        (int(round(point[0])), int(round(point[1])))
+        for piece in kept
+        for point in (piece.baseline or [])
+    ]
+    boundary = merged_boundary(pieces, baseline)
+    logger.info(
+        "HTR segmentation: merged %s segment(s) into one line (%s..%s)",
+        len(pieces), baseline[0][0] if baseline else "?", baseline[-1][0] if baseline else "?",
+    )
+    merged_line = copy(pieces[0])
+    merged_line.baseline = baseline
+    merged_line.boundary = boundary
+    return merged_line
+
+
+def _union_band_groups(
+    lines: list[Any],
+    groups: list[list[int]],
+    bands: Sequence[tuple[int, int]],
+) -> list[list[int]]:
+    """Union the groups that share one ink row band.
+
+    A group whose baseline falls inside a band belongs to that row even when its
+    direction or offset defeated ``is_continuation``. Each group is assigned to
+    the band it overlaps most, and only groups of the *same* band are unioned: a
+    tall mark that reaches into two rows (a curly brace of the logbook) must not
+    bridge them.
+    """
+    parent = list(range(len(groups)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    by_band: dict[int, int] = {}
+    for index, group in enumerate(groups):
+        ys = [
+            float(point[1])
+            for member in group
+            for point in (getattr(lines[member], "baseline", None) or [])
+        ]
+        band = _best_band((min(ys), max(ys)) if ys else None, bands)
+        if band is None:
+            continue
+        first = by_band.setdefault(band, index)
+        if first != index:
+            root_first, root_index = find(first), find(index)
+            if root_first != root_index:
+                parent[max(root_first, root_index)] = min(root_first, root_index)
+
+    unioned: dict[int, list[int]] = {}
+    for index, group in enumerate(groups):
+        unioned.setdefault(find(index), []).extend(group)
+    return list(unioned.values())
+
+
+def _best_band(
+    span: tuple[float, float] | None, bands: Sequence[tuple[int, int]]
+) -> int | None:
+    """Index of the band overlapping ``span`` most, or None when none does."""
+    if span is None:
+        return None
+    best: int | None = None
+    best_overlap = 0.0
+    for index, (top, bottom) in enumerate(bands):
+        overlap = min(span[1], bottom) - max(span[0], top)
+        if overlap > best_overlap:
+            best, best_overlap = index, overlap
+    return best
+
+
+def reading_order(lines: list[Any]) -> list[Any]:
+    """Put baselines in the order a person reads them (top to bottom).
+
+    A segmenter emits the baselines in the order it found the regions, which on a
+    logbook page can put the first row third; recognition then inherits that
+    order. The pages of this project are single text columns, so ordering by
+    vertical position is enough — a multi-column page would need an XY-cut.
+    """
+    return sorted(lines, key=_reading_key)
+
+
+def _reading_key(line: Any) -> tuple[float, float]:
+    baseline = [point for point in (getattr(line, "baseline", None) or [])]
+    if len(baseline) >= 2:
+        ys = [float(point[1]) for point in baseline]
+        xs = [float(point[0]) for point in baseline]
+        return ((min(ys) + max(ys)) / 2, min(xs))
+    box = line_box(line)
+    if box is None:
+        return (math.inf, math.inf)
+    return ((box[1] + box[3]) / 2, box[0])
+
+
+def line_box(line: Any) -> tuple[float, float, float, float] | None:
+    """``(x0, y0, x1, y1)`` of a line's outline, falling back to its box."""
+    points = getattr(line, "boundary", None)
+    if not points:
+        bbox = getattr(line, "bbox", None)
+        if bbox:
+            return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        points = getattr(line, "baseline", None)
+    if not points:
+        return None
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    return min(xs), min(ys), max(xs), max(ys)
 
 
 def merged_boundary(
@@ -689,6 +862,8 @@ class KrakenRecognizer(HTRRecognizer):
         temperature: float = 1.0,
         segmentation_engine: str = "neural",
         merge_lines: bool = True,
+        segmentation_rows: bool = True,
+        segmentation_rows_threshold: float = 0.4,
         return_logits: bool = False,
         decoder: str = "greedy",
         lm_path: str | None = None,
@@ -713,6 +888,11 @@ class KrakenRecognizer(HTRRecognizer):
         self.segmentation_engine = segmentation_engine
         # glue a detached first word back onto its line before recognition
         self.merge_lines = merge_lines
+        # additionally union the pieces that share one *physical row* found in
+        # the ink (see rows.row_bands); the geometric merge above is the base,
+        # so the ink can only add merges
+        self.segmentation_rows = segmentation_rows
+        self.segmentation_rows_threshold = segmentation_rows_threshold
         # 'greedy' = kraken's own decoder; 'beam' = prefix beam search with a
         # character language model and an optional lexicon bonus
         self.decoder = (decoder or "greedy").strip().lower()
@@ -764,7 +944,7 @@ class KrakenRecognizer(HTRRecognizer):
                     if decoder is not None
                     else None
                 )
-                segmentation = self._merge_split_lines(self._segment(image))
+                segmentation = self._merge_split_lines(self._segment(image), image)
                 if not segmentation.lines:
                     raise RecognitionError(
                         "No text lines were found on the page; check the scan "
@@ -1024,19 +1204,39 @@ class KrakenRecognizer(HTRRecognizer):
                 )
         return self._classical_segment(image)
 
-    def _merge_split_lines(self, segmentation):
-        """Re-join segments that the segmenter split off the same line."""
-        if not self.merge_lines:
-            return segmentation
+    def _merge_split_lines(self, segmentation, image=None):
+        """Re-join the pieces of one line and number the lines in reading order.
+
+        The geometric merge is the base; the page's ink rows (``rows.row_bands``)
+        can only add merges to it, never remove one, so a bad profile cannot
+        split a line the geometry already got right. The segmenter's own order is
+        replaced by the reading order either way.
+        """
         lines = list(getattr(segmentation, "lines", None) or [])
-        if len(lines) < 2 or not all(getattr(line, "baseline", None) for line in lines):
+        if len(lines) < 2:
             return segmentation
-        merged = merge_collinear_lines(lines)
-        if len(merged) == len(lines):
-            return segmentation
+        if self.merge_lines and all(getattr(line, "baseline", None) for line in lines):
+            lines = merge_collinear_lines(lines, bands=self._ink_row_bands(image))
         from dataclasses import replace
 
-        return replace(segmentation, lines=merged)
+        return replace(segmentation, lines=reading_order(lines))
+
+    def _ink_row_bands(self, image):
+        """The page's physical rows, or None when the ink gives none.
+
+        The profile must never fail recognition: a broken or unusable image
+        simply leaves the geometric merge alone.
+        """
+        if not self.segmentation_rows or image is None:
+            return None
+        try:
+            bands = row_bands(image, threshold_ratio=self.segmentation_rows_threshold)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "HTR segmentation: ink rows unavailable (%s: %s)", type(exc).__name__, exc
+            )
+            return None
+        return bands or None
 
     def _neural_segment(self, image):
         """Bundled bLLA model: polygons and baselines that follow curved lines."""

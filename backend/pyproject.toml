@@ -9,5 +9,11 @@ dependencies = [
 	"redis>=5.2.1",
 	"llama-cpp-python>=0.3.16",
 	"torch>=2.11.0",
-	"transformers>=5.5.4",
+	# 5.19 is the first release that knows the `embedding_gemma2` architecture
+	# of google/embeddinggemma-2
+	"transformers>=5.19.0",
+	# knowledge deduplication + RAG embeddings, loaded in-process
+	"sentence-transformers>=6.1.0",
+	# vector columns (pgvector/pgvector:pg16 ships the extension)
+	"pgvector>=0.5.1",
 ]

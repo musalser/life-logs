@@ -478,7 +478,32 @@ class KnowledgeService:
     # ------------------------------------------------------------------
 
     async def process_diary_page(self, db: Session, user_id: int, page: DiaryPage) -> dict[str, Any]:
-        """Runs extraction -> resolution -> aggregation for one diary page."""
+        """Runs extraction -> resolution -> aggregation for one diary page.
+
+        .. deprecated:: stage 3
+           This pipeline predates the knowledge_sources migration: it writes
+           through columns that no longer exist (``diary_page_id``, the old
+           one-edge-per-person ``entity_relations``), so it refuses to run
+           instead of failing with a TypeError from a removed column. It is
+           replaced by ``KnowledgeSourceService`` + the extraction pipeline,
+           which address a page through its source and keep offsets into it.
+           The extraction prompts and the LLM resolution below are reused there.
+        """
+        logger.warning(
+            "KnowledgeService.process_diary_page is superseded by the source pipeline "
+            "(stage 3) and does nothing; the page still needs its source row "
+            "(python -m app.scripts.backfill_sources)"
+        )
+        return {
+            "errors": ["pipeline_superseded_by_knowledge_sources"],
+            "superseded": True,
+            "page_id": getattr(page, "id", None),
+        }
+
+    async def _legacy_process_diary_page(
+        self, db: Session, user_id: int, page: DiaryPage
+    ) -> dict[str, Any]:
+        """The pre-sources implementation, kept until stage 4 replaces it."""
         summary: dict[str, Any] = {"errors": []}
         content = page.content or ""
         if not content.strip():

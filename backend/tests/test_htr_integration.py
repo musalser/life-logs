@@ -117,8 +117,10 @@ def env(db_session, tmp_path, user, author):
     return page_service, training_service, model_repo, trainer, user, author
 
 
-def run_page_cycle(page_service, user, author, edit=True):
-    page = page_service.upload_page(user.id, author.id, "page.png", png_bytes())
+def run_page_cycle(page_service, user, author, edit=True, filename="page.png"):
+    # the same name from the same source is refused now, so a test that needs two
+    # pages of one author names them apart
+    page = page_service.upload_page(user.id, author.id, filename, png_bytes())
     assert page.status == PageStatus.UPLOADED
     page = page_service.apply_recognition(page.id, recognition_result())
     assert page.status == PageStatus.RECOGNIZED
@@ -174,9 +176,9 @@ def test_full_training_workflow(env):
 def test_second_page_retrains_from_default_with_full_corpus(env):
     page_service, training_service, model_repo, trainer, user, author = env
 
-    run_page_cycle(page_service, user, author)
+    run_page_cycle(page_service, user, author, filename="page_1.png")
     training_service.train_author(author.id)
-    run_page_cycle(page_service, user, author, edit=False)
+    run_page_cycle(page_service, user, author, edit=False, filename="page_2.png")
     result = training_service.train_author(author.id)
 
     assert result.outcome == TrainingOutcome.SUCCESS
@@ -211,8 +213,8 @@ def test_recognition_records_active_model_version(env):
 def test_deleted_confirmed_page_leaves_the_training_corpus(env):
     page_service, training_service, _, _, user, author = env
 
-    first = run_page_cycle(page_service, user, author)
-    second = run_page_cycle(page_service, user, author, edit=False)
+    first = run_page_cycle(page_service, user, author, filename="page_1.png")
+    second = run_page_cycle(page_service, user, author, edit=False, filename="page_2.png")
 
     dataset = training_service.dataset_builder.build_for_author(author.id)
     assert {s.page_id for s in dataset.samples} == {first.id, second.id}

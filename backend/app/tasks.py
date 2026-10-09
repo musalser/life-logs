@@ -21,6 +21,31 @@ def generate_reply_task(
     return asyncio.run(generate_reply(message, tone, history))
 
 
+@celery.task(name="app.tasks.extract_knowledge", bind=True, max_retries=1)
+def extract_knowledge_task(self, source_id: int) -> dict:
+    """Extracts the knowledge of one source (async mode of the pipeline).
+
+    The worker owns its own session and its own singletons (LLM adapter,
+    embedding service), and the synchronous entry point wraps the async
+    pipeline — exactly like the chat task above.
+    """
+    from .db import SessionLocal
+    from .models import KnowledgeSource
+    from .services.knowledge_source_service import KnowledgeSourceService
+
+    db = SessionLocal()
+    try:
+        source = (
+            db.query(KnowledgeSource).filter(KnowledgeSource.id == source_id).first()
+        )
+        if source is None:
+            logger.warning("extract_knowledge: source %s not found", source_id)
+            return {"source_id": source_id, "status": "missing"}
+        return asyncio.run(KnowledgeSourceService(db).run_now(source))
+    finally:
+        db.close()
+
+
 # Process-level NER singleton – initialised once per Celery worker process.
 _ner_service = None
 
@@ -42,7 +67,7 @@ def extract_entities_sync(
 ) -> dict[str, int]:
     from .config import settings
     from .db import SessionLocal
-    from .models import Entity, EntityMention
+    from .models import Entity, EntityMention, KnowledgeSource
 
     logger.info(
         "Starting extract_entities task_id=%s diary_page_id=%s user_id=%s",
@@ -64,6 +89,21 @@ def extract_entities_sync(
 
     db = SessionLocal()
     try:
+        # mentions hang off a knowledge source now, not off the diary page
+        source = (
+            db.query(KnowledgeSource)
+            .filter_by(user_id=user_id, source_type="diary", ref_id=diary_page_id)
+            .first()
+        )
+        if source is None:
+            logger.warning(
+                "No knowledge source for diary page %s (task_id=%s); "
+                "run `python -m app.scripts.backfill_sources`",
+                diary_page_id,
+                task_id,
+            )
+            return {"entities_extracted": 0}
+
         now = datetime.now(timezone.utc)
         for ent in entities:
             normalized = ent["mention_text"].lower().strip()
@@ -93,7 +133,7 @@ def extract_entities_sync(
 
             mention = EntityMention(
                 entity_id=entity.id,
-                diary_page_id=diary_page_id,
+                source_id=source.id,
                 mention_text=ent["mention_text"],
                 sentence_text=ent["sentence"],
                 start_offset=ent["start"],

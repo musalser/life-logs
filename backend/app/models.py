@@ -1,6 +1,7 @@
 from sqlalchemy import (
     Boolean,
     Column,
+    Index,
     Integer,
     String,
     Text,
@@ -11,7 +12,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
+from pgvector.sqlalchemy import Vector
+
 from .db import Base
+
+#: dimension of the embeddings written by app.services.embedding_service.
+#: Kept as a literal (not settings.embedding_dim) so that the model metadata,
+#: and therefore Alembic autogenerate, does not change with an environment
+#: variable: switching the embedding model must be a migration, not a surprise.
+EMBEDDING_DIM = 768
 
 
 class User(Base):
@@ -21,16 +30,27 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     name = Column(String, default="User")
     tone = Column(String, default="coach")  # "coach", "friend", "critic"
+    #: the person-object that represents this account ("Я" on the knowledge
+    #: tab). Knowledge extracted from the diary is attributed to it, so it is
+    #: created together with the account (see routes/auth.py).
+    self_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     entries = relationship("Entry", back_populates="user")
     diary_pages = relationship("DiaryPage", back_populates="user")
-    entities = relationship("Entity", back_populates="user")
+    #: two foreign keys now link users and entities (entities.user_id and
+    #: users.self_entity_id), so the join must name its column
+    entities = relationship("Entity", back_populates="user", foreign_keys="Entity.user_id")
     facts = relationship("Fact", back_populates="user")
     refresh_sessions = relationship("RefreshSession", back_populates="user")
     goals = relationship("Goal", back_populates="user")
     events = relationship("Event", back_populates="user")
     habits = relationship("Habit", back_populates="user")
     entity_relations = relationship("EntityRelation", back_populates="user")
+    #: the cycle users.self_entity_id <-> entities.user_id needs one side to be
+    #: written after the other, otherwise flush order is ambiguous
+    self_entity = relationship("Entity", foreign_keys=[self_entity_id], post_update=True)
 
 
 class RefreshSession(Base):
@@ -60,6 +80,9 @@ class Entry(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     text = Column(Text)
     reply = Column(Text)
+    #: JSON list of the RAG chunks the answer was built from:
+    #: [{"chunk_id": 1, "text": "...", "source_type": "htr", "ref_id": 12, "title": "..."}]
+    context_json = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="entries")
@@ -74,8 +97,6 @@ class DiaryPage(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="diary_pages")
-    entity_mentions = relationship("EntityMention", back_populates="diary_page")
-    facts = relationship("Fact", back_populates="diary_page")
 
 
 class Entity(Base):
@@ -87,6 +108,13 @@ class Entity(Base):
             "normalized_name",
             name="uq_entity_user_type_name",
         ),
+        Index(
+            "ix_entities_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -95,22 +123,29 @@ class Entity(Base):
     canonical_name = Column(String(255), nullable=False)
     normalized_name = Column(String(255), nullable=False, index=True)
     description = Column(Text, nullable=True)
+    #: JSON list of other spellings of the same object ("mama", "mom",
+    #: "матушка"): a merge adds the variant instead of creating a new entity
+    aliases_json = Column(Text, nullable=True)
+    #: embedding of canonical_name + aliases, used to *retrieve* dedup
+    #: candidates (the decision is the LLM resolver's, see the spec 7.2)
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
     first_seen_at = Column(DateTime(timezone=True), nullable=True)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    # Alias stubs: optional synonym storage for one entity.
-    # Example: ["mama", "mom", "mother"].
-    # aliases_json = Column(Text, nullable=True)
-
-    # Embedding stubs: vector search support for semantic retrieval.
-    # Keep commented until pgvector or external vector store is added.
-    # embedding_model = Column(String(100), nullable=True)
-    # embedding_vector = Column(Text, nullable=True)
-
-    user = relationship("User", back_populates="entities")
+    user = relationship("User", back_populates="entities", foreign_keys=[user_id])
     mentions = relationship("EntityMention", back_populates="entity")
-    relation = relationship("EntityRelation", back_populates="entity", uselist=False)
+    from_relations = relationship(
+        "EntityRelation",
+        foreign_keys="EntityRelation.from_entity_id",
+        back_populates="from_entity",
+    )
+    to_relations = relationship(
+        "EntityRelation",
+        foreign_keys="EntityRelation.to_entity_id",
+        back_populates="to_entity",
+    )
     subject_facts = relationship(
         "Fact",
         foreign_keys="Fact.subject_entity_id",
@@ -128,9 +163,14 @@ class EntityMention(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     entity_id = Column(Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False, index=True)
-    diary_page_id = Column(Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    #: the text the mention was read from: a diary page or a manuscript page,
+    #: see KnowledgeSource
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     mention_text = Column(String(255), nullable=False)
     sentence_text = Column(Text, nullable=True)
+    #: offsets into KnowledgeSource.text (0-based, end exclusive)
     start_offset = Column(Integer, nullable=True)
     end_offset = Column(Integer, nullable=True)
     confidence = Column(Float, nullable=True)
@@ -139,7 +179,7 @@ class EntityMention(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     entity = relationship("Entity", back_populates="mentions")
-    diary_page = relationship("DiaryPage", back_populates="entity_mentions")
+    source = relationship("KnowledgeSource", back_populates="mentions")
 
 
 class Fact(Base):
@@ -147,34 +187,27 @@ class Fact(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    diary_page_id = Column(Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     subject_entity_id = Column(Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True)
     predicate = Column(String(100), nullable=False, index=True)
     object_entity_id = Column(Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True)
     object_text = Column(Text, nullable=True)
+    #: exact quote from the source, kept as a copy so a re-indexed or edited
+    #: source still has a readable citation
     source_text = Column(Text, nullable=False)
+    #: offsets of that quote in KnowledgeSource.text (0-based, end exclusive)
+    start_offset = Column(Integer, nullable=True)
+    end_offset = Column(Integer, nullable=True)
     time_text = Column(String(255), nullable=True)
     emotion_label = Column(String(32), nullable=True, index=True)
     sentiment_score = Column(Float, nullable=True)
     confidence = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # Summary stubs: page-level or period-level summaries derived from facts.
-    # Keep commented if summaries will be stored in a separate table later.
-    # summary_short = Column(Text, nullable=True)
-    # summary_long = Column(Text, nullable=True)
-
-    # Clustering stubs: group semantically similar facts.
-    # Store cluster id and centroid distance when clustering is added.
-    # cluster_id = Column(Integer, nullable=True, index=True)
-    # cluster_distance = Column(Float, nullable=True)
-
-    # Embedding stubs: optional vector per fact for semantic search.
-    # embedding_model = Column(String(100), nullable=True)
-    # embedding_vector = Column(Text, nullable=True)
-
     user = relationship("User", back_populates="facts")
-    diary_page = relationship("DiaryPage", back_populates="facts")
+    source = relationship("KnowledgeSource", back_populates="facts")
     subject_entity = relationship(
         "Entity",
         foreign_keys=[subject_entity_id],
@@ -189,16 +222,32 @@ class Fact(Base):
 
 class Goal(Base):
     __tablename__ = "goals"
+    __table_args__ = (
+        Index(
+            "ix_goals_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    #: whose goal it is: the author of the source text, not necessarily the
+    #: account owner (a manuscript's author has their own goals)
+    subject_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     # active | completed | abandoned
     status = Column(String(32), nullable=False, default="active", index=True)
-    created_from_page_id = Column(
-        Integer, ForeignKey("diary_pages.id", ondelete="SET NULL"), nullable=True
+    created_from_source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="SET NULL"), nullable=True
     )
+    #: embedding of the title, used to retrieve dedup candidates
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -213,8 +262,8 @@ class GoalProgress(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     goal_id = Column(Integer, ForeignKey("goals.id", ondelete="CASCADE"), nullable=False, index=True)
-    diary_page_id = Column(
-        Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
     )
     # started | progress | completed | abandoned
     progress_kind = Column(String(32), nullable=False, default="progress")
@@ -224,55 +273,115 @@ class GoalProgress(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     goal = relationship("Goal", back_populates="progress_notes")
-    diary_page = relationship("DiaryPage")
+    source = relationship("KnowledgeSource", back_populates="goal_progress")
 
 
 class EntityRelation(Base):
+    """A directed edge of the social graph: "from" is the perspective.
+
+    A manuscript written by Баба Галя yields ``Баба Галя -> мама``, not
+    ``me -> мама``: knowledge about the circle of contacts is always tied to
+    the author of the text. The knowledge tab shows the edges of the selected
+    object and the path to it, and never re-composes relationship names.
+    """
+
     __tablename__ = "entity_relations"
     __table_args__ = (
-        UniqueConstraint("user_id", "entity_id", name="uq_entity_relation_user_entity"),
+        UniqueConstraint(
+            "user_id",
+            "from_entity_id",
+            "to_entity_id",
+            "relation_type",
+            name="uq_entity_relation_edge",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    entity_id = Column(Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False, index=True)
+    from_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    to_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     # sister, friend, colleague, mother, ...
     relation_type = Column(String(64), nullable=False)
     confidence = Column(Float, nullable=True)
     evidence_text = Column(Text, nullable=True)
-    last_page_id = Column(Integer, ForeignKey("diary_pages.id", ondelete="SET NULL"), nullable=True)
+    #: where the edge was read (NULL for edges migrated from the old
+    #: single-perspective table)
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    start_offset = Column(Integer, nullable=True)
+    end_offset = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="entity_relations")
-    entity = relationship("Entity", back_populates="relation")
+    from_entity = relationship(
+        "Entity", foreign_keys=[from_entity_id], back_populates="from_relations"
+    )
+    to_entity = relationship("Entity", foreign_keys=[to_entity_id], back_populates="to_relations")
+    source = relationship("KnowledgeSource")
 
 
 class Event(Base):
     __tablename__ = "events"
+    __table_args__ = (
+        Index(
+            "ix_events_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    diary_page_id = Column(
-        Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    subject_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
     )
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     time_text = Column(String(255), nullable=True)
     importance = Column(Float, nullable=True)
     source_text = Column(Text, nullable=True)
+    start_offset = Column(Integer, nullable=True)
+    end_offset = Column(Integer, nullable=True)
+    #: embedding of title + time_text + description: the date must be part of
+    #: the vector text, or "день рождения 2023" and "…2024" become one event
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="events")
-    diary_page = relationship("DiaryPage")
+    source = relationship("KnowledgeSource", back_populates="events")
 
 
 class Habit(Base):
     __tablename__ = "habits"
+    __table_args__ = (
+        Index(
+            "ix_habits_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    subject_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title = Column(String(255), nullable=False)
+    #: embedding of the title, used to retrieve dedup candidates
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -285,15 +394,177 @@ class HabitLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     habit_id = Column(Integer, ForeignKey("habits.id", ondelete="CASCADE"), nullable=False, index=True)
-    diary_page_id = Column(
-        Integer, ForeignKey("diary_pages.id", ondelete="CASCADE"), nullable=False, index=True
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
     )
     note = Column(Text, nullable=True)
     source_text = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     habit = relationship("Habit", back_populates="logs")
-    diary_page = relationship("DiaryPage")
+    source = relationship("KnowledgeSource", back_populates="habit_logs")
+
+
+# ---------------------------------------------------------------------------
+# Knowledge sources: one text to extract from (manuscript page or diary page)
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeSource(Base):
+    """The text a knowledge extraction run reads, whatever produced it.
+
+    A confirmed manuscript page and a diary page are both *sources*: the
+    pipeline, the offsets and the provenance are the same, and nothing is
+    copied between the two (see the spec, section 6).
+    """
+
+    __tablename__ = "knowledge_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "source_type", "ref_id", name="uq_knowledge_source_user_ref"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    #: 'htr' (htr_pages.id) | 'diary' (diary_pages.id)
+    source_type = Column(String(16), nullable=False, index=True)
+    ref_id = Column(Integer, nullable=False, index=True)
+    #: whose text this is: the object of the manuscript author, or the
+    #: account's own object for the diary
+    author_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    title = Column(String(255), nullable=True)
+    text = Column(Text, nullable=False, default="")
+    #: sha256 of text; a change means the knowledge derived from it is stale
+    text_hash = Column(String(64), nullable=True, index=True)
+    #: for 'htr': JSON [{"line_id": N, "start": 0, "end": 42}, ...] mapping
+    #: global offsets in `text` back to the lines of the manuscript page;
+    #: NULL for the diary, where offsets are simply indexes into content
+    line_map = Column(Text, nullable=True)
+    #: pending | running | done | failed
+    extraction_status = Column(String(16), nullable=False, default="pending", index=True)
+    last_extracted_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
+    author_entity = relationship("Entity")
+    mentions = relationship(
+        "EntityMention", back_populates="source", cascade="all, delete-orphan"
+    )
+    facts = relationship("Fact", back_populates="source", cascade="all, delete-orphan")
+    goal_progress = relationship(
+        "GoalProgress", back_populates="source", cascade="all, delete-orphan"
+    )
+    events = relationship("Event", back_populates="source", cascade="all, delete-orphan")
+    habit_logs = relationship(
+        "HabitLog", back_populates="source", cascade="all, delete-orphan"
+    )
+    chunks = relationship("Chunk", back_populates="source", cascade="all, delete-orphan")
+    runs = relationship(
+        "ExtractionRun",
+        back_populates="source",
+        cascade="all, delete-orphan",
+        order_by="ExtractionRun.id",
+    )
+
+
+class ExtractionRun(Base):
+    """One execution of the extraction pipeline over one source."""
+
+    __tablename__ = "extraction_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: running | succeeded | failed
+    status = Column(String(16), nullable=False, default="running", index=True)
+    #: JSON counters per knowledge type (created / matched / errors)
+    stats = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    #: which LLM produced the extraction
+    model = Column(String(64), nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    source = relationship("KnowledgeSource", back_populates="runs")
+
+
+class Chunk(Base):
+    """A RAG passage of one source, with its embedding."""
+
+    __tablename__ = "chunks"
+    __table_args__ = (
+        Index(
+            "ix_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chunk_index = Column(Integer, nullable=False, default=0)
+    text = Column(Text, nullable=False)
+    start_offset = Column(Integer, nullable=True)
+    end_offset = Column(Integer, nullable=True)
+    #: embedded with the model's 'Document' prompt (queries use 'SearchQuery')
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    source = relationship("KnowledgeSource", back_populates="chunks")
+
+
+class KnowledgeInsight(Base):
+    """Cached analytics (insights / questions / ideas / conclusions).
+
+    Regenerated when knowledge_state.version moves past the stored version.
+    """
+
+    __tablename__ = "knowledge_insights"
+    __table_args__ = (
+        UniqueConstraint("user_id", "subject_entity_id", name="uq_knowledge_insight_subject"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    #: the object the analytics was generated from
+    subject_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    #: knowledge_state.version at generation time
+    version = Column(Integer, nullable=False, default=0)
+    #: JSON {"insights": [...], "questions": [...], "ideas": [...],
+    #: "conclusions": [...]}, each item {text, confidence, evidence: [...]}
+    payload = Column(Text, nullable=False, default="{}")
+    model = Column(String(64), nullable=True)
+    generated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    subject_entity = relationship("Entity")
+
+
+class KnowledgeState(Base):
+    """Per-user version of the knowledge base, bumped on every extraction."""
+
+    __tablename__ = "knowledge_state"
+
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    version = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +578,16 @@ class HTRAuthor(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
+    #: the object this manuscript author is for the family: relations read from
+    #: their pages are attributed to it, so extraction refuses to run without it
+    entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     pages = relationship("HTRPage", back_populates="author")
     model_versions = relationship("HTRModelVersion", back_populates="author")
+    entity = relationship("Entity")
 
 
 class HTRPage(Base):

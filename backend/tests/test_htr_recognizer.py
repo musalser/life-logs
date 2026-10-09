@@ -16,6 +16,7 @@ from app.htr.infrastructure.kraken.recognizer import (
     KrakenRecognizer,
     available_lightning_device,
     baseline_ends,
+    estimate_pitch,
     group_collinear_lines,
     is_continuation,
     lightning_device,
@@ -24,6 +25,7 @@ from app.htr.infrastructure.kraken.recognizer import (
     merge_collinear_lines,
     polygon_bbox,
     polygon_points,
+    reading_order,
     word_spans,
     words_from_record,
 )
@@ -193,6 +195,89 @@ def test_merge_keeps_reading_order_and_untouched_lines():
     assert len(merged) == 2
     assert merged[0].baseline[0][0] == 10 and merged[0].baseline[-1][0] == 900
     assert merged[1].id == "f"
+
+
+def test_over_segmented_lines_are_glued_back_with_a_robust_pitch():
+    """A split line must not be the reason the merge cannot bridge its pieces.
+
+    The page of this author is a logbook: its words stand far apart, so the
+    segmenter returns several baselines per physical line. Dividing the midpoint
+    span by the number of *pieces* then shrinks the pitch to the distance between
+    pieces, and the repair threshold rejects the very gaps it should bridge. The
+    pitch is therefore read from the midpoints of the lines, not from the number
+    of segments.
+    """
+    lines = []
+    for row, y in enumerate((100, 300, 500)):
+        for piece, (x0, x1) in enumerate(((10, 130), (250, 370), (490, 610))):
+            lines.append(FakeBaselineLine(f"{row}-{piece}", [(x0, y), (x1, y + 4)], height=40))
+
+    # one physical line per y level, each made of three pieces 120 px apart
+    assert estimate_pitch([line.baseline for line in lines], [40] * len(lines)) == pytest.approx(200)
+    groups = group_collinear_lines(lines)
+    assert sorted(sorted(group) for group in groups) == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    assert len(merge_collinear_lines(lines)) == 3
+
+
+def test_reading_order_sorts_lines_top_to_bottom():
+    """The segmenter's order is not the reading order: recognition inherits ours."""
+    bottom = FakeBaselineLine("bottom", [(500, 400), (900, 404)])
+    top = FakeBaselineLine("top", [(10, 100), (400, 104)])
+    middle = FakeBaselineLine("middle", [(10, 250), (900, 254)])
+
+    ordered = reading_order([bottom, top, middle])
+
+    assert [line.id for line in ordered] == ["top", "middle", "bottom"]
+
+
+def test_over_segmented_rows_are_merged_and_read_top_to_bottom():
+    """A logbook page: rows emitted out of order, each split into two pieces."""
+    lines = [
+        # the segmenter emits the third row's tail first, then a mix of rows
+        FakeBaselineLine("third-b", [(500, 500), (900, 504)]),
+        FakeBaselineLine("second-a", [(10, 300), (400, 304)]),
+        FakeBaselineLine("header-b", [(500, 100), (900, 104)]),
+        FakeBaselineLine("third-a", [(10, 500), (400, 504)]),
+        FakeBaselineLine("header-a", [(10, 100), (400, 104)]),
+        FakeBaselineLine("second-b", [(500, 300), (900, 304)]),
+    ]
+
+    ordered = reading_order(merge_collinear_lines(lines))
+
+    assert len(ordered) == 3
+    assert [line.baseline[0][1] for line in ordered] == [100, 300, 500]
+    assert [(line.baseline[0][0], line.baseline[-1][0]) for line in ordered] == [
+        (10, 900),
+        (10, 900),
+        (10, 900),
+    ]
+
+
+def test_ink_rows_glue_a_mark_the_geometry_cannot_place():
+    """A tiny near-vertical mark inside a row belongs to that row.
+
+    ``is_continuation`` rejects it (its direction is not the row's), so only the
+    ink band can place it. It must join the outline without folding the baseline:
+    a zigzag through it would misdirect the crop.
+    """
+    row = FakeBaselineLine("row", [(10, 100), (900, 104)])
+    plus = FakeBaselineLine("plus", [(500, 122), (508, 84)])
+
+    merged = merge_collinear_lines([row, plus], bands=[(80, 140)])
+
+    assert len(merged) == 1
+    assert merged[0].baseline[0] == (10, 100)
+    assert merged[0].baseline[-1] == (900, 104)
+
+
+def test_ink_rows_do_not_glue_two_different_rows():
+    first = FakeBaselineLine("a", [(10, 100), (900, 104)])
+    second = FakeBaselineLine("b", [(10, 240), (900, 244)])
+
+    merged = merge_collinear_lines([first, second], bands=[(80, 140), (220, 280)])
+
+    assert len(merged) == 2
+    assert merge_collinear_lines([first, second]) == [first, second]
 
 
 def test_words_from_record_keeps_character_cut_polygon():

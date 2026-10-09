@@ -10,10 +10,10 @@
             </div>
 
             <nav class="flex items-center gap-2">
-              <NuxtLink to="/chat" class="nav-link" active-class="nav-link--active">Чат</NuxtLink>
-              <NuxtLink to="/diary" class="nav-link" active-class="nav-link--active">Дневник</NuxtLink>
-              <NuxtLink to="/knowledge" class="nav-link" active-class="nav-link--active">Знания</NuxtLink>
-              <NuxtLink to="/manuscripts" class="nav-link" active-class="nav-link--active">Рукописи</NuxtLink>
+              <TabNavLink to="/chat" label="Чат" glyph="chat" />
+              <TabNavLink to="/diary" label="Дневник" glyph="diary" />
+              <TabNavLink to="/knowledge" label="Знания" glyph="knowledge" />
+              <TabNavLink to="/manuscripts" label="Рукописи" glyph="manuscripts" />
             </nav>
           </div>
 
@@ -416,28 +416,8 @@ onBeforeUnmount(() => {
   background: rgb(var(--c-primary) / 0.24);
 }
 
-.nav-link {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-radius: 0.75rem;
-  border: 1px solid rgb(var(--c-border) / 0.4);
-  padding: 0.5rem 0.85rem;
-  font-size: 0.875rem;
-  color: rgb(var(--c-text));
-  background: rgb(var(--c-surface) / 0.3);
-  transition: background 0.15s ease, border-color 0.15s ease;
-}
-
-.nav-link:hover {
-  background: rgb(var(--c-surface) / 0.6);
-  border-color: rgb(var(--c-primary) / 0.4);
-}
-
-.nav-link--active {
-  background: rgb(var(--c-primary) / 0.18);
-  border-color: rgb(var(--c-primary) / 0.55);
-}
+/* `.nav-link` lives in assets/css/main.css: the marks inside a tab are rendered
+   by components/TabNavLink.vue, and a scoped rule here would not reach inside it. */
 
 .auth-input {
   width: 100%;

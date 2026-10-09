@@ -6,11 +6,14 @@ import uuid
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import SessionLocal
 from app.services.diary_service import DiaryService
+from app.services.embedding_service import EmbeddingService, get_embedding_service as _build_embedding_service
 from app.services.knowledge_service import KnowledgeService
+from app.services.knowledge_source_service import KnowledgeSourceService
 from app.adapters.ollama_adapter import OllamaAdapter
 
 
@@ -188,3 +191,13 @@ def get_knowledge_service() -> KnowledgeService:
     if _knowledge_service is None:
         _knowledge_service = KnowledgeService(ai_adapter=get_ollama_adapter())
     return _knowledge_service
+
+
+def get_embedding_service() -> EmbeddingService:
+    """Shared embedding service: one cache, one loaded model per process."""
+    return _build_embedding_service()
+
+
+def get_knowledge_source_service(db: Session = Depends(get_db)) -> KnowledgeSourceService:
+    """Source lifecycle + pipeline runs, bound to the request's session."""
+    return KnowledgeSourceService(db)

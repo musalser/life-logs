@@ -176,6 +176,30 @@
   .btn-gold {
     @apply inline-block border border-gold/60 bg-gold/10 px-8 py-3 font-display text-xs font-semibold uppercase tracking-[0.3em] text-gold transition-colors duration-300 hover:bg-gold hover:text-obsidian;
   }
+
+  /*
+   * A tab in the journal header. It is global, not scoped to the layout, because
+   * the mark inside it is rendered by components/TabNavLink.vue — a scoped rule
+   * in the layout would style the child's root node but nothing inside it.
+   */
+  .nav-link {
+    @apply inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-sm;
+    border-color: rgb(var(--c-border) / 0.4);
+    color: rgb(var(--c-text));
+    background: rgb(var(--c-surface) / 0.3);
+    transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+  }
+
+  .nav-link:hover {
+    background: rgb(var(--c-surface) / 0.6);
+    border-color: rgb(var(--c-primary) / 0.45);
+    transform: translateY(-1px);
+  }
+
+  .nav-link--active {
+    background: rgb(var(--c-primary) / 0.18);
+    border-color: rgb(var(--c-primary) / 0.55);
+  }
 }
 
 .no-scrollbar {

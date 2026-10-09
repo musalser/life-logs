@@ -409,6 +409,94 @@ def test_upload_without_a_path_keeps_only_the_name(api):
     assert page["source_path"] is None
 
 
+# --------------------------------------------------------------- duplicate names
+
+
+def post_page(client, author_id: int, filename: str, source_path: str | None = None):
+    data = {"source_path": source_path} if source_path is not None else {}
+    return client.post(
+        f"/htr/authors/{author_id}/pages",
+        files={"file": (filename, png_bytes(), "image/png")},
+        data=data,
+    )
+
+
+def test_the_same_name_from_the_same_folder_is_refused(api):
+    client, _, author = api
+    first = upload_named(client, author.id, "scan_001.jpg", source_path="diary/scan_001.jpg")
+
+    response = post_page(client, author.id, "scan_001.jpg", source_path="diary/scan_001.jpg")
+
+    assert response.status_code == 409, response.text
+    assert "scan_001.jpg" in response.json()["detail"]
+    # the corpus still holds the first page and nothing else
+    body = client.get(f"/htr/authors/{author.id}/pages").json()
+    assert [row["page_id"] for row in body] == [first]
+
+
+def test_the_same_name_without_a_path_is_also_refused(api):
+    client, _, author = api
+    # the file picker sends no path at all, so this is the everyday case
+    upload_named(client, author.id, "205150.jpg")
+
+    assert post_page(client, author.id, "205150.jpg").status_code == 409
+
+
+def test_the_name_is_compared_ignoring_case_and_spaces(api):
+    client, _, author = api
+    upload_named(client, author.id, "Page.JPG")
+
+    assert post_page(client, author.id, "  page.jpg  ").status_code == 409
+
+
+def test_equal_names_from_different_folders_stay_two_pages(api):
+    client, _, author = api
+    # this is what source_path is kept for: two scans named the same are not
+    # necessarily the same page
+    first = upload_named(client, author.id, "scan_001.jpg", source_path="diary/1975/scan_001.jpg")
+    second = upload_named(client, author.id, "scan_001.jpg", source_path="diary/1976/scan_001.jpg")
+
+    body = client.get(f"/htr/authors/{author.id}/pages").json()
+    assert [row["page_id"] for row in body] == [first, second]
+
+
+def test_another_author_may_use_the_same_name(api, db_session):
+    from app.models import HTRAuthor
+
+    client, _, author = api
+    other = HTRAuthor(user_id=author.user_id, name="Grandmother")
+    db_session.add(other)
+    db_session.commit()
+    db_session.refresh(other)
+
+    upload_named(client, author.id, "scan_001.jpg")
+    response = post_page(client, other.id, "scan_001.jpg")
+
+    assert response.status_code == 201, response.text
+
+
+def test_the_name_is_free_again_after_the_page_is_deleted(api):
+    client, _, author = api
+    page_id = upload_named(client, author.id, "scan_001.jpg")
+    assert post_page(client, author.id, "scan_001.jpg").status_code == 409
+
+    client.delete(f"/htr/pages/{page_id}")
+
+    assert post_page(client, author.id, "scan_001.jpg").status_code == 201
+
+
+def test_a_refused_upload_leaves_no_image_on_disk(api, tmp_path):
+    client, _, author = api
+    upload_named(client, author.id, "scan_001.jpg")
+    page_dir = tmp_path / "htr" / "pages" / f"author_{author.id}"
+    stored = sorted(p.name for p in page_dir.iterdir())
+
+    assert post_page(client, author.id, "scan_001.jpg").status_code == 409
+
+    # the check runs before the image is written: no orphan file, no new row
+    assert sorted(p.name for p in page_dir.iterdir()) == stored
+
+
 def test_pages_keep_the_upload_order_until_the_user_reorders_them(api):
     client, _, author = api
     first = upload_named(client, author.id, "a.png")
