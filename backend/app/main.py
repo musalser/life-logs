@@ -9,7 +9,7 @@ from app.deps import get_embedding_service, get_ollama_adapter
 from app.logging_utils import configure_logging, log_requests
 
 from .config import settings
-from .routes import auth, chat, diary, htr, knowledge
+from .routes import auth, chat, diary, htr, knowledge, library
 
 
 
@@ -44,6 +44,7 @@ app.include_router(auth.router)
 app.include_router(diary.router)
 app.include_router(knowledge.router)
 app.include_router(htr.router)
+app.include_router(library.router)
 
 @app.get("/")
 def root():

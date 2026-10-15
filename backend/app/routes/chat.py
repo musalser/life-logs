@@ -1,4 +1,5 @@
 
+import json
 import logging
 from typing import List
 from datetime import datetime
@@ -12,6 +13,7 @@ from ..adapters.ollama_adapter import OllamaAdapter
 from ..models import User, Entry
 from ..config import settings
 from ..deps import get_current_user, get_db, get_ollama_adapter
+from ..services.rag_service import RagService
 
 
 HISTORY_LIMIT = 6
@@ -55,15 +57,38 @@ def _recent_history(db: Session, user_id: int, limit: int = HISTORY_LIMIT):
     ]
 
 
+#: `/chat` (как зовёт фронтенд) и `/chat/` (как звали раньше) — оба пути.
+#: Один лишь `/chat/` заставлял FastAPI отвечать 307 на POST /chat, а браузер
+#: на таком редиректе теряет тело потокового запроса: сеть показывает
+#: net::ERR_ABORTED, и чат отвечает «Дневник не смог ответить».
+@router.post("", response_model=ChatResponse, include_in_schema=False)
 @router.post("/", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
     db: Session = Depends(get_db),
     ai_adapter: OllamaAdapter = Depends(get_ollama_adapter),
 ):
-    logger.info("Processing chat request with stream=%s tone=%s", request.stream, request.tone)
+    logger.info(
+        "Processing chat request with stream=%s tone=%s rag=%s",
+        request.stream, request.tone, request.rag,
+    )
     user = _get_or_create_user(db, request.tone)
     history_payload = _recent_history(db, user.id)
+
+    # RAG: вопрос ищется по архиву, найденные фрагменты уходят в промпт, а
+    # список использованных сохраняется вместе с ответом, чтобы UI показал
+    # источники под сообщением (ТЗ 8.4)
+    chunks: List[dict] = []
+    if request.rag:
+        try:
+            chunks = await RagService(db).search(
+                user.id, request.message, subject_entity_id=request.subject_entity_id
+            )
+        except Exception:
+            logger.exception("RAG search failed for user_id=%s; answering without it", user.id)
+    context_block = RagService.context_block(chunks)
+    prompt_message = f"{context_block}\n\nВопрос:\n{request.message}" if context_block else request.message
+    context_json = json.dumps(chunks, ensure_ascii=False) if chunks else None
 
     if ai_adapter is None:
         logger.warning("Chat request failed because AI adapter is unavailable")
@@ -78,20 +103,30 @@ async def chat(
             reply_chunks: List[str] = []
             # тон и история — часть промпта чата: без них модель видела только
             # голое сообщение, и выбор тональности ни на что не влиял
-            async for chunk in ai_adapter.stream_reply(request.message, request.tone, history_payload):
+            async for chunk in ai_adapter.stream_reply(prompt_message, request.tone, history_payload):
                 reply_chunks.append(chunk)
                 yield chunk
 
             full_reply = "".join(reply_chunks)
-            entry = Entry(user_id=user.id, text=request.message, reply=full_reply)
+            entry = Entry(
+                user_id=user.id,
+                text=request.message,
+                reply=full_reply,
+                context_json=context_json,
+            )
             db.add(entry)
             db.commit()
             logger.info("Completed streaming chat response for user_id=%s", user.id)
 
         return StreamingResponse(event_generator(), media_type="text/plain")
 
-    reply = await ai_adapter.generate_reply(request.message, request.tone, history_payload)
-    entry = Entry(user_id=user.id, text=request.message, reply=reply)
+    reply = await ai_adapter.generate_reply(prompt_message, request.tone, history_payload)
+    entry = Entry(
+        user_id=user.id,
+        text=request.message,
+        reply=reply,
+        context_json=context_json,
+    )
     db.add(entry)
     db.commit()
     logger.info("Completed chat response for user_id=%s", user.id)

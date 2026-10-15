@@ -5,6 +5,29 @@
         <p class="text-sm uppercase tracking-widest text-app-accent">LIFE LOGS</p>
         <h1 class="text-3xl font-semibold">Мементо</h1>
       </div>
+      <div class="flex flex-wrap items-center gap-4">
+        <!--
+          RAG (spec 11.3): the archive is searched by default, and the object
+          selector narrows the search to one person's pages. Switching it off
+          asks the model to answer from the conversation alone.
+        -->
+        <label class="flex items-center gap-2 text-sm font-medium text-app-muted">
+          <input v-model="ragEnabled" type="checkbox" class="h-4 w-4 accent-current" />
+          Искать по архиву
+        </label>
+        <label v-if="ragEnabled" class="flex items-center gap-2 text-sm font-medium text-app-muted">
+          Объект
+          <select
+            v-model="subjectEntityId"
+            class="rounded-md border border-app-border/60 bg-app-panel px-3 py-2 text-sm text-app-text focus:border-app-primary focus:outline-none"
+            aria-label="Чьи записи искать"
+          >
+            <option :value="null">все записи</option>
+            <option v-for="subject in subjects" :key="subject.id" :value="subject.id">
+              {{ subject.name }}{{ subject.is_self ? ' (я)' : '' }}
+            </option>
+          </select>
+        </label>
       <label class="flex items-center gap-2 text-sm font-medium text-app-muted">
         Тональность
         <select
@@ -17,6 +40,7 @@
           </option>
         </select>
       </label>
+      </div>
     </header>
 
     <section class="flex h-[clamp(360px,68dvh,780px)] flex-col overflow-hidden rounded-2xl border border-app-border/40 bg-app-panel/60 shadow-lg shadow-app-primary/10 md:h-[clamp(420px,70dvh,840px)]">
@@ -36,6 +60,23 @@
               :class="message.role === 'user' ? 'bg-app-user text-white' : 'bg-app-assistant text-app-text'"
             >
               {{ message.text }}
+            </div>
+
+            <!-- Where an answer came from: the reader must be able to check it -->
+            <div v-if="message.role === 'assistant' && message.sources?.length" class="max-w-xl">
+              <p class="mb-1 text-[10px] uppercase tracking-widest text-app-muted">Источники</p>
+              <div class="flex flex-wrap gap-1.5">
+                <button
+                  v-for="source in message.sources"
+                  :key="`${message.id}-${source.chunk_id}`"
+                  type="button"
+                  class="max-w-md truncate rounded-full border border-app-border/50 px-2.5 py-0.5 text-[11px] text-app-muted transition hover:border-app-primary/60 hover:text-app-accent"
+                  :title="source.text"
+                  @click="openSource(source)"
+                >
+                  {{ source.title }}: {{ shortText(source.text) }}
+                </button>
+              </div>
             </div>
           </article>
         </template>
@@ -84,6 +125,7 @@
 </template>
 
 <script setup>
+const router = useRouter()
 const chatStore = useChatStore()
 const draft = ref('')
 const chatContainer = ref(null)
@@ -101,6 +143,34 @@ const tone = computed({
 
 const toneLabel = computed(() => toneOptions.find((opt) => opt.value === tone.value)?.label ?? '')
 
+// RAG controls live in the store so the setting survives a tab switch
+const ragEnabled = computed({
+  get: () => chatStore.ragEnabled,
+  set: (value) => { chatStore.ragEnabled = value }
+})
+
+const subjectEntityId = computed({
+  get: () => chatStore.subjectEntityId,
+  set: (value) => { chatStore.subjectEntityId = value }
+})
+
+// Objects for the selector: «Я» first, then the people of the archive
+const { subjects, load: loadSubjects, selectedId, selectDefault } = useKnowledgeSubjects()
+
+const shortText = (text) => {
+  const value = String(text || '').replace(/\s+/g, ' ').trim()
+  return value.length > 70 ? `${value.slice(0, 70)}…` : value
+}
+
+/** A source of an answer opens the page it was read from. */
+const openSource = (source) => {
+  if (!source?.source_type) return
+  router.push({
+    path: '/library',
+    query: { type: source.source_type, page: String(source.ref_id) }
+  })
+}
+
 const scrollToBottom = async (behavior = 'smooth') => {
   await nextTick()
   const container = chatContainer.value
@@ -115,7 +185,10 @@ watch(
 )
 
 onMounted(async () => {
-  await chatStore.loadHistory()
+  await Promise.all([chatStore.loadHistory(), loadSubjects()])
+  selectDefault()
+  // the object chosen on the knowledge tab is the one the chat searches by
+  subjectEntityId.value = selectedId.value
   scrollToBottom('auto')
 })
 

@@ -1,5 +1,6 @@
 *.pyc
 backend/postgres-data
+backend/postgres-data-backup-*
 frontend/node_modules
 frontend/dist
 frontend/.nuxt

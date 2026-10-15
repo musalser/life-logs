@@ -15,9 +15,18 @@ class AuthorResponse(BaseModel):
     id: int
     name: str
     created_at: datetime | None = None
+    #: объект-персона, от лица которой читаются знания этой рукописи (spec 8.2)
+    entity_id: int | None = None
+    entity_name: str | None = None
 
     class Config:
         from_attributes = True
+
+
+class AuthorEntityRequest(BaseModel):
+    """Привязка автора рукописи к известному объекту."""
+
+    entity_id: int
 
 
 class BoundingBoxSchema(BaseModel):

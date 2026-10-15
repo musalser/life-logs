@@ -44,19 +44,14 @@ export const TAB_SCENES = {
     plate: '/landing/bust-sage.png',
     fit: 'figure'
   },
-  diary: {
-    path: '/diary',
-    plate: '/landing/hero-statue.png',
+  library: {
+    path: '/library',
+    plate: '/landing/forge-statue.png',
     fit: 'figure'
   },
   knowledge: {
     path: '/knowledge',
     plate: '/landing/oracle-hand.png',
-    fit: 'figure'
-  },
-  manuscripts: {
-    path: '/manuscripts',
-    plate: '/landing/forge-statue.png',
     fit: 'figure'
   }
 }

@@ -26,6 +26,17 @@ services:
     ports:
       - "5432:5432"
     volumes:
+      # Данные лежат в каталоге проекта — рядом с кодом, как было с самого начала.
+      #
+      # ВАЖНО: поднимайте compose из этого каталога WSL
+      # (`/home/musalser/projects/life-logs`). Docker Desktop привязывает
+      # bind-mount к тому каталогу, из которого запущен: если запустить копию
+      # проекта на стороне Windows, контейнер получит тот же путь
+      # `/var/lib/postgresql/data`, но уже поверх tmpfs, и база откроется
+      # пустой — данные при этом останутся в этом каталоге целыми.
+      # Проверить, что смонтирован именно каталог проекта:
+      #   docker compose exec postgres mount | grep postgresql
+      # Ожидаемый ответ — строка с `type ext4` (или 9p), но не `type tmpfs`.
       - ./backend/postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

@@ -238,7 +238,8 @@ def test_context_block_uses_the_neighbouring_pages(db_session, author, settings_
     source, _, _ = service.refresh_from_htr_page(middle)
     block = service.context_block(source)
 
-    assert "НЕ извлекай" in block
+    assert "НЕ извлекай" in block or "НИКОГДА не извлекай" in block
+    assert "Контекст соседних страниц" in block
     assert "конец первой" in block
     assert "начало третьей" in block
     # текст самой страницы в контекст не попадает
@@ -314,7 +315,12 @@ def test_run_now_skips_a_source_already_running(db_session, user):
 
 
 def test_unimplemented_pipeline_leaves_the_source_pending(db_session, user):
-    service = KnowledgeSourceService(db_session)  # конвейер этапа 4 ещё заглушка
+    """Конвейер, который ещё не реализован, — не сбой: источник ждёт в pending."""
+
+    async def not_implemented(db, source):
+        raise NotImplementedError("конвейер ещё не написан")
+
+    service = KnowledgeSourceService(db_session, pipeline=not_implemented)
     source, _, _ = service.refresh_from_diary_page(make_diary_page(db_session, user))
 
     result = run(service.run_now(source))
@@ -446,6 +452,45 @@ def test_reset_drops_knowledge_and_orphan_heads(db_session, user):
     assert db_session.query(Habit).filter_by(id=ids["kept_habit"]).count() == 1
     assert db_session.query(Entity).filter_by(id=ids["self"]).count() == 1
     assert db_session.query(Entity).filter_by(id=ids["keeps_other"]).count() == 1
+
+
+def test_reset_removes_orphaned_objects_of_every_type(db_session, user):
+    """Мусор от прошлого прогона не должен оставаться в базе.
+
+    Извлечение создаёт не только людей: промпт возвращает места, организации и
+    даты. Если страницу переизвлекли с лучшим промптом, такие записи теряют
+    упоминания — и обязаны уйти, иначе они висят в «Персонах» вкладки «Знания».
+    """
+    service = KnowledgeSourceService(db_session)
+    source, _, _ = service.refresh_from_diary_page(make_diary_page(db_session, user))
+    self_entity = service.ensure_self_entity(user.id)
+
+    junk = []
+    for name, kind in (("мох", "person"), ("деревня Кленовая", "location"), ("Ивановы", "organization")):
+        row = Entity(
+            user_id=user.id,
+            entity_type=kind,
+            canonical_name=name,
+            normalized_name=name.lower(),
+        )
+        db_session.add(row)
+        db_session.flush()
+        junk.append(row.id)
+    db_session.add(EntityMention(entity_id=junk[0], source_id=source.id, mention_text="мох"))
+    db_session.add(EntityMention(entity_id=junk[1], source_id=source.id, mention_text="деревня"))
+    # организация держится фактом того же источника — уйдёт вместе с ним
+    db_session.add(
+        Fact(user_id=user.id, source_id=source.id, predicate="соседи", source_text="Ивановы", object_entity_id=junk[2])
+    )
+    db_session.commit()
+
+    removed = service.reset_source_knowledge(source)
+    db_session.commit()
+
+    assert removed["entities"] == 3
+    assert db_session.query(Entity).filter(Entity.id.in_(junk)).count() == 0
+    # объект аккаунта остаётся всегда
+    assert db_session.query(Entity).filter(Entity.id == self_entity.id).count() == 1
 
 
 def test_mark_pending_hides_the_knowledge(db_session, user):

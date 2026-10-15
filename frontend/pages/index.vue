@@ -12,7 +12,7 @@
       <span>Life Logs · MMXXVI</span>
       <nav class="flex gap-6">
         <NuxtLink to="/chat" class="transition-colors hover:text-gold">Chat</NuxtLink>
-        <NuxtLink to="/diary" class="transition-colors hover:text-gold">Diary</NuxtLink>
+        <NuxtLink to="/library" class="transition-colors hover:text-gold">Записи</NuxtLink>
       </nav>
     </footer>
   </main>

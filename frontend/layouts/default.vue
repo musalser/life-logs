@@ -1,6 +1,6 @@
 <template>
   <div class="min-h-screen bg-app-bg text-app-text">
-    <div :class="isWideRoute ? 'mx-auto max-w-[1800px] px-4 py-6 md:px-6' : 'mx-auto max-w-6xl px-4 py-6 md:px-8'">
+    <div class="mx-auto max-w-[1800px] px-4 py-6 md:px-6">
       <header class="mb-6 rounded-2xl border border-app-border/40 bg-app-panel/60 p-4">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div class="flex items-center gap-4">
@@ -11,9 +11,8 @@
 
             <nav class="flex items-center gap-2">
               <TabNavLink to="/chat" label="Чат" glyph="chat" />
-              <TabNavLink to="/diary" label="Дневник" glyph="diary" />
+              <TabNavLink to="/library" label="Записи" glyph="library" />
               <TabNavLink to="/knowledge" label="Знания" glyph="knowledge" />
-              <TabNavLink to="/manuscripts" label="Рукописи" glyph="manuscripts" />
             </nav>
           </div>
 
@@ -65,69 +64,9 @@
         </div>
       </header>
 
-      <div :class="isWideRoute ? 'grid grid-cols-1 gap-6' : 'grid grid-cols-1 gap-6 md:grid-cols-[260px_1fr]'">
-        <aside v-if="!isWideRoute" class="rounded-2xl border border-app-border/40 bg-app-panel/60 p-4">
-          <div class="mb-3 flex items-center justify-between gap-2">
-            <p class="text-xs uppercase tracking-widest text-app-accent">История страниц</p>
-            <p v-if="isDiaryRoute && isAuthenticated" class="text-xs text-app-muted">{{ diaryPages.length }} шт.</p>
-          </div>
-
-          <p v-if="!isDiaryRoute" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
-            История доступна в разделе «Дневник».
-          </p>
-
-          <p v-else-if="!isAuthenticated" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
-            Войдите, чтобы видеть историю страниц.
-          </p>
-
-          <p v-else-if="diaryHistoryError" class="mb-2 rounded-lg border border-app-border/40 bg-app-input/40 px-3 py-2 text-sm text-app-error">
-            {{ diaryHistoryError }}
-          </p>
-
-          <div v-if="isDiaryRoute && isAuthenticated && diaryPages.length" class="no-scrollbar max-h-[70vh] space-y-2 overflow-y-auto pr-1">
-            <button
-              v-for="page in diaryPages"
-              :key="page.id"
-              type="button"
-              class="w-full rounded-xl border px-3 py-2 text-left transition"
-              :class="
-                activePageId === page.id
-                  ? 'border-app-primary/70 bg-app-primary/10'
-                  : 'border-app-border/40 bg-app-panel/30 hover:border-app-primary/40 hover:bg-app-panel/50'
-              "
-              @click="openDiaryPage(page.id)"
-            >
-              <div class="flex items-center justify-between gap-2">
-                <p class="text-sm font-medium text-app-text">{{ page.title }}</p>
-                <div class="flex items-center gap-1">
-                  <p class="text-[11px] text-app-muted">{{ formatTimestamp(page.created_at) }}</p>
-                  <button
-                    type="button"
-                    class="ml-1 inline-flex items-center justify-center rounded-lg px-1.5 py-0.5 text-app-muted transition hover:bg-app-error/20 hover:text-app-error"
-                    title="Удалить страницу"
-                    @click.stop="handleDeleteDiaryPage(page.id)"
-                  >
-                    <svg viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5">
-                      <path d="M6 2h12l2 2v2H2V4l2-2zm2 6v12c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V8H8zM10 10h4v10h-4V10z"></path>
-                    </svg>
-                  </button>
-                </div>
-              </div>
-              <p class="mt-1 line-clamp-2 text-xs text-app-muted">{{ previewText(page.content) }}</p>
-            </button>
-          </div>
-
-          <p v-else-if="isDiaryRoute && isAuthenticated && !diaryHistoryLoading" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
-            История пока пустая.
-          </p>
-
-          <p v-if="isDiaryRoute && diaryHistoryLoading" class="mt-2 text-xs text-app-muted">Загрузка...</p>
-        </aside>
-
-        <main class="rounded-2xl border border-app-border/40 bg-app-panel/30 p-4 md:p-6">
-          <slot />
-        </main>
-      </div>
+      <main>
+        <slot />
+      </main>
     </div>
 
     <div
@@ -197,84 +136,16 @@
 </template>
 
 <script setup>
-import { authFetch } from '~/utils/auth-fetch'
-
 const authStore = useAuthStore()
 const chatStore = useChatStore()
-const route = useRoute()
-const router = useRouter()
-const { public: { apiBaseUrl } } = useRuntimeConfig()
 
 const menuOpen = ref(false)
 const authModalOpen = ref(false)
-const diaryPages = ref([])
-const diaryHistoryLoading = ref(false)
-const diaryHistoryError = ref('')
 const authMode = ref('login')
 const authForm = reactive({ username: '', password: '', name: '' })
 
 const isAuthenticated = computed(() => authStore.isAuthenticated)
 const authUser = computed(() => authStore.user || 'Пользователь')
-const isDiaryRoute = computed(() => route.name === 'diary')
-// the annotation view needs the full width: no history sidebar
-const isWideRoute = computed(() => route.name === 'manuscripts')
-const activePageId = computed(() => {
-  const parsed = Number(route.query.page)
-  return Number.isInteger(parsed) ? parsed : null
-})
-
-const previewText = (value) => value?.trim() || 'Пустая страница'
-
-const formatTimestamp = (timestamp) => {
-  if (!timestamp) return '—'
-  try {
-    return new Date(timestamp).toLocaleString('ru-RU', {
-      hour: '2-digit',
-      minute: '2-digit',
-      day: '2-digit',
-      month: 'short'
-    })
-  } catch {
-    return '—'
-  }
-}
-
-const loadDiaryPages = async () => {
-  if (!isDiaryRoute.value) return
-
-  diaryHistoryLoading.value = true
-  diaryHistoryError.value = ''
-  try {
-    if (!authStore.token) {
-      diaryPages.value = []
-      return
-    }
-
-    const response = await authFetch(apiBaseUrl, `${apiBaseUrl}/diary/pages?limit=100&offset=0`)
-
-    if (response.status === 401) {
-      diaryPages.value = []
-      diaryHistoryError.value = 'Сессия истекла. Войдите снова.'
-      return
-    }
-
-    if (!response.ok) throw new Error('Не удалось загрузить историю')
-
-    diaryPages.value = await response.json()
-  } catch (error) {
-    diaryHistoryError.value = error.message || 'Ошибка загрузки истории'
-  } finally {
-    diaryHistoryLoading.value = false
-  }
-}
-
-const handleDiaryPagesUpdated = async () => {
-  await loadDiaryPages()
-}
-
-const openDiaryPage = (pageId) => {
-  router.push({ name: 'diary', query: { page: String(pageId) } })
-}
 
 const resetAuthForm = () => {
   authForm.username = ''
@@ -308,7 +179,6 @@ const submitAuth = async () => {
       await authStore.register(authForm.username, authForm.password, authForm.name)
     }
     await chatStore.loadHistory()
-    await loadDiaryPages()
     closeAuthModal()
   } catch {
     // Error text is managed by authStore.error
@@ -318,45 +188,11 @@ const submitAuth = async () => {
 const handleLogout = async () => {
   await authStore.logout()
   chatStore.resetChat()
-  diaryPages.value = []
-  diaryHistoryError.value = ''
   menuOpen.value = false
 }
 
-const handleDeleteDiaryPage = async (pageId) => {
-  if (!confirm('Вы уверены? Эту страницу нельзя будет восстановить.')) return
-
-  try {
-    const response = await authFetch(apiBaseUrl, `${apiBaseUrl}/diary/pages/${pageId}`, {
-      method: 'DELETE',
-    })
-
-    if (!response.ok) throw new Error('Не удалось удалить страницу')
-
-    if (activePageId.value === pageId) {
-      router.push({ name: 'diary' })
-    }
-    await loadDiaryPages()
-  } catch (error) {
-    diaryHistoryError.value = error.message || 'Ошибка удаления страницы'
-  }
-}
-
-watch(
-  () => [route.name, authStore.token],
-  async () => {
-    await loadDiaryPages()
-  },
-  { immediate: true }
-)
-
 onMounted(() => {
   authStore.tryRestoreSession()
-  window.addEventListener('diary-pages-updated', handleDiaryPagesUpdated)
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('diary-pages-updated', handleDiaryPagesUpdated)
 })
 </script>
 
@@ -415,9 +251,6 @@ onBeforeUnmount(() => {
 .menu-action:hover {
   background: rgb(var(--c-primary) / 0.24);
 }
-
-/* `.nav-link` lives in assets/css/main.css: the marks inside a tab are rendered
-   by components/TabNavLink.vue, and a scoped rule here would not reach inside it. */
 
 .auth-input {
   width: 100%;

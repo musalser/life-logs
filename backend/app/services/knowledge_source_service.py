@@ -32,6 +32,7 @@ from ..models import (
     Event,
     ExtractionRun,
     Fact,
+    FactSource,
     Goal,
     GoalProgress,
     Habit,
@@ -43,7 +44,8 @@ from ..models import (
     KnowledgeState,
     User,
 )
-from .extraction_pipeline import ExtractionNotImplemented, run_extraction
+from .extraction_pipeline import run_extraction
+from .extraction_prompts import CONTEXT_RULE
 from .source_text import assemble_lines, manuscript_title, neighbor_context, text_hash
 
 logger = logging.getLogger(__name__)
@@ -65,12 +67,23 @@ HTR_CONFIRMED = "CONFIRMED"
 #: manuscript authors that mean "the account owner"
 SELF_NAMES = ("me", "я", "i")
 
-#: orphaned person objects: nothing references them any more (7.4)
+#: Orphaned objects: nothing references them any more (7.4).
+#:
+#: Not restricted to people on purpose. An extraction run also creates places,
+#: organisations and dates (the entity call returns all types), and when a page
+#: is re-extracted with a better prompt those records lose their mentions too.
+#:
+#: Two kinds of object are never deleted, and both are load-bearing:
+#:   * the account's own object («Я») — the perspective of every diary entry;
+#:   * the object a manuscript author is bound to. It is usually *not* mentioned
+#:     on the author's own pages («моя мама» has a name, the author does not),
+#:     so an orphan check would delete it right before the next extraction needs
+#:     it — that is exactly how a re-extraction of page 24 lost its author.
 _ORPHAN_ENTITIES_SQL = """
 DELETE FROM entities
-WHERE entity_type = 'person'
-  AND user_id = :user_id
+WHERE user_id = :user_id
   AND id NOT IN (SELECT self_entity_id FROM users WHERE self_entity_id IS NOT NULL)
+  AND id NOT IN (SELECT entity_id FROM htr_authors WHERE entity_id IS NOT NULL)
   AND NOT EXISTS (SELECT 1 FROM entity_mentions m WHERE m.entity_id = entities.id)
   AND NOT EXISTS (SELECT 1 FROM facts f
                   WHERE f.subject_entity_id = entities.id OR f.object_entity_id = entities.id)
@@ -81,8 +94,12 @@ WHERE entity_type = 'person'
   AND NOT EXISTS (SELECT 1 FROM habits h WHERE h.subject_entity_id = entities.id)
 """
 
-#: the heads an extraction may create; deleting them keeps orphans from piling up
-_OWNED_CHILDREN = (EntityMention, Fact, GoalProgress, Event, HabitLog, Chunk, EntityRelation)
+#: the heads an extraction may create; deleting them keeps orphans from piling up.
+#: ``FactSource`` — подтверждения фактов этого источника: без них повторный
+#: прогон добавил бы к факту вторую цитату того же источника.
+_OWNED_CHILDREN = (
+    EntityMention, Fact, FactSource, GoalProgress, Event, HabitLog, Chunk, EntityRelation
+)
 
 Pipeline = Callable[[Session, KnowledgeSource], Awaitable[dict[str, Any]]]
 
@@ -369,11 +386,19 @@ class KnowledgeSourceService:
             )
         return self.page_lines(neighbor.id) if neighbor is not None else []
 
+    def author_entity(self, source: KnowledgeSource) -> Entity | None:
+        """The object the text is written by: the perspective of every relation."""
+        if source.author_entity_id is None:
+            return None
+        return self.db.query(Entity).filter(Entity.id == source.author_entity_id).first()
+
     def context_block(self, source: KnowledgeSource) -> str:
         """Tail of the previous page and head of the next one, for the prompt.
 
         A sentence can start on one page and end on another; the model needs the
-        neighbour text to read it, but must not extract anything from it.
+        neighbour text to read it, but must not extract anything from it — the
+        wording of that ban lives in ``extraction_prompts``, so every call
+        carries exactly the same rule.
         """
         if source.source_type != SOURCE_HTR:
             return ""
@@ -387,7 +412,7 @@ class KnowledgeSourceService:
         )
         if not context:
             return ""
-        return "Контекст соседних страниц (НЕ извлекай знания из него):\n" + context
+        return f"{CONTEXT_RULE}Контекст соседних страниц:\n{context}\n\n"
 
     # ------------------------------------------------------------------
     # Running the pipeline
@@ -437,7 +462,8 @@ class KnowledgeSourceService:
             self.db.commit()
             logger.info("Source %s extracted: %s", source_id, summary)
             return {"source_id": source_id, "status": STATUS_DONE, "summary": summary}
-        except ExtractionNotImplemented as exc:
+        except NotImplementedError as exc:
+            # конвейер ещё не реализован: это не сбой данных, источник ждёт
             self.db.rollback()
             self._release(source_id, run_id, STATUS_PENDING, error=None, drop_run=True)
             logger.info("Source %s left pending: %s", source_id, exc)

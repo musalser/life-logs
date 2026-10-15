@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..deps import get_current_user, get_db, get_knowledge_source_service
 from ..services.knowledge_source_service import KnowledgeSourceService
+from ..schemas import PageKnowledgeLine, PageKnowledgeResponse
+from ..services.source_text import line_for_offset
 from ..htr import factory
 from ..htr.application.confidence import ConfidencePolicy
 from ..htr.application.page_service import HandwritingPageService
@@ -33,6 +35,7 @@ from ..htr.domain.errors import (
 from ..htr.schemas import (
     WordAlternativeSchema,
     AuthorCreateRequest,
+    AuthorEntityRequest,
     AuthorLexiconResponse,
     AuthorResponse,
     BoundingBoxSchema,
@@ -55,7 +58,21 @@ from ..htr.schemas import (
     WordResponse,
     WordUpdateRequest,
 )
-from ..models import HTRAuthor, User
+from ..models import (
+    Entity,
+    EntityMention,
+    EntityRelation,
+    Event,
+    Fact,
+    FactSource,
+    HTRAuthor,
+    HTRLexiconIgnore,
+    HTRLine,
+    HTRModelVersion,
+    HTRPage,
+    KnowledgeSource,
+    User,
+)
 
 router = APIRouter(prefix="/htr", tags=["Handwriting"])
 logger = logging.getLogger(__name__)
@@ -92,6 +109,22 @@ def _get_owned_page(page_service: HandwritingPageService, page_id: int, user: Us
     if page is None or page.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
     return page
+
+
+def _author_response(db: Session, author: HTRAuthor) -> AuthorResponse:
+    """Автор рукописи вместе с объектом, от лица которого читаются знания."""
+    entity = (
+        db.query(Entity).filter(Entity.id == author.entity_id).first()
+        if author.entity_id
+        else None
+    )
+    return AuthorResponse(
+        id=author.id,
+        name=author.name,
+        created_at=author.created_at,
+        entity_id=entity.id if entity else None,
+        entity_name=entity.canonical_name if entity else None,
+    )
 
 
 def _to_page_response(page: PageView) -> PageResponse:
@@ -216,7 +249,10 @@ def create_author(
     db.add(author)
     db.commit()
     db.refresh(author)
-    return author
+    # у автора сразу есть объект: без него конвейер не сможет отнести к кому-то
+    KnowledgeSourceService(db).ensure_author_entity(author)
+    db.commit()
+    return _author_response(db, author)
 
 
 @router.get("/authors", response_model=list[AuthorResponse])
@@ -225,7 +261,8 @@ def list_authors(
     username: str = Depends(get_current_user),
 ):
     user = _get_user(db, username)
-    return db.query(HTRAuthor).filter(HTRAuthor.user_id == user.id).order_by(HTRAuthor.id).all()
+    authors = db.query(HTRAuthor).filter(HTRAuthor.user_id == user.id).order_by(HTRAuthor.id).all()
+    return [_author_response(db, author) for author in authors]
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +318,50 @@ def _to_page_summary(summary: PageSummary) -> PageSummaryResponse:
         file_path=summary.file_path,
         order_index=summary.order_index,
     )
+
+
+@router.get("/authors/{author_id}", response_model=AuthorResponse)
+def get_author(
+    author_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Автор рукописи: с привязкой к объекту (entity_id, entity_name)."""
+    user = _get_user(db, username)
+    author = _get_author(db, author_id, user)
+    return _author_response(db, author)
+
+
+@router.put("/authors/{author_id}/entity", response_model=AuthorResponse)
+def bind_author_entity(
+    author_id: int,
+    request: AuthorEntityRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Привязывает автора рукописи к известному объекту.
+
+    Именно от этого объекта читаются связи и факты страниц автора: «моя мама» в
+    его рукописи — его мама, а не читателя. Перепривязка касается будущих
+    извлечений; уже извлечённое знание остаётся у прежнего объекта до
+    переизвлечения страниц.
+    """
+    user = _get_user(db, username)
+    author = _get_author(db, author_id, user)
+    entity = (
+        db.query(Entity)
+        .filter(Entity.id == request.entity_id, Entity.user_id == user.id)
+        .first()
+    )
+    if entity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Knowledge object not found",
+        )
+    author.entity_id = entity.id
+    db.commit()
+    db.refresh(author)
+    return _author_response(db, author)
 
 
 @router.get("/authors/{author_id}/pages", response_model=list[PageSummaryResponse])
@@ -769,6 +850,94 @@ def reopen_page(
     except Exception:
         logger.exception("Could not reset the knowledge of page %s", page_id)
     return _to_page_response(page)
+
+
+@router.get(
+    "/pages/{page_id}/knowledge",
+    response_model=PageKnowledgeResponse,
+    summary="Знания, извлечённые из этой страницы, с привязкой к строкам",
+)
+def get_page_knowledge(
+    page_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Факты, упоминания и события страницы с переводом офсетов в строки.
+
+    Офсет знания указывает в текст источника; карта строк переводит его в
+    конкретную строку страницы (``line_id`` и её порядковый номер), а строка уже
+    имеет координаты на изображении — это и есть «ссылка на реальный текст».
+    """
+    user = _get_user(db, username)
+    page = (
+        db.query(HTRPage)
+        .filter(HTRPage.id == page_id, HTRPage.user_id == user.id)
+        .first()
+    )
+    if page is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
+
+    service = KnowledgeSourceService(db)
+    source = service.get("htr", page_id, user.id)
+    if source is None:
+        return PageKnowledgeResponse(page_id=page_id, source_id=None, status=None, items=[])
+
+    order_by_line = {
+        line.id: line.order_index
+        for line in db.query(HTRLine.id, HTRLine.order_index)
+        .filter(HTRLine.page_id == page_id)
+        .all()
+    }
+    items: list[PageKnowledgeLine] = []
+
+    def add(kind: str, record_id: int, text: str, quote: str | None, offset: int | None, confidence: float | None):
+        line_id = line_for_offset(source.line_map, offset)
+        items.append(
+            PageKnowledgeLine(
+                kind=kind,
+                id=record_id,
+                text=text,
+                quote=quote,
+                line_id=line_id,
+                line_order=order_by_line.get(line_id) if line_id else None,
+                confidence=confidence,
+            )
+        )
+
+    # Факт может быть подтверждён на нескольких страницах: у каждой своя цитата
+    # и офсеты, поэтому берём подтверждение именно этой страницы, а если его нет —
+    # основную цитату факта (страница, где он был прочитан впервые).
+    occurrences: dict[int, tuple[Fact, str | None, int | None, float | None]] = {}
+    for fact in db.query(Fact).filter(Fact.source_id == source.id).all():
+        occurrences.setdefault(fact.id, (fact, fact.source_text, fact.start_offset, fact.confidence))
+    for quote_row in db.query(FactSource).filter(FactSource.source_id == source.id).all():
+        if quote_row.fact is None:
+            continue
+        occurrences.setdefault(
+            quote_row.fact_id,
+            (quote_row.fact, quote_row.source_text, quote_row.start_offset, quote_row.confidence),
+        )
+    for fact, quote_text, offset, confidence in occurrences.values():
+        subject = fact.subject_entity.canonical_name if fact.subject_entity else None
+        obj = fact.object_entity.canonical_name if fact.object_entity else (fact.object_text or "")
+        label = " ".join(part for part in (subject, fact.predicate, obj) if part)
+        add("fact", fact.id, label.strip(), quote_text, offset, confidence)
+    for mention in db.query(EntityMention).filter(EntityMention.source_id == source.id).all():
+        entity = mention.entity.canonical_name if mention.entity else "?"
+        add("mention", mention.id, entity, mention.mention_text, mention.start_offset, mention.confidence)
+    for event in db.query(Event).filter(Event.source_id == source.id).all():
+        add("event", event.id, event.title, event.source_text, event.start_offset, event.importance)
+    for edge in db.query(EntityRelation).filter(EntityRelation.source_id == source.id).all():
+        person = edge.to_entity.canonical_name if edge.to_entity else "?"
+        add("relation", edge.id, f"{person} — {edge.relation_type}", edge.evidence_text, edge.start_offset, edge.confidence)
+
+    items.sort(key=lambda item: (item.line_order is None, item.line_order or 0, item.kind))
+    return PageKnowledgeResponse(
+        page_id=page_id,
+        source_id=source.id,
+        status=source.extraction_status,
+        items=items,
+    )
 
 
 @router.get(

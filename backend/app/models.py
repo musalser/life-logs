@@ -94,9 +94,46 @@ class DiaryPage(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String(120), nullable=True)
     content = Column(Text)
+    #: the folder of the unified "Записи" tree this page lives in (NULL = root)
+    folder_id = Column(
+        Integer, ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="diary_pages")
+    folder = relationship("Folder", foreign_keys=[folder_id])
+
+
+class Folder(Base):
+    """A user-configured folder in the unified "Записи" tree.
+
+    Folders are owned by an author object (``owner_entity_id``): the account's
+    own object («Я») holds diary folders, a manuscript author's object holds the
+    folders of their pages. They nest through ``parent_id``, so the tree is
+    author -> folder -> (subfolder | page) with arbitrary depth.
+    """
+
+    __tablename__ = "folders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    #: whose folders these are — the author object of the tree this folder is in
+    owner_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    name = Column(String(255), nullable=False)
+    #: NULL = root level of the author's tree
+    parent_id = Column(
+        Integer, ForeignKey("folders.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    order_index = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
+    owner_entity = relationship("Entity")
+    parent = relationship("Folder", remote_side=[id], back_populates="children")
+    children = relationship("Folder", back_populates="parent")
 
 
 class Entity(Base):
@@ -129,12 +166,21 @@ class Entity(Base):
     #: embedding of canonical_name + aliases, used to *retrieve* dedup
     #: candidates (the decision is the LLM resolver's, see the spec 7.2)
     embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
+    #: якорная сущность безымянного родственника: «мой отец» — это объект с
+    #: идентичностью (anchor_entity_id = автор, anchor_relation = 'father') и
+    #: отображаемым именем «Отец автора». У обычной именованной персоны NULL.
+    anchor_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    anchor_relation = Column(String(32), nullable=True)
     first_seen_at = Column(DateTime(timezone=True), nullable=True)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="entities", foreign_keys=[user_id])
+    #: для якорной сущности — тот, чьим родственником она является
+    anchor_entity = relationship("Entity", remote_side=[id], foreign_keys=[anchor_entity_id])
     mentions = relationship("EntityMention", back_populates="entity")
     from_relations = relationship(
         "EntityRelation",
@@ -192,6 +238,14 @@ class Fact(Base):
     )
     subject_entity_id = Column(Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True)
     predicate = Column(String(100), nullable=False, index=True)
+    #: канонический ключ предиката из закрытого словаря (birth, death, …).
+    #: По нему работает инвариант функциональности: у человека одно рождение
+    #: и одна смерть, второе отличающееся значение — конфликт, а не новый факт.
+    predicate_kind = Column(String(32), nullable=True, index=True)
+    #: откуда взят субъект: self | named | relative | graph. Доля self в статистике
+    #: прогонов — метрика дрейфа: рост означает, что модель снова начала
+    #: подставлять автора вместо действующего лица.
+    subject_source = Column(String(16), nullable=True, index=True)
     object_entity_id = Column(Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True)
     object_text = Column(Text, nullable=True)
     #: exact quote from the source, kept as a copy so a re-indexed or edited
@@ -201,6 +255,9 @@ class Fact(Base):
     start_offset = Column(Integer, nullable=True)
     end_offset = Column(Integer, nullable=True)
     time_text = Column(String(255), nullable=True)
+    #: та же дата, приведённая моделью к ГГГГ[-ММ[-ДД]]; нужна для сравнения
+    #: «1910» и «20 августа 1910» как одной даты и для запросов по времени
+    time_iso = Column(String(32), nullable=True, index=True)
     emotion_label = Column(String(32), nullable=True, index=True)
     sentiment_score = Column(Float, nullable=True)
     confidence = Column(Float, nullable=True)
@@ -218,6 +275,80 @@ class Fact(Base):
         foreign_keys=[object_entity_id],
         back_populates="object_facts",
     )
+    #: все подтверждения факта: страница-источник, цитата и офсеты
+    quotes = relationship("FactSource", back_populates="fact", cascade="all, delete-orphan")
+
+
+class FactConflict(Base):
+    """Второе, отличающееся значение функционального предиката — на проверку.
+
+    «У человека одно рождение»: если по факту уже есть дата, а из нового текста
+    приходит другая — это не новый факт и не молчаливая перезапись, а конфликт,
+    который должен увидеть пользователь. Так «Alexander родился в 1910» рядом с
+    настоящей датой рождения ловится без единого слова про отца.
+    """
+
+    __tablename__ = "fact_conflicts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    #: источник, из которого пришло конфликтующее значение
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    subject_entity_id = Column(
+        Integer, ForeignKey("entities.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    predicate_kind = Column(String(32), nullable=False, index=True)
+    #: уже сохранённый факт, с которым разошлось новое значение
+    existing_fact_id = Column(
+        Integer, ForeignKey("facts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    existing_value = Column(String(255), nullable=True)
+    incoming_value = Column(String(255), nullable=True)
+    #: цитата нового значения — чтобы конфликт можно было проверить по тексту
+    source_text = Column(Text, nullable=True)
+    time_text = Column(String(255), nullable=True)
+    confidence = Column(Float, nullable=True)
+    #: NULL — конфликт ещё не разобран
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    #: keep_existing | accept_incoming | both (что решил пользователь)
+    resolution = Column(String(24), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    user = relationship("User")
+    source = relationship("KnowledgeSource")
+    subject_entity = relationship("Entity")
+    existing_fact = relationship("Fact")
+
+
+class FactSource(Base):
+    """Одно подтверждение факта в конкретном источнике.
+
+    Факт может быть прочитан на нескольких страницах, и каждая — со своей
+    цитатой и офсетами. Перезаписывать единственную цитату при дедупе нельзя:
+    подтверждение теряется. Поэтому основной факт хранит первую цитату, а все
+    подтверждения — здесь, по строке на источник.
+    """
+
+    __tablename__ = "fact_sources"
+    __table_args__ = (
+        UniqueConstraint("fact_id", "source_id", name="uq_fact_source_fact_source"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    fact_id = Column(Integer, ForeignKey("facts.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_text = Column(Text, nullable=False)
+    start_offset = Column(Integer, nullable=True)
+    end_offset = Column(Integer, nullable=True)
+    confidence = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    fact = relationship("Fact", back_populates="quotes")
+    source = relationship("KnowledgeSource", back_populates="fact_quotes")
 
 
 class Goal(Base):
@@ -304,8 +435,11 @@ class EntityRelation(Base):
     to_entity_id = Column(
         Integer, ForeignKey("entities.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    # sister, friend, colleague, mother, ...
+    # sister, friend, colleague, mother, ... — подпись для интерфейса
     relation_type = Column(String(64), nullable=False)
+    #: канонический ключ отношения из закрытого списка (father, mother, …) —
+    #: по нему ищется якорная сущность и сравниваются рёбра
+    relation_kind = Column(String(32), nullable=True, index=True)
     confidence = Column(Float, nullable=True)
     evidence_text = Column(Text, nullable=True)
     #: where the edge was read (NULL for edges migrated from the old
@@ -456,6 +590,9 @@ class KnowledgeSource(Base):
         "EntityMention", back_populates="source", cascade="all, delete-orphan"
     )
     facts = relationship("Fact", back_populates="source", cascade="all, delete-orphan")
+    fact_quotes = relationship(
+        "FactSource", back_populates="source", cascade="all, delete-orphan"
+    )
     goal_progress = relationship(
         "GoalProgress", back_populates="source", cascade="all, delete-orphan"
     )
@@ -499,6 +636,7 @@ class Chunk(Base):
 
     __tablename__ = "chunks"
     __table_args__ = (
+        UniqueConstraint("source_id", "chunk_index", name="uq_chunk_source_index"),
         Index(
             "ix_chunks_embedding_hnsw",
             "embedding",
@@ -604,6 +742,10 @@ class HTRPage(Base):
     source_path = Column(String(2048), nullable=True)
     # manual order inside the author's sidebar list (ascending)
     order_index = Column(Integer, nullable=False, default=0, server_default="0", index=True)
+    #: the folder of the unified "Записи" tree this page lives in (NULL = root)
+    folder_id = Column(
+        Integer, ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # UPLOADED | RECOGNIZED | EDITING | CONFIRMED
     status = Column(String(32), nullable=False, default="UPLOADED", index=True)
     width = Column(Integer, nullable=True)
@@ -618,6 +760,7 @@ class HTRPage(Base):
     prediction_wer = Column(Float, nullable=True)
 
     author = relationship("HTRAuthor", back_populates="pages")
+    folder = relationship("Folder", foreign_keys=[folder_id])
     lines = relationship(
         "HTRLine",
         back_populates="page",

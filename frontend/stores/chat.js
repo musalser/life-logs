@@ -7,6 +7,10 @@ export const useChatStore = defineStore('chat', () => {
   const tone = ref('critic')
   const loading = ref(false)
   const error = ref(null)
+  // RAG (spec 11.3): searching the archive is on by default, and the chosen
+  // object narrows the search to one person's sources (own sources always stay)
+  const ragEnabled = ref(true)
+  const subjectEntityId = ref(null)
 
   const createMessageId = () =>
     typeof crypto !== 'undefined' && crypto.randomUUID
@@ -42,7 +46,10 @@ export const useChatStore = defineStore('chat', () => {
             id: `entry-${entry.id}-assistant`,
             role: 'assistant',
             text: entry.reply,
-            timestamp: entry.created_at
+            timestamp: entry.created_at,
+            // источники сохраняются вместе с ответом: старые ответы тоже
+            // должны уметь показать, откуда они взялись
+            sources: parseSources(entry.context_json)
           })
         }
       })
@@ -80,7 +87,13 @@ export const useChatStore = defineStore('chat', () => {
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ message: trimmed, tone: tone.value, stream: true })
+        body: JSON.stringify({
+          message: trimmed,
+          tone: tone.value,
+          stream: true,
+          rag: ragEnabled.value,
+          subject_entity_id: subjectEntityId.value
+        })
       })
 
       if (!response.ok) throw new Error('Не удалось получить ответ дневника')
@@ -113,6 +126,9 @@ export const useChatStore = defineStore('chat', () => {
         if (!received.trim()) finalMsg.text = 'Ответ пустой'
         finalMsg.streaming = false
         finalMsg.timestamp = new Date().toISOString()
+        // стрим не несёт источников: они лежат в записи истории, поэтому
+        // после завершения забираем последнюю и показываем, на что опирались
+        finalMsg.sources = await fetchLastSources()
       }
     } catch (err) {
       error.value = err.message ?? 'Сервис временно недоступен'
@@ -127,9 +143,42 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  /** Chunks an answer was built from, as stored in the entry. */
+  function parseSources(contextJson) {
+    if (!contextJson) return []
+    try {
+      const parsed = typeof contextJson === 'string' ? JSON.parse(contextJson) : contextJson
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  async function fetchLastSources() {
+    try {
+      const response = await authFetch(apiBaseUrl, `${apiBaseUrl}/chat/history?limit=1`)
+      if (!response.ok) return []
+      const entries = await response.json()
+      return parseSources(entries.at(-1)?.context_json)
+    } catch {
+      return []
+    }
+  }
+
   function resetChat() {
     messages.value = []
   }
 
-  return { messages, tone, loading, error, clearError, loadHistory, sendMessage, resetChat }
+  return {
+    messages,
+    tone,
+    loading,
+    error,
+    ragEnabled,
+    subjectEntityId,
+    clearError,
+    loadHistory,
+    sendMessage,
+    resetChat
+  }
 })

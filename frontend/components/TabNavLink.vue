@@ -22,7 +22,7 @@
         <template v-if="glyph === 'chat'">
           <path d="M4.5 4h15a1.5 1.5 0 011.5 1.5v10A1.5 1.5 0 0119.5 17H9.6L4 21.2V5.5A1.5 1.5 0 015.5 4z" />
         </template>
-        <template v-else-if="glyph === 'diary'">
+        <template v-else-if="glyph === 'diary' || glyph === 'library'">
           <path d="M12 6.9C9.7 5.2 6.1 4.9 3.8 5.7V18.3c2.3-.8 5.9-.5 8.2 1.2 2.3-1.7 5.9-2 8.2-1.2V5.7c-2.3-.8-5.9-.5-8.2 1.2z" />
           <path d="M11.4 8.1h1.2v11.4h-1.2z" fill="#07070b" />
         </template>
