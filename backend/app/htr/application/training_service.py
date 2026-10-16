@@ -72,6 +72,17 @@ def author_training_in_progress(author_id: int) -> bool:
     return True
 
 
+def any_training_in_progress() -> bool:
+    """Is any author's model being trained in this process right now?
+
+    Background recognition waits for it: both want the GPU, and nobody is
+    looking at the pages the queue would read.
+    """
+    with _AUTHOR_LOCKS_GUARD:
+        author_ids = list(_AUTHOR_LOCKS)
+    return any(author_training_in_progress(author_id) for author_id in author_ids)
+
+
 class HandwritingTrainingService:
     def __init__(
         self,

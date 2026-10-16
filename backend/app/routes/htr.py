@@ -7,15 +7,17 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..deps import get_current_user, get_db, get_knowledge_source_service
-from ..services.knowledge_source_service import KnowledgeSourceService
+from ..services.knowledge_source_service import KnowledgeSourceService, SourceError
+from ..services.library_service import LibraryError, LibraryService
 from ..schemas import PageKnowledgeLine, PageKnowledgeResponse
 from ..services.source_text import line_for_offset
-from ..htr import factory
+from ..htr import background, factory
 from ..htr.application.confidence import ConfidencePolicy
 from ..htr.application.page_service import HandwritingPageService
 from ..htr.application.training_service import HandwritingTrainingService
 from ..htr.domain.entities import (
     BoundingBox,
+    PageStatus,
     PageSummary,
     PageView,
     RecognitionResult,
@@ -25,6 +27,7 @@ from ..htr.domain.entities import (
 )
 from ..htr.domain.errors import (
     CorruptImageError,
+    CorruptPdfError,
     DuplicatePageError,
     HTRError,
     InvalidTranscriptionError,
@@ -32,6 +35,7 @@ from ..htr.domain.errors import (
     PageStateError,
     RecognitionError,
 )
+from ..htr.infrastructure.pdf import PdfRasterizer
 from ..htr.schemas import (
     WordAlternativeSchema,
     AuthorCreateRequest,
@@ -51,6 +55,7 @@ from ..htr.schemas import (
     PageResponse,
     PageSummaryResponse,
     PageUploadResponse,
+    PdfUploadResponse,
     RecognitionResultIn,
     SuggestionChangeSchema,
     SuggestionsResponse,
@@ -62,7 +67,7 @@ from ..models import (
     Entity,
     EntityMention,
     EntityRelation,
-    Event,
+    RelationSource,
     Fact,
     FactSource,
     HTRAuthor,
@@ -84,6 +89,10 @@ def get_page_service(db: Session = Depends(get_db)) -> HandwritingPageService:
 
 def get_training_service(db: Session = Depends(get_db)) -> HandwritingTrainingService:
     return factory.build_training_service(db)
+
+
+def get_pdf_rasterizer() -> PdfRasterizer:
+    return factory.build_pdf_rasterizer()
 
 
 def _get_user(db: Session, username: str) -> User:
@@ -109,6 +118,24 @@ def _get_owned_page(page_service: HandwritingPageService, page_id: int, user: Us
     if page is None or page.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
     return page
+
+
+def _require_author_folder(db: Session, user: User, folder_id: int, author: HTRAuthor) -> None:
+    """Refuse an upload into a folder that is not this author's."""
+    try:
+        LibraryService(db).folder_for_upload(user, folder_id, author.entity_id)
+    except LibraryError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+def _pdf_page_names(pdf_name: str, number: int) -> tuple[str, str]:
+    """Storage name and client path of page ``number`` (1-based) of ``pdf_name``.
+
+    The path names the PDF as the page's source directory: it keeps the pages of
+    two same-named PDFs apart and makes re-importing one PDF a duplicate. The
+    base name of that path is what the sidebar shows.
+    """
+    return f"page-{number:04d}.png", f"{pdf_name}/Стр. {number}.png"
 
 
 def _author_response(db: Session, author: HTRAuthor) -> AuthorResponse:
@@ -279,12 +306,15 @@ async def upload_page(
     author_id: int,
     file: UploadFile = File(...),
     source_path: str | None = Form(default=None),
+    folder_id: int | None = Form(default=None),
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
 ):
     user = _get_user(db, username)
-    _get_author(db, author_id, user)
+    author = _get_author(db, author_id, user)
+    if folder_id is not None:
+        _require_author_folder(db, user, folder_id, author)
     content = await file.read()
     try:
         page = page_service.upload_page(
@@ -293,12 +323,129 @@ async def upload_page(
             file.filename or "page.png",
             content,
             source_path=source_path,
+            folder_id=folder_id,
         )
     except CorruptImageError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except DuplicatePageError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    background.enqueue_pages([page.id])
     return PageUploadResponse(page_id=page.id, status=page.status.value)
+
+
+@router.post(
+    "/authors/{author_id}/pdf",
+    response_model=PdfUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_pdf(
+    author_id: int,
+    file: UploadFile = File(...),
+    parent_folder_id: int | None = Form(default=None),
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+    rasterizer: PdfRasterizer = Depends(get_pdf_rasterizer),
+):
+    """Every page of the PDF becomes a page of the author, in one folder.
+
+    The folder is named after the file (without the extension) and is reused
+    when it already exists, so importing the same PDF again continues that
+    folder instead of piling up «Дневник (2)». The import is all-or-nothing: it
+    is refused while any of its pages is already in the corpus, and a PDF that
+    fails halfway leaves neither pages nor an empty folder behind.
+    """
+    user = _get_user(db, username)
+    author = _get_author(db, author_id, user)
+    # a folder belongs to an author *object*; an author that predates the
+    # binding gets one here, exactly as creating an author does
+    KnowledgeSourceService(db).ensure_author_entity(author)
+    db.commit()
+    if parent_folder_id is not None:
+        _require_author_folder(db, user, parent_folder_id, author)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Пустой файл")
+    pdf_name = Path(file.filename or "document.pdf").name
+    folder_name = Path(pdf_name).stem.strip() or "PDF"
+    try:
+        page_count = rasterizer.page_count(content)
+    except CorruptPdfError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    if page_count == 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="В PDF нет страниц")
+    if page_count > settings.htr_pdf_max_pages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"В PDF {page_count} страниц — это больше предела "
+                f"{settings.htr_pdf_max_pages}. Разделите файл и загрузите частями."
+            ),
+        )
+    # the whole file is refused when one of its pages is already here: a half
+    # import would look like a successful one in the tree
+    duplicates = [
+        number
+        for number in range(1, page_count + 1)
+        if page_service.find_page_by_upload_name(author_id, *_pdf_page_names(pdf_name, number))
+    ]
+    if duplicates:
+        shown = ", ".join(str(number) for number in duplicates[:5])
+        more = "" if len(duplicates) <= 5 else f" и ещё {len(duplicates) - 5}"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Страницы этого PDF уже загружены (стр. {shown}{more}). "
+                "Удалите их, если нужно загрузить файл заново."
+            ),
+        )
+    try:
+        folder, folder_created = LibraryService(db).ensure_folder(
+            user, folder_name, author.entity_id, parent_folder_id
+        )
+    except LibraryError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    created: list[int] = []
+    try:
+        for number, image in enumerate(rasterizer.render_pages(content), start=1):
+            filename, source_path = _pdf_page_names(pdf_name, number)
+            page = page_service.upload_page(
+                user.id,
+                author_id,
+                filename,
+                image,
+                source_path=source_path,
+                folder_id=folder.id,
+            )
+            created.append(page.id)
+    except (CorruptPdfError, CorruptImageError, DuplicatePageError) as exc:
+        # all-or-nothing: a page that failed must not leave its predecessors
+        # behind — nor an empty folder the import itself created
+        for page_id in created:
+            page_service.delete_page(page_id)
+        if folder_created:
+            try:
+                LibraryService(db).delete_folder(user, folder.id)
+            except LibraryError:  # pragma: no cover - nothing else is in it
+                logger.warning("Could not remove the folder of a failed PDF import: %s", folder.id)
+        code = (
+            status.HTTP_409_CONFLICT
+            if isinstance(exc, DuplicatePageError)
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=code, detail=str(exc))
+    logger.info(
+        "PDF imported: user_id=%s author_id=%s folder_id=%s pages=%s file_name=%s",
+        user.id, author_id, folder.id, len(created), pdf_name,
+    )
+    background.enqueue_pages(created)
+    return PdfUploadResponse(
+        folder_id=folder.id,
+        folder_name=folder.name,
+        page_count=len(created),
+        page_ids=created,
+    )
 
 
 def _to_page_summary(summary: PageSummary) -> PageSummaryResponse:
@@ -522,6 +669,7 @@ def import_recognition_result(
 def recognize_page(
     page_id: int,
     force: bool = False,
+    only_uploaded: bool = False,
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
@@ -535,11 +683,23 @@ def recognize_page(
     ``force=true`` re-segments a page that is already in EDITING (for example
     after the segmenter changed); it replaces the prediction and drops that
     page's corrections.
+
+    The background queue (``htr/background.py``) may be reading the same page:
+    the route then waits for it and returns its result instead of a second run.
+    ``only_uploaded=true`` (the client's "this page has no markup yet") also
+    returns the page as it is when it was recognized in the meantime.
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
     try:
-        page = page_service.recognize_page(page_id, force=force)
+        with background.get_recognition_queue().page_lock(page_id) as queue_had_it:
+            if queue_had_it or only_uploaded:
+                # the queue committed in its own session: read the page anew
+                db.expire_all()
+                current = page_service.get_page(page_id)
+                if current.status != PageStatus.UPLOADED and not force:
+                    return _to_page_response(current)
+            page = page_service.recognize_page(page_id, force=force)
     except RecognitionError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
@@ -547,6 +707,27 @@ def recognize_page(
     except PageStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return _to_page_response(page)
+
+
+@router.get(
+    "/pages/{page_id}/recognition-status",
+    summary="Is the page waiting for, or in, background recognition?",
+)
+def recognition_status(
+    page_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+):
+    """``queued`` / ``running`` / ``idle`` plus the page status (cheap to poll)."""
+    user = _get_user(db, username)
+    page = _get_owned_page(page_service, page_id, user)
+    state = (
+        background.get_recognition_queue().state(page_id)
+        if background.background_enabled()
+        else background.IDLE
+    )
+    return {"page_id": page_id, "status": page.status.value, "background": state}
 
 
 @router.post(
@@ -730,17 +911,27 @@ def delete_page(
     db: Session = Depends(get_db),
     username: str = Depends(get_current_user),
     page_service: HandwritingPageService = Depends(get_page_service),
+    source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
 ):
-    """Removes the page, its lines/words and its image/crops.
+    """Removes the page, its lines/words, its image/crops and what was read from it.
 
     Because every fine-tune rebuilds the corpus from the confirmed pages that
     exist at that moment, deleting a bad page keeps it out of all later
     trainings. Model versions that were trained before the deletion keep their
     dataset hash and are not touched.
+
+    Знания уходят вместе со страницей — так же, как у дневниковой записи:
+    ``KnowledgeSource.ref_id`` не имеет внешнего ключа, и без этой уборки
+    упоминания, факты и рёбра оставались бы сиротами и продолжали показываться
+    в «Знаниях». Страницу удаляем первой: если уборка не удастся, останется
+    сирота (её можно вычистить), а не потерянные знания живой страницы.
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
     page_service.delete_page(page_id)
+    source = source_service.get("htr", page_id, user.id)
+    if source is not None:
+        source_service.delete_source(source)
     return None
 
 
@@ -925,11 +1116,29 @@ def get_page_knowledge(
     for mention in db.query(EntityMention).filter(EntityMention.source_id == source.id).all():
         entity = mention.entity.canonical_name if mention.entity else "?"
         add("mention", mention.id, entity, mention.mention_text, mention.start_offset, mention.confidence)
-    for event in db.query(Event).filter(Event.source_id == source.id).all():
-        add("event", event.id, event.title, event.source_text, event.start_offset, event.importance)
+    # Ребро может быть подтверждено несколькими источниками, поэтому берём и его
+    # собственный источник, и строки подтверждений: иначе страница не показала бы
+    # связь, которую она подтверждает, но не «владеет» ею
+    edge_occurrences: dict[int, tuple[EntityRelation, str | None, int | None, float | None]] = {}
     for edge in db.query(EntityRelation).filter(EntityRelation.source_id == source.id).all():
+        edge_occurrences.setdefault(edge.id, (edge, edge.evidence_text, edge.start_offset, edge.confidence))
+    for confirmation in (
+        db.query(RelationSource).filter(RelationSource.source_id == source.id).all()
+    ):
+        if confirmation.relation is None:
+            continue
+        edge_occurrences.setdefault(
+            confirmation.relation_id,
+            (
+                confirmation.relation,
+                confirmation.evidence_text,
+                confirmation.start_offset,
+                confirmation.confidence,
+            ),
+        )
+    for edge, quote_text, offset, confidence in edge_occurrences.values():
         person = edge.to_entity.canonical_name if edge.to_entity else "?"
-        add("relation", edge.id, f"{person} — {edge.relation_type}", edge.evidence_text, edge.start_offset, edge.confidence)
+        add("relation", edge.id, f"{person} — {edge.relation_type}", quote_text, offset, confidence)
 
     items.sort(key=lambda item: (item.line_order is None, item.line_order or 0, item.kind))
     return PageKnowledgeResponse(
@@ -992,9 +1201,10 @@ def confirm_page(
     The response also lists the words the confirmation added to the author's own
     vocabulary, because that is the moment those words stop being unknown.
 
-    The confirmed text also becomes a knowledge source and is extracted (spec 6.3):
-    sync mode runs the pipeline before the response, async mode queues it and the
-    UI polls ``GET /knowledge/sources/htr/{page_id}/status``.
+    The confirmed text becomes a knowledge source here, but it is **not**
+    extracted: extraction is an LLM run of its own, and confirming a batch of
+    pages must not pay for one per page. The source waits as ``pending`` until
+    the user asks for it (``POST /htr/pages/{page_id}/knowledge/extract``).
     """
     user = _get_user(db, username)
     _get_owned_page(page_service, page_id, user)
@@ -1009,15 +1219,49 @@ def confirm_page(
     response.author_words_learned = list(report.learned_words)
 
     try:
-        source, created, changed = source_service.refresh_from_htr_page(report.page)
-        extraction = source_service.request_extraction_sync(source)
+        _, created, changed = source_service.refresh_from_htr_page(report.page)
         logger.info(
-            "Knowledge source for page %s: created=%s changed=%s %s",
-            page_id, created, changed, extraction,
+            "Knowledge source for page %s: created=%s changed=%s (extraction on request)",
+            page_id, created, changed,
         )
     except Exception:
-        logger.exception("Knowledge extraction could not be started for page %s", page_id)
+        logger.exception("Knowledge source could not be refreshed for page %s", page_id)
     return response
+
+
+@router.post(
+    "/pages/{page_id}/knowledge/extract",
+    summary="Extract knowledge from a confirmed page (separate from confirming it)",
+)
+def extract_page_knowledge(
+    page_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+    page_service: HandwritingPageService = Depends(get_page_service),
+    source_service: KnowledgeSourceService = Depends(get_knowledge_source_service),
+):
+    """Runs the knowledge pipeline over the confirmed text of the page.
+
+    Only confirmed text is ground truth, so an unconfirmed page is refused
+    (``409``). The source is refreshed from the current lines first (it is
+    created if the page was confirmed before sources existed), so a re-run
+    always reads what the page says now. Sync mode returns when the pipeline has
+    finished, async mode queues it and the UI polls
+    ``GET /knowledge/sources/htr/{page_id}/status``.
+    """
+    user = _get_user(db, username)
+    page = _get_owned_page(page_service, page_id, user)
+    if page.status != PageStatus.CONFIRMED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Знания извлекаются только из подтверждённой страницы",
+        )
+    record = db.query(HTRPage).filter(HTRPage.id == page_id).first()
+    try:
+        source, _, _ = source_service.refresh_from_htr_page(record)
+    except SourceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return source_service.request_extraction_sync(source)
 
 
 # ---------------------------------------------------------------------------

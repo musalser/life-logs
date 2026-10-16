@@ -27,6 +27,26 @@ class Settings(BaseSettings):
     # the price of a slow boot; off by default on developer machines.
     llm_warmup_enabled: bool = False
 
+    # Model for knowledge extraction and analytics (the chat stays on Ollama):
+    # ollama | anthropic | openai | deepseek. See app/adapters/cloud_llm.py.
+    knowledge_llm_provider: str = "ollama"
+    # Empty: the provider default (llm_model for ollama, claude-opus-5-5 for
+    # anthropic, deepseek-chat for deepseek). OpenAI has no default — set it.
+    knowledge_llm_model: str = ""
+    # Keys may also come from the SDK's own env vars (ANTHROPIC_API_KEY,
+    # OPENAI_API_KEY); Claude also picks up an `ant auth login` profile.
+    anthropic_api_key: str | None = None
+    # Claude thinking depth for extraction: low | medium | high | xhigh | max
+    anthropic_effort: str = "medium"
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    # Proxy for the cloud APIs only (http://user:pass@host:port). Ollama on
+    # the Windows host is always reached directly, so no NO_PROXY juggling.
+    llm_api_proxy: str | None = None
+    llm_api_timeout_s: float = 300.0
+
     # Embeddings: deduplication of extracted knowledge and RAG over the archive.
     # The weights are a Hugging Face SentenceTransformer, not an Ollama model:
     # google/embeddinggemma-2 (740m: a 270m text backbone plus loadable vision
@@ -78,6 +98,9 @@ class Settings(BaseSettings):
     # it filters noise without dropping a possible duplicate.
     knowledge_dedup_candidates: int = 5
     knowledge_dedup_min_similarity: float = 0.88
+    # Событие — факт с важностью не ниже порога (модель ставит рутине 0,
+    # заметному ~0.5): по нему строится блок «События» и пометка в аналитике.
+    knowledge_event_min_importance: float = 0.4
 
     # RAG in the chat.
     rag_enabled_by_default: bool = True
@@ -120,6 +143,14 @@ class Settings(BaseSettings):
     htr_default_model_path: str = "htr_storage/models/default/ppocrv6_medium.safetensors"
     htr_device: str = "cuda:0"
 
+    # PDF import: one scanned PDF becomes one page per sheet, all of them in a
+    # folder named after the file. 300 dpi is the resolution OCR/HTR expects
+    # (below ~150 the pen strokes start to merge); the ceiling is what keeps an
+    # accidentally picked 2000-page scan from filling the disk inside one HTTP
+    # request — the import is synchronous, like recognition and training.
+    htr_pdf_dpi: int = 300
+    htr_pdf_max_pages: int = 500
+
     # HTR decoding: how the CTC matrix becomes text.
     # 'greedy' = kraken's own decoder; 'beam' = prefix beam search with a
     # character n-gram language model (and a soft lexicon bonus), which fixes
@@ -151,6 +182,17 @@ class Settings(BaseSettings):
     htr_beam_alpha: float = 0.2
     htr_beam_beta: float = 0.0
     htr_beam_word_bonus: float = 0.8
+    # Characters below this probability are not expanded by the beam (the best
+    # character of a frame always is): only ~1.9 of 1623 classes per frame reach
+    # 1e-4, so the rest of the top-k only cost time. Measured on 123 lines of
+    # five pages, single process, author model + vocabulary:
+    #   min_prob   time    best reading changed   N-best (word variants) changed
+    #   0          100 s   -                      -
+    #   1e-5        33 s   0 lines                9 lines
+    #   1e-4        16 s   0 lines                46 lines
+    # 1e-5 keeps the word alternatives of the editor almost intact; with the
+    # worker processes the difference to 1e-4 is ~0.5 s per page. 0 = off.
+    htr_beam_min_prob: float = 0.00001
     # Beam decoding needs a language model with real running text behind it;
     # below this many characters of running text (author pages plus --extra-text,
     # *not* bare word forms) the model cannot judge word boundaries and greedy
@@ -223,6 +265,16 @@ class Settings(BaseSettings):
     htr_segmentation_rows_threshold: float = 0.4
     htr_segmentation_maxcolseps: int = 2
     htr_segmentation_no_hlines: bool = True
+    # Worker processes for the CPU-bound parts of recognition that hold the GIL
+    # (line outlines, beam search). 0 = one per CPU core, 1 = no worker processes.
+    htr_cpu_workers: int = 0
+    # Recognize uploaded pages in the background (after an upload / PDF import,
+    # and the pages still waiting when the backend starts), so a page is ready
+    # by the time it is opened. Pauses while a model is being trained.
+    htr_background_recognition: bool = True
+    # Pages recognized at the same time in the background: with 2, one page is
+    # segmented on the CPU while the other is recognized on the GPU.
+    htr_background_workers: int = 2
 
     # LLM proposals for the raw recognition (same Ollama instance as the chat).
     # A proposal never overwrites the transcription: it is stored separately and

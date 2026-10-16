@@ -177,6 +177,17 @@ class HandwritingPageService:
 
     # ------------------------------------------------------------------
 
+    def find_page_by_upload_name(
+        self, author_id: int, filename: str, source_path: str | None = None
+    ) -> PageView | None:
+        """The page this upload name would duplicate, if any.
+
+        The same rule :meth:`upload_page` enforces, exposed so a bulk import (a
+        PDF) can refuse a whole file *before* the first sheet is written.
+        """
+        file_name, original_path = split_page_path(source_path or filename)
+        return self.page_repository.find_page_by_name(author_id, file_name, original_path)
+
     def upload_page(
         self,
         user_id: int,
@@ -184,6 +195,7 @@ class HandwritingPageService:
         filename: str,
         content: bytes,
         source_path: str | None = None,
+        folder_id: int | None = None,
     ) -> PageView:
         width, height = self.image_store.probe_image(content)
         file_name, original_path = split_page_path(source_path or filename)
@@ -206,6 +218,7 @@ class HandwritingPageService:
             height=height,
             file_name=file_name,
             source_path=original_path,
+            folder_id=folder_id,
         )
         logger.info(
             "HTR page uploaded: user_id=%s author_id=%s page_id=%s file_name=%s",

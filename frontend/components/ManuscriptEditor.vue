@@ -260,7 +260,17 @@
             :disabled="!canRecognize || recognizing"
             @click="recognize"
           >
-            {{ recognizing ? 'Распознавание…' : canRecognize && page?.status !== 'UPLOADED' ? 'Распознать заново' : 'Распознать' }}
+            {{
+              recognizing
+                ? 'Распознавание…'
+                : page?.status === 'UPLOADED' && backgroundState === 'running'
+                  ? 'Распознаётся в фоне…'
+                  : page?.status === 'UPLOADED' && backgroundState === 'queued'
+                    ? 'В очереди на распознавание'
+                    : canRecognize && page?.status !== 'UPLOADED'
+                      ? 'Распознать заново'
+                      : 'Распознать'
+            }}
           </button>
           <button
             v-if="page?.lines.some(hasSuggestion)"
@@ -299,6 +309,29 @@
                     : 'Подтвердить страницу'
             }}
           </button>
+          <!--
+            Knowledge is extracted on request, not by the confirmation: the
+            extraction is an LLM run of its own, and confirming a batch of
+            pages must not pay for one per page.
+          -->
+          <button
+            v-if="readOnly"
+            type="button"
+            class="app-ghost"
+            :disabled="extractStarting || statusOf(page.page_id)?.status === 'running'"
+            :title="statusOf(page.page_id)?.status === 'done'
+              ? 'Извлечь знания из этой страницы заново (прежние знания страницы будут заменены)'
+              : 'Извлечь знания (людей, факты, события, связи) из подтверждённого текста страницы'"
+            @click="extractPageKnowledge()"
+          >
+            {{
+              extractStarting || statusOf(page.page_id)?.status === 'running'
+                ? 'Извлечение…'
+                : statusOf(page.page_id)?.status === 'done'
+                  ? 'Извлечь знания заново'
+                  : 'Извлечь знания'
+            }}
+          </button>
         </div>
 
         <div class="mb-2 flex items-center justify-between gap-2">
@@ -315,7 +348,7 @@
               Knowledge of this page: the badge answers «идёт / готово / ошибка»,
               and the switch paints the lines that taught something.
             -->
-            <template v-if="page && statusOf(page.page_id)">
+            <template v-if="page && statusOf(page.page_id)?.status">
               <span
                 class="rounded-full px-2 py-0.5 text-[10px] font-semibold"
                 :class="sourceStatusTone(statusOf(page.page_id).status)"
@@ -323,19 +356,6 @@
               >
                 {{ sourceStatusLabel(statusOf(page.page_id).status) }}
               </span>
-              <button
-                v-if="statusOf(page.page_id).status === 'failed'"
-                type="button"
-                class="page-icon"
-                :disabled="extractStarting"
-                title="Повторить извлечение знаний"
-                @click.stop="extractPageKnowledge()"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="h-4 w-4">
-                  <path d="M4 12a8 8 0 1 1 2.3 5.7"></path>
-                  <path d="M4 20v-5h5"></path>
-                </svg>
-              </button>
             </template>
             <button
               v-if="page && pageKnowledge?.items?.length"
@@ -588,7 +608,7 @@
 
       <p v-if="pageKnowledgeLoading" class="text-sm text-app-muted">Загрузка знаний…</p>
       <p v-else-if="!pageKnowledge?.items?.length" class="text-sm text-app-muted">
-        Эта страница пока не дала знаний. Подтвердите её — извлечение запустится.
+        Эта страница пока не дала знаний. Подтвердите её и нажмите «Извлечь знания».
       </p>
       <div v-else class="flex flex-wrap gap-2">
         <button
@@ -988,6 +1008,9 @@ const pageLoading = ref(false)
 const imageLoading = ref(false)
 const uploading = ref(false)
 const recognizing = ref(false)
+/** Background recognition of the open page: 'queued' | 'running' | 'idle' | null. */
+const backgroundState = ref(null)
+let backgroundTimer = null
 const confirming = ref(false)
 //: the confirmation dialog: what the page would teach the dictionary before the
 //: write. Null while it is closed.
@@ -1383,7 +1406,9 @@ const loadSourceStatusQuiet = async (pageId) => {
     if (!response.ok) return null
     const payload = await response.json()
     rememberStatus(pageId, payload)
-    if (!['done', 'failed'].includes(payload.status)) watchExtraction(pageId)
+    // only a running extraction is worth watching: a pending source waits for
+    // the «Извлечь знания» button and would only be polled until the timeout
+    if (payload.status === 'running') watchExtraction(pageId)
     return payload
   } catch {
     return null
@@ -1439,22 +1464,36 @@ const scrollToKnowledgeLine = (lineId) => {
   }
 }
 
-/** Manual re-run of the extraction when it failed or the text changed. */
+/**
+ * Extract the knowledge of a confirmed page — its own button, never a side
+ * effect of the confirmation. In sync mode the request returns when the
+ * pipeline has finished; in async mode it is queued and polled.
+ */
 const extractPageKnowledge = async (pageId = null) => {
   const target = pageId || page.value?.page_id
   if (!target || extractStarting.value) return
   extractStarting.value = true
   clearMessages()
+  rememberStatus(target, { ...(sourceStatuses[target] || {}), status: 'running', error: null })
   try {
-    const response = await api(`/knowledge/sources/htr/${target}/extract`, { method: 'POST' })
+    const response = await api(`/htr/pages/${target}/knowledge/extract`, { method: 'POST' })
     if (!response.ok) {
       const detail = await response.json().catch(() => null)
-      throw new Error(detail?.detail || 'Не удалось запустить извлечение')
+      throw new Error(detail?.detail || 'Не удалось извлечь знания')
     }
-    rememberStatus(target, await response.json())
-    watchExtraction(target)
-    notice.value = 'Извлечение знаний запущено.'
+    const payload = await response.json()
+    if (page.value?.page_id === target) await loadPageKnowledge()
+    // the knowledge read refreshes only the status field; the run's own
+    // payload (status, error, counters) is the one to show
+    rememberStatus(target, payload)
+    if (payload.status === 'running' || payload.status === 'pending') {
+      watchExtraction(target)
+      notice.value = 'Извлечение знаний запущено.'
+    } else if (payload.status === 'done') {
+      notice.value = 'Знания из страницы извлечены.'
+    }
   } catch (err) {
+    await loadSourceStatusQuiet(target)
     error.value = err.message || 'Ошибка запуска извлечения'
   } finally {
     extractStarting.value = false
@@ -1508,8 +1547,11 @@ const bindAuthorTo = async (entityId) => {
     authors.value = authors.value.map((a) => (a.id === updated.id ? updated : a))
     notice.value = `Автор «${updated.name}» связан с объектом «${updated.entity_name}».`
     closeAuthorBinding()
-    // теперь конвейеру есть к кому отнести связи: повторяем извлечение
-    if (page.value) await extractPageKnowledge(page.value.page_id)
+    // теперь конвейеру есть к кому отнести связи: повторяем извлечение, но
+    // только там, где оно уже было, — запуск с нуля остаётся за кнопкой
+    // «Извлечь знания» (привязку предлагают сразу после подтверждения)
+    const extracted = ['done', 'failed'].includes(statusOf(page.value?.page_id)?.status)
+    if (page.value && extracted) await extractPageKnowledge(page.value.page_id)
   } catch (err) {
     authorBindingError.value = err.message || 'Ошибка привязки'
   } finally {
@@ -1593,7 +1635,46 @@ const loadPages = async () => {
   emit('changed')
 }
 
+/**
+ * An uploaded page is read by the background queue: watch it and show the
+ * result as soon as it is there, instead of making the user press the button.
+ * The poll is cheap (no lines) and stops once the page is recognized, the
+ * queue has let go of it, or another page is opened.
+ */
+const stopBackgroundWatch = () => {
+  if (backgroundTimer) clearTimeout(backgroundTimer)
+  backgroundTimer = null
+  backgroundState.value = null
+}
+
+const watchBackgroundRecognition = (pageId) => {
+  stopBackgroundWatch()
+  const tick = async () => {
+    backgroundTimer = null
+    if (page.value?.page_id !== pageId || recognizing.value) return
+    try {
+      const response = await api(`/htr/pages/${pageId}/recognition-status`)
+      if (!response.ok) return
+      const payload = await response.json()
+      if (page.value?.page_id !== pageId) return
+      if (payload.status !== 'UPLOADED') {
+        backgroundState.value = null
+        await openPage(pageId)
+        await loadPages(false)
+        return
+      }
+      backgroundState.value = payload.background
+      if (payload.background === 'idle') return
+    } catch {
+      // the network blinked — try again on the next tick
+    }
+    backgroundTimer = setTimeout(tick, 3000)
+  }
+  tick()
+}
+
 const openPage = async (pageId) => {
+  stopBackgroundWatch()
   pageLoading.value = true
   clearMessages()
   imageError.value = ''
@@ -1615,6 +1696,7 @@ const openPage = async (pageId) => {
     await nextTick()
     growTextareas()
     if (!sourceStatuses[pageId]) await loadSourceStatusQuiet(pageId)
+    if (page.value?.status === 'UPLOADED') watchBackgroundRecognition(pageId)
   } catch (err) {
     error.value = err.message || 'Ошибка загрузки страницы'
   } finally {
@@ -2133,11 +2215,15 @@ const recognize = async () => {
     if (!confirm(warned)) return
     await flushPendingSaves()
   }
+  stopBackgroundWatch()
   recognizing.value = true
   clearMessages()
   training.value = null
   try {
-    const url = `/htr/pages/${page.value.page_id}/recognize${force ? '?force=true' : ''}`
+    // a page without markup may be finished by the background queue while this
+    // request waits; `only_uploaded` then returns that result instead of a rerun
+    const query = force ? '?force=true' : page.value.status === 'UPLOADED' ? '?only_uploaded=true' : ''
+    const url = `/htr/pages/${page.value.page_id}/recognize${query}`
     const response = await api(url, { method: 'POST' })
     if (!response.ok) {
       const detail = await response.json().catch(() => null)
@@ -2393,10 +2479,10 @@ const applyConfirmation = async () => {
     resetDrafts()
     await loadPages(false)
     confirmPreview.value = null
-    notice.value = 'Страница подтверждена и вошла в обучающую выборку.'
-    // подтверждение запускает извлечение знаний: показываем его ход
-    await loadPageKnowledge()
-    watchExtraction(page.value.page_id)
+    notice.value = 'Страница подтверждена и вошла в обучающую выборку. Знания из неё извлекаются отдельной кнопкой.'
+    // the confirmation only prepares the knowledge source; extracting it is
+    // the «Извлечь знания» button
+    await loadSourceStatusQuiet(page.value.page_id)
     if (authorNeedsBinding.value) await openAuthorBinding()
   } catch (err) {
     error.value = err.message || 'Ошибка подтверждения'
@@ -3370,6 +3456,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopAllPolling()
+  stopBackgroundWatch()
   releaseImage()
 })
 

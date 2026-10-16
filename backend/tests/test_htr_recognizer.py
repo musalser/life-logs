@@ -900,3 +900,34 @@ def test_words_from_record_still_reports_a_line_without_any_cut():
     record.cuts = record._cuts  # lengths disagree: no geometry is claimed
 
     assert words_from_record(record, "0") == []
+
+
+def test_ink_rows_never_glue_two_slanted_lines_into_one():
+    """A band is horizontal, a phone photo's lines are not (pages 98, 117, 132).
+
+    Two full-width lines that drop across the page can both overlap one band
+    most; they stand above each other and must stay two lines.
+    """
+    lines = [
+        FakeBaselineLine("a", [(260, 4227), (2071, 4165)]),
+        FakeBaselineLine("b", [(380, 4410), (3260, 4261)]),
+        FakeBaselineLine("c", [(276, 4572), (3201, 4436)]),
+        FakeBaselineLine("d", [(270, 4700), (3200, 4600)]),
+    ]
+
+    merged = merge_collinear_lines(lines, bands=[(4150, 4450)])
+
+    assert len(merged) == 4
+
+
+def test_an_insertion_written_above_a_line_is_not_glued_into_it():
+    line = FakeBaselineLine("line", [(466, 696), (2347, 724)])
+    insertion = FakeBaselineLine("above", [(2450, 665), (3082, 654)])
+    continuation = FakeBaselineLine("rest", [(2378, 729), (3330, 742)])
+    others = [FakeBaselineLine(str(i), [(400, 900 + 200 * i), (3300, 900 + 200 * i)]) for i in range(3)]
+
+    merged = merge_collinear_lines([line, insertion, continuation, *others])
+
+    spans = sorted((m.baseline[0][0], m.baseline[-1][0]) for m in merged)
+    assert (2450, 3082) in spans      # the insertion keeps its own line
+    assert (466, 3330) in spans       # the line still continues to its end

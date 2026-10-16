@@ -26,6 +26,12 @@ async def lifespan(app: FastAPI):
     # weights at startup saves the first request a few seconds
     await get_embedding_service().warmup()
     logger.info("Application warmup completed")
+    if settings.htr_background_recognition:
+        # pages uploaded before a restart are still waiting; the queue reads
+        # them in worker threads, so startup does not wait for any of it
+        from app.htr.background import get_recognition_queue
+
+        get_recognition_queue().enqueue_pending()
     yield
     
 app = FastAPI(title="Live Journal AI", lifespan=lifespan)

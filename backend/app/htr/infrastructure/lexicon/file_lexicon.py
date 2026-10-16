@@ -25,6 +25,17 @@ class FileLexicon:
     def __init__(self, path: str | Path, bloom: BloomFilter | None = None):
         self.path = str(path)
         self._bloom = bloom
+        #: set by :func:`load_file_lexicon`: the artifact can be re-read by path
+        self._from_file = False
+
+    def __reduce__(self):
+        # The beam search of a page runs in worker processes, and the decoder's
+        # vocabulary travels with every chunk of lines. A lexicon read from its
+        # artifact pickles to that path (each worker loads it once and caches
+        # it), instead of copying the ~6 MB filter into every chunk.
+        if self._from_file:
+            return (load_file_lexicon, (self.path,))
+        return (FileLexicon, (self.path, self._bloom))
 
     @property
     def is_available(self) -> bool:
@@ -65,6 +76,7 @@ def load_file_lexicon(path: str | Path) -> FileLexicon:
         return FileLexicon(target, None)
 
     lexicon = FileLexicon(target, bloom)
+    lexicon._from_file = True
     with _lock:
         for stale in [k for k in _loaded if k[0] == key[0] and k != key]:
             del _loaded[stale]

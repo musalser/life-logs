@@ -167,6 +167,7 @@ class SqlAlchemyPageRepository:
         height: int,
         file_name: str | None = None,
         source_path: str | None = None,
+        folder_id: int | None = None,
     ) -> PageView:
         # new pages go to the end of the author's list; the sidebar order is the
         # user's from then on, so upload order survives a multi-file upload
@@ -181,6 +182,7 @@ class SqlAlchemyPageRepository:
             file_path=file_path,
             file_name=file_name,
             source_path=source_path,
+            folder_id=folder_id,
             order_index=int(highest) + 1 if highest is not None else 0,
             status=PageStatus.UPLOADED.value,
             width=width,

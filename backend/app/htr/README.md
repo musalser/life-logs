@@ -38,8 +38,18 @@ of 45**, and every line/word carries a polygon that follows the handwriting.
 
 bLLA occasionally detaches the first word of a line into its own record, so the
 transcript gets a one-word row followed by the rest of the line. Before
-recognition the adapter glues such pieces back together
-(`merge_collinear_lines`), because merging afterwards would only hide the split.
+recognition the adapter glues such pieces back together, because merging
+afterwards would only hide the split.
+
+**The glue runs inside kraken** (`infrastructure/kraken/vectorize.py`), between
+vectorizing the baselines and drawing their outlines: the pieces are grouped
+(rules below), their baselines are joined left to right, and kraken's own
+polygonizer draws the outline of the *whole* line, with every other line as an
+obstacle. The earlier page-level repair gave a glued line the convex hull of its
+pieces — 16 points against the ~60–80 of a drawn outline, and on a curved line
+a hull swallows the ascenders of the neighbours. The hull remains only as the
+fallback when kraken refuses a joined baseline, and the page-level
+`merge_collinear_lines` only runs when kraken could not be hooked at all.
 
 The decision is geometric and **direction aware**: the vector between two pieces
 is projected onto the local baseline direction, and a merge requires
@@ -69,6 +79,39 @@ the position of its earliest piece.
 Measured on the development page: **36 → 32 lines**, `сейчас`/`успевал` are back
 inside their lines, word count unchanged (200 → 199). Disable the step with
 `htr_segmentation_merge_lines = false` if a page ever merges too eagerly.
+
+**Pieces that stand above each other are never one line.** Two pieces of one
+physical line stand side by side; pieces that overlap horizontally by more than
+half of the shorter one stand above each other — an insertion written over the
+line, the second half of a note squeezed under its end. Both steps respect this:
+
+* the geometric step joins the *best* pairs first (smallest step across the
+  line, then smallest gap along it) and refuses a join whose two groups are
+  stacked. Union-find alone glued an insertion over a line end *and* the line's
+  real continuation under it into one group (page 117);
+* the ink-row step keeps, per band, clusters of groups that stand side by side;
+  a group stacked against a cluster starts its own. A band is horizontal, a
+  phone photo's lines are not: lines that drop 100–150 px across the page made
+  two or three neighbouring full-width lines pick one band, and they were glued
+  into a single line that read as garbage. A mark narrower than the line pitch
+  (a "+", a dot) still joins the row whose span it sits in.
+
+Measured on 20 pages of the current corpus: 17 keep exactly their line structure,
+the three that changed (98, 117, 132) are exactly the ones with glued rows, and
+their text went from garbage to the written text — page 132's last line read
+«о ке и на а до по о я д по до поу так как покон пертом …» and now reads
+«из-за коровы и жел дороги.» / «Когда умерла бабушка, мы вскоре продали» /
+«корову, так как покосы перестали выделять».
+
+The *decision* which pieces belong together is taken in page coordinates — the
+pieces scaled exactly as kraken scales its output, the ink rows measured on the
+page image — so it is the decision the page-level repair made. Deciding in the
+network's coordinates looked equivalent (every threshold is relative to the line
+pitch) but is not: the direction of a baseline end comes from its last, often
+short, segment, and the network's rounding flipped a borderline case — on page
+178 the word «матери», written under the end of the first line as the second
+half of «(от другой / матери)», was glued into that line, which then read as
+garbage. Only the joining and the outline happen in the network's coordinates.
 
 ### The page's physical rows, from the ink
 
@@ -1166,13 +1209,93 @@ them instead of hiding them.
 | `htr_segmentation_engine` | `neural` (bLLA baselines) or `classical` (straight boxes) |
 | `htr_segmentation_merge_lines` | `true`: glue a detached first word back onto its line before recognition |
 | `htr_segmentation_maxcolseps` / `htr_segmentation_no_hlines` | classical segmenter knobs (ignored by the neural one) |
+| `htr_cpu_workers` | worker processes for line outlines and beam search (`0` = one per core, `1` = none) |
+| `htr_background_recognition` | recognize uploaded pages in the background (`true`) |
+| `htr_background_workers` | pages recognized at once in the background (`2`) |
 
-Recognition is CPU-bound by default: the diary page used during development
-(3472×4640) takes ≈2 minutes on CPU with the `medium` model, ≈0.9 s per line.
-On a working CUDA setup `htr_recognition_device=cuda:0` reduces that to
-seconds (the whole page — neural segmentation *and* recognition — took ≈50 s on
-an RTX 5060 Ti), but it then shares the GPU with training. With the neural
-segmenter the CPU path is noticeably slower, so set `cuda:0` when a GPU exists.
+Set `htr_recognition_device=cuda:0` when a GPU exists; it then shares the GPU
+with training. The GPU is, however, a small part of a page: see the next
+section.
+
+### Where a page's time goes, and how it was cut
+
+Profiled on a 30-line diary page (3472×4640, RTX 5060 Ti, 8 cores), the GPU was
+busy ~4 s of ~67 s and the process used 120 % CPU out of 800 %:
+
+| stage | before | after | how |
+| --- | --- | --- | --- |
+| bLLA forward pass (GPU) | <1 s | <1 s | — |
+| `skimage.filters.sato` on the heatmap | 9.1 s | 1.8 s | five scales in threads (scipy releases the GIL); σ = 1 truncated at 8 σ like the others — its tail is below float32 resolution, max \|difference\| = 0 |
+| `boundary_tracing` (baseline blobs, regions) | ≈7 s | <0.1 s | the same Moore walk on a flat byte mask instead of numpy arrays per pixel step — same array out, ~50× faster |
+| line outlines | 12.8 s | ≈3 s | worker processes (`kraken/parallel.py`); threads measured *slower* (24 s), the work holds the GIL |
+| recognition forward pass (GPU) | 3.9 s | 3.9 s | — |
+| beam search | 27–29 s | see below | candidate pruning + worker processes |
+
+**Identical output.** With merging off, the new vectorization returns the same
+baselines and outlines as kraken's own code on the three pages it was compared
+on (`==` on every point). The faster pieces are installed into kraken once
+(`vectorize.install`): `spred.vec_lines`, `segmentation.boundary_tracing` and
+the `sato` kraken's segmentation module sees — nothing else in the process.
+
+**Worker processes** are spawned (not forked: the parent has CUDA initialized),
+one per core by default (`htr_cpu_workers`), started ahead of the first page,
+and kept on a single BLAS/OpenMP/torch thread each — with the default pools
+eight workers × eight threads fought over eight cores and the outlines took
+5.0 s instead of 3.1 s. The feature map reaches the workers through shared
+memory; a line's beam search receives only its few candidates per frame, not the
+`1623 × time` matrix. Fewer than four lines, one worker, or a broken pool: the
+same functions run in-process.
+
+**Beam pruning** (`htr_beam_min_prob`): on average only 1.9 of 1623 classes per
+frame reach p = 1e-4, so most of the `top_k = 8` expansions per beam and frame
+were wasted. Characters below the threshold are not expanded (the best one of a
+frame always is). Measured on 123 lines of five pages (one process, author model
+and vocabulary):
+
+| `min_prob` | beam time | best reading changed | N-best (word variants) changed |
+| --- | --- | --- | --- |
+| 0 | 100 s | — | — |
+| **1e-5** (default) | 33 s | 0 lines | 9 lines |
+| 1e-4 | 16 s | 0 lines | 46 lines |
+
+1e-5 keeps the editor's word alternatives almost intact; spread over the worker
+processes the difference to 1e-4 is about half a second per page.
+
+**Measured end to end** (same author model, five pages, warm models): 57–60 s
+per page before, 12–14 s after; the very first page after a start pays for
+loading the models and starting the workers. The recognized text is identical on
+four of the five pages. On the fifth (page 175) one line changed because of a
+kraken property that has nothing to do with these changes — see the batch note
+below.
+
+**A line's reading depends on its batch.** kraken recognizes lines in batches
+(`htr_recognition_batch_size = 8`) and pads them to the longest one, and
+PP-OCRv6 sees the padding: the same line of page 175 reads «Л голова» alone,
+«Я голова» in a batch without the glued last line, «Я полова» in the full batch.
+Recognizing one line at a time removes that dependence but was not more
+accurate on the three confirmed pages (CER 0.0044 → 0.0053 on page 177, equal
+elsewhere) and is ~1 s slower per page, so the batch stays at 8.
+
+**Locks.** Segmentation is no longer under the recognition lock: each thread
+has its own bLLA instance, and only the recognition forward pass (the prepared
+model keeps per-call state) is serialized. One page can therefore be segmented
+on the CPU while another is recognized on the GPU.
+
+### Background recognition
+
+Uploaded pages are recognized before anyone opens them (`htr/background.py`):
+right after an upload or a PDF import, and — on backend start — every page still
+`UPLOADED`. `htr_background_workers` pages run at once (2: one segments while
+the other uses the GPU). Rules: only `UPLOADED` pages are touched, so the queue
+never overwrites work; the HTTP route shares a lock per page with the queue — a
+user who presses «Распознать» while the queue reads that page waits for it and
+gets its result (`?only_uploaded=true` returns an already recognized page as
+is); a failure leaves the page `UPLOADED` and is not retried until a restart;
+the queue waits while a model is trained (both want the GPU).
+`GET /htr/pages/{id}/recognition-status` answers `queued` / `running` / `idle`,
+and the editor shows «В очереди на распознавание» / «Распознаётся в фоне…» and
+loads the result as soon as it is there. The queue is in-process, so run a single
+backend process (several uvicorn workers would each run their own queue).
 
 ### Fine-tuning
 
@@ -1233,7 +1356,7 @@ routes/htr.py                      HTTP only
         metrics.py / confidence.py CER/WER, confidence levels
   └── domain/                      entities + interfaces (no framework imports)
   └── infrastructure/
-        page_repository.py, model_repository.py, storage.py
+        page_repository.py, model_repository.py, storage.py, pdf.py
         lexicon/                   Bloom dictionary, author corpus, layered check
         kraken/recognizer.py       HTRRecognizer (kraken)
         kraken/trainer.py          HTRTrainer (kraken 7)
@@ -1242,15 +1365,45 @@ routes/htr.py                      HTTP only
 The application layer never imports kraken; a second backend only needs a new
 `HTRTrainer` (and eventually `HTRRecognizer`) implementation.
 
+## PDF import (one PDF → one folder → one page per sheet)
+
+A scanned manuscript usually arrives as a single PDF, while everything
+downstream speaks "one image = one page". `POST /htr/authors/{id}/pdf` bridges
+the two: it renders every sheet and stores it as an ordinary page of the author.
+
+* Rendering is **pypdfium2** (PDFium inside the wheel: no poppler or ghostscript
+  to install) at `htr_pdf_dpi` — 300 dpi, the resolution HTR expects.
+* A sheet is stored as **PNG**, not JPEG: this file is the recognizer's input,
+  and ringing around thin pen strokes costs accuracy. A sheet whose render
+  carries no colour is stored as grayscale — a typescript or a black-and-white
+  diary page is three times smaller that way and looks identical in the viewer.
+* Every page of one PDF lands in **one folder named after the file** (extension
+  dropped). An existing folder of that name is reused, so re-importing a PDF
+  continues it instead of piling up «Дневник (2)»; `parent_folder_id` puts that
+  folder inside another one.
+* The import is **all-or-nothing**: the whole file is refused (`409`) while any
+  of its pages is already in the corpus, and a PDF that fails halfway leaves
+  neither pages nor the empty folder it created. `htr_pdf_max_pages` (500) is
+  the ceiling that keeps an accidentally picked 2000-page scan from filling the
+  disk inside one HTTP request — the import is synchronous, like recognition.
+* Pages are labelled by their sheet number («Стр. 7.png»), and the PDF file name
+  is kept as the page's `source_path`, so the pages of two same-named PDFs stay
+  two pages exactly like a folder upload.
+
+A single page image can be uploaded straight into a folder of the tree with the
+`folder_id` form field of `POST /htr/authors/{id}/pages`.
+
 ## API
 
 | endpoint | purpose |
 | --- | --- |
-| `POST /htr/authors/{id}/pages` | upload a page image (EXIF orientation is applied). An optional `source_path` form field keeps the client-side path of a folder upload; the file name becomes the page label |
+| `POST /htr/authors/{id}/pages` | upload a page image (EXIF orientation is applied). An optional `source_path` form field keeps the client-side path of a folder upload; the file name becomes the page label. An optional `folder_id` puts the page into a folder of the «Записи» tree |
+| `POST /htr/authors/{id}/pdf` | import a PDF: every sheet becomes a page of the author, all of them in a folder named after the file (`parent_folder_id` nests that folder) |
 | `GET /htr/authors/{id}/pages` | page list (id, file name, stored order, status, line count, dates, prediction CER, dictionary misses) for the sidebar |
 | `PUT /htr/authors/{id}/pages/order` | store the order the user dragged the pages into (`page_ids`, ids the client did not send keep their relative order at the end) |
 | `PATCH /htr/pages/{id}/name` | rename the displayed file name of a page (drops the client-side `source_path`) |
-| `POST /htr/pages/{id}/recognize` | **run recognition**, store lines/words |
+| `POST /htr/pages/{id}/recognize` | **run recognition**, store lines/words (waits for the background queue when it is reading the page; `only_uploaded=true` returns a page recognized meanwhile as is) |
+| `GET /htr/pages/{id}/recognition-status` | page status plus `queued` / `running` / `idle` of the background queue |
 | `POST /htr/pages/{id}/recognition-result` | import a result produced by an external tool (geometry is validated; it does not recognize anything) |
 | `GET /htr/pages/{id}` | read page + lines + words + confidence levels + `in_lexicon` / `oov_count` / `lexicon_available` |
 | `DELETE /htr/pages/{id}` | delete a page (with its image and crops); it leaves every future training corpus |
@@ -1261,7 +1414,8 @@ The application layer never imports kraken; a second backend only needs a new
 | `PUT …/lines/{line}/suggestion`, `DELETE …/lines/{line}/suggestion` | accept / dismiss one whole proposal |
 | `PUT …/lines/{line}/suggestion/changes/{index}` | accept a single proposed word, the rest of the proposal stays |
 | `POST /htr/pages/{id}/suggestions/accept` | accept every proposal whose changes the dictionary confirms |
-| `POST /htr/pages/{id}/confirm` | confirm ground truth and measure prediction CER/WER (never starts training); the response lists the words the confirmation added to the author's vocabulary |
+| `POST /htr/pages/{id}/confirm` | confirm ground truth and measure prediction CER/WER (never starts training, never extracts knowledge — the knowledge source is only prepared as `pending`); the response lists the words the confirmation added to the author's vocabulary |
+| `POST /htr/pages/{id}/knowledge/extract` | extract knowledge from a confirmed page («Извлечь знания»; `409` for an unconfirmed one) |
 | `POST /htr/pages/{id}/reopen` | undo the confirmation: back to `EDITING`, metrics cleared, the next training run ignores the page (`409` if it is not confirmed or a run is in flight) |
 | `POST /htr/authors/{id}/train` | fine-tune the author's model on all confirmed pages |
 | `GET /htr/authors/{id}/models` | model versions of the author |

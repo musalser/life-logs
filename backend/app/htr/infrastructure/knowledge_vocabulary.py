@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from ...models import Entity, Event, Goal, Habit
+from ...models import Entity, Goal
 
 
 class SqlAlchemyKnowledgeVocabulary:
@@ -28,7 +28,7 @@ class SqlAlchemyKnowledgeVocabulary:
         terms.extend(row[0] for row in entities if row[0])
 
         # titles are phrases, but they still carry names and toponyms
-        for model in (Event, Goal, Habit):
+        for model in (Goal,):
             rows = (
                 self.db.query(model.title)
                 .filter(model.user_id == user_id)

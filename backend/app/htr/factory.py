@@ -29,6 +29,7 @@ from .infrastructure.model_repository import (
     SqlAlchemyTrainingRunRepository,
 )
 from .infrastructure.page_repository import SqlAlchemyPageRepository
+from .infrastructure.pdf import PdfRasterizer
 from .infrastructure.storage import HTRStorage, PilLineCropper
 from .infrastructure.lm.builder import rebuild_author_char_lm
 
@@ -83,6 +84,11 @@ def build_storage() -> HTRStorage:
     return HTRStorage(settings.htr_storage_dir)
 
 
+def build_pdf_rasterizer() -> PdfRasterizer:
+    """PDF → page images, at the resolution the recognizer expects."""
+    return PdfRasterizer(dpi=settings.htr_pdf_dpi)
+
+
 def build_default_model_ref() -> ModelRef:
     return ModelRef(id=settings.htr_default_model_id, path=settings.htr_default_model_path)
 
@@ -108,11 +114,15 @@ def build_beam_config():
         alpha=settings.htr_beam_alpha,
         beta=settings.htr_beam_beta,
         word_bonus=settings.htr_beam_word_bonus,
+        min_prob=settings.htr_beam_min_prob,
     )
 
 
 def build_recognizer() -> KrakenRecognizer:
     """Recognition backend (kraken is imported lazily on first use)."""
+    from .infrastructure.kraken import parallel
+
+    parallel.configure(settings.htr_cpu_workers)
     return KrakenRecognizer(
         device=settings.htr_recognition_device,
         batch_size=settings.htr_recognition_batch_size,

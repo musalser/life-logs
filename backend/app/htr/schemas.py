@@ -176,6 +176,16 @@ class PageUploadResponse(BaseModel):
     status: str
 
 
+class PdfUploadResponse(BaseModel):
+    """One imported PDF: the folder it created and the pages that went into it."""
+
+    folder_id: int
+    folder_name: str
+    page_count: int
+    #: ids in document order (page 1 first)
+    page_ids: list[int]
+
+
 class PageSummaryResponse(BaseModel):
     """Sidebar row: enough to pick a page without loading its lines/words."""
 

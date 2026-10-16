@@ -253,3 +253,72 @@ def test_nbest_n_larger_than_the_beam_is_not_an_error():
     candidates = search.decode_nbest(matrix, n=50)
 
     assert len(candidates) <= 2, "вернулось не больше, чем выжило гипотез"
+
+
+# ---------------------------------------------------------------------------
+# candidate pruning and the prepared-frame form (used by the worker processes)
+# ---------------------------------------------------------------------------
+
+
+def _per_frame_candidates(probs: np.ndarray, top_k: int):
+    """The selection the search used to run inside its frame loop."""
+    out = []
+    for frame in range(probs.shape[1]):
+        column = probs[:, frame]
+        width = min(top_k, column.size)
+        candidates = np.argpartition(column, -width)[-width:]
+        candidates = candidates[np.argsort(-column[candidates])]
+        out.append(
+            (candidates.tolist(), np.log10(np.maximum(column[candidates], 1e-12)).tolist())
+        )
+    return out
+
+
+def test_frame_candidates_match_the_per_frame_selection():
+    codec = _codec("акорв ")
+    rng = np.random.default_rng(3)
+    matrix = rng.random((len(codec.l2c_single) + 1, 40)).astype(np.float32)
+    search = PrefixBeamSearch(codec=codec, config=BeamSearchConfig(top_k=4))
+    probs = search.probabilities(matrix)
+
+    assert search.frame_candidates(probs) == _per_frame_candidates(probs, 4)
+
+
+def test_min_prob_drops_unlikely_characters_but_keeps_the_best():
+    codec = _codec("абв ")
+    matrix = _blank_matrix(codec, "аб в")
+    search = PrefixBeamSearch(codec=codec, config=BeamSearchConfig(top_k=4, min_prob=0.5))
+
+    frames = search.frame_candidates(search.probabilities(matrix))
+
+    # every frame of this sharp matrix has exactly one character above 0.5
+    assert all(len(labels) == 1 for labels, _ in frames)
+    flat = PrefixBeamSearch(codec=codec, config=BeamSearchConfig(top_k=4, min_prob=1.0))
+    # nothing reaches p = 1.0, and still the best character of a frame stays
+    assert all(len(labels) == 1 for labels, _ in flat.frame_candidates(flat.probabilities(matrix)))
+
+
+def test_min_prob_keeps_the_reading_of_a_confusable_frame():
+    """Pruning removes noise, not the alternatives the language model chooses from."""
+    codec = _codec("акорв ")
+    lm = CharNGram.build(["корова " * 200], order=5, min_count=1)
+    matrix = _confusable_matrix(codec, "корова", wrong="а")
+    config = dict(alpha=0.8, beta=0.0, word_bonus=0.0)
+    full = PrefixBeamSearch(codec=codec, lm=lm, config=BeamSearchConfig(**config))
+    pruned = PrefixBeamSearch(codec=codec, lm=lm, config=BeamSearchConfig(min_prob=1e-4, **config))
+
+    assert pruned.decode(matrix) == full.decode(matrix)
+    assert pruned.decode(matrix).startswith("ко")
+
+
+def test_decoding_prepared_frames_equals_decoding_the_matrix():
+    codec = _codec("акорв ")
+    lm = CharNGram.build(["корова " * 200], order=5, min_count=1)
+    matrix = _confusable_matrix(codec, "корова", wrong="а")
+    search = PrefixBeamSearch(codec=codec, lm=lm, config=BeamSearchConfig(alpha=0.8))
+    frames = search.frame_candidates(search.probabilities(matrix))
+
+    assert search.text_from_frames(frames) == search.decode(matrix)
+    assert [c.text for c in search.nbest_from_frames(frames, 5)] == [
+        c.text for c in search.decode_nbest(matrix, n=5)
+    ]

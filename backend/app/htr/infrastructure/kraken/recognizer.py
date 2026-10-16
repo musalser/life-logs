@@ -55,8 +55,10 @@ logger = logging.getLogger(__name__)
 
 # Prepared models hold torch weights and a Lightning Fabric; rebuilding them per
 # request would dominate the request time, so they are cached per model file and
-# inference parameters. Kraken inference is serialized because a prepared model
-# keeps per-call state (scaling factors, precision module).
+# inference parameters. Recognition with a prepared model is serialized because
+# it keeps per-call state (scaling factors, precision module); segmentation is
+# not under this lock (every thread has its own segmentation model), so one page
+# can be segmented on the CPU while another one is recognized on the GPU.
 _MODEL_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 _MODEL_CACHE_LOCK = threading.Lock()
 _RECOGNITION_LOCK = threading.Lock()
@@ -133,21 +135,21 @@ def _loaded_language_model(path: str | None):
     logger.info("HTR decoding: language model %s (order %s) loaded", path, model.order)
     return model
 
-# The bundled bLLA segmentation model is a singleton: loading it is expensive
-# and it is stateless, unlike the recognition nets.
-_SEGMENTATION_MODEL: Any = None
-_SEGMENTATION_MODEL_LOCK = threading.Lock()
+# The bundled bLLA segmentation model is loaded once per thread: ``predict``
+# prepares the net for inference on every call (per-call state), so two pages
+# segmented at the same time must not share one instance. The weights are small
+# (a few MB); the background recognition runs on a fixed number of threads.
+_SEGMENTATION_MODELS = threading.local()
 
 
 def _segmentation_model():
-    global _SEGMENTATION_MODEL
-    with _SEGMENTATION_MODEL_LOCK:
-        if _SEGMENTATION_MODEL is None:
-            from kraken.tasks import SegmentationTaskModel
+    model = getattr(_SEGMENTATION_MODELS, "model", None)
+    if model is None:
+        from kraken.tasks import SegmentationTaskModel
 
-            logger.info("Loading the default bLLA line segmentation model")
-            _SEGMENTATION_MODEL = SegmentationTaskModel.load_model()
-        return _SEGMENTATION_MODEL
+        logger.info("Loading the default bLLA line segmentation model")
+        model = _SEGMENTATION_MODELS.model = SegmentationTaskModel.load_model()
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +333,28 @@ def is_continuation(
     perp_factor: float = 0.5,
     overlap_factor: float = 0.5,
     angle_factor: float = 0.5,
+    max_overlap_share: float = 0.5,
 ) -> bool:
-    """True when two baselines are pieces of the same physical line.
+    """True when two baselines are pieces of the same physical line."""
+    return continuation_cost(
+        first, second, scale, gap_factor, perp_factor, overlap_factor, angle_factor,
+        max_overlap_share,
+    ) is not None
+
+
+def continuation_cost(
+    first: Sequence | None,
+    second: Sequence | None,
+    scale: float,
+    gap_factor: float = 1.5,
+    perp_factor: float = 0.5,
+    overlap_factor: float = 0.5,
+    angle_factor: float = 0.5,
+    max_overlap_share: float = 0.5,
+) -> float | None:
+    """How well two baselines continue each other (lower is better), or None.
+
+    None when they are not pieces of the same physical line.
 
     The segmenter occasionally detaches the first word of a line into its own
     record. The connecting vector between the two pieces then runs *along* the
@@ -343,17 +365,26 @@ def is_continuation(
 
     ``scale`` is the line pitch (see :func:`estimate_pitch`), not the glyph
     height.
+
+    Two pieces of one physical line stand *side by side*. Pieces that overlap
+    horizontally by more than ``max_overlap_share`` of the shorter one stand
+    *above each other* — an insertion written over the line, the second half of
+    a note squeezed under its end — and are never one line, however close their
+    baselines are. Without this rule such a pair was also judged differently
+    depending on the argument order (which end is compared with which start).
     """
     first_points = list(first or [])
     second_points = list(second or [])
     if len(first_points) < 2 or len(second_points) < 2:
-        return False
+        return None
+    if horizontal_overlap_share(first_points, second_points) > max_overlap_share:
+        return None
     if first_points[-1][0] > second_points[0][0]:
         first_points, second_points = second_points, first_points
 
     direction = unit_direction(first_points, at_end=True)
     if direction is None:
-        return False
+        return None
 
     ax, ay = float(first_points[-1][0]), float(first_points[-1][1])
     bx, by = float(second_points[0][0]), float(second_points[0][1])
@@ -362,14 +393,58 @@ def is_continuation(
     perpendicular = abs(vx * direction[1] - vy * direction[0])
 
     if perpendicular > perp_factor * scale:
-        return False
+        return None
     if along > gap_factor * scale or along < -overlap_factor * scale:
-        return False
+        return None
 
     other = unit_direction(second_points, at_end=False)
     if other is not None and abs(direction[0] * other[1] - direction[1] * other[0]) > angle_factor:
-        return False
-    return True
+        return None
+    # the offset across the line weighs most: a word space is normal, a step
+    # up or down to another baseline is not
+    return (2.0 * perpendicular + abs(along)) / scale
+
+
+def _x_span(points: Sequence) -> tuple[float, float]:
+    xs = [float(point[0]) for point in points]
+    return min(xs), max(xs)
+
+
+def horizontal_overlap_share(first: Sequence, second: Sequence) -> float:
+    """Horizontal overlap of two baselines, as a share of the shorter one."""
+    a0, a1 = _x_span(first)
+    b0, b1 = _x_span(second)
+    shorter = min(a1 - a0, b1 - b0)
+    if shorter <= 0:
+        return 0.0
+    return max(0.0, min(a1, b1) - max(a0, b0)) / shorter
+
+
+def stacked(
+    first: list[Any], second: list[Any], pitch: float | None, max_overlap_share: float = 0.5
+) -> bool:
+    """Do two groups of pieces stand above each other rather than side by side?
+
+    True when a piece of one group overlaps a piece of the other horizontally by
+    more than ``max_overlap_share`` of the shorter of the two — unless that one
+    is a mark narrower than the line pitch (a "+", a dot, a stray stroke), which
+    may well sit inside the span of a row and still belong to it.
+    """
+    for a in first:
+        a_line = list(getattr(a, "baseline", None) or [])
+        for b in second:
+            b_line = list(getattr(b, "baseline", None) or [])
+            if len(a_line) < 2 or len(b_line) < 2:
+                continue
+            widths = sorted((_x_span(a_line)[1] - _x_span(a_line)[0], _x_span(b_line)[1] - _x_span(b_line)[0]))
+            # a mark: narrower than the pitch, or — when the page is too small
+            # to estimate one — than a tenth of the piece it sits in
+            mark_width = pitch if pitch else 0.1 * widths[1]
+            if widths[0] < mark_width:
+                continue
+            if horizontal_overlap_share(a_line, b_line) > max_overlap_share:
+                return True
+    return False
 
 
 def group_collinear_lines(lines: list[Any], scale: float | None = None) -> list[list[int]]:
@@ -386,6 +461,7 @@ def group_collinear_lines(lines: list[Any], scale: float | None = None) -> list[
         return [[index] for index in range(len(lines))]
 
     parent = list(range(len(lines)))
+    members: dict[int, list[int]] = {index: [index] for index in range(len(lines))}
 
     def find(index: int) -> int:
         while parent[index] != index:
@@ -393,12 +469,27 @@ def group_collinear_lines(lines: list[Any], scale: float | None = None) -> list[
             index = parent[index]
         return index
 
+    # Best joins first, and never two groups that stand above each other: an
+    # insertion written over the end of a line continues that line about as well
+    # as the line's real continuation does, and union-find alone would glue all
+    # three — the insertion through the line to the continuation under it.
+    pairs = []
     for i in range(len(lines)):
         for j in range(i + 1, len(lines)):
-            if is_continuation(baselines[i], baselines[j], scale):
-                root_i, root_j = find(i), find(j)
-                if root_i != root_j:
-                    parent[max(root_i, root_j)] = min(root_i, root_j)
+            cost = continuation_cost(baselines[i], baselines[j], scale)
+            if cost is not None:
+                pairs.append((cost, i, j))
+    for _, i, j in sorted(pairs):
+        root_i, root_j = find(i), find(j)
+        if root_i == root_j:
+            continue
+        if stacked(
+            [lines[k] for k in members[root_i]], [lines[k] for k in members[root_j]], scale
+        ):
+            continue
+        keep, drop = min(root_i, root_j), max(root_i, root_j)
+        parent[drop] = keep
+        members[keep].extend(members.pop(drop))
 
     groups: dict[int, list[int]] = {}
     for index in range(len(lines)):
@@ -496,7 +587,18 @@ def _union_band_groups(
     the band it overlaps most, and only groups of the *same* band are unioned: a
     tall mark that reaches into two rows (a curly brace of the logbook) must not
     bridge them.
+
+    Groups that stand above each other (:func:`stacked`) are never unioned. A
+    band is horizontal, a slanted or curved line is not: on a phone photo whose
+    lines drop 100–150 px across the page, two neighbouring full-width lines
+    both picked one band and were glued into a single line that read as
+    garbage (pages 98, 117, 132 — three full lines at once on 132).
     """
+    heights = [line_height(line) for line in lines]
+    pitch = estimate_pitch(
+        [list(getattr(line, "baseline", None) or []) for line in lines],
+        [height for height in heights if height],
+    )
     parent = list(range(len(groups)))
 
     def find(index: int) -> int:
@@ -505,7 +607,8 @@ def _union_band_groups(
             index = parent[index]
         return index
 
-    by_band: dict[int, int] = {}
+    #: per band, clusters of groups that stand side by side
+    by_band: dict[int, list[list[int]]] = {}
     for index, group in enumerate(groups):
         ys = [
             float(point[1])
@@ -515,11 +618,24 @@ def _union_band_groups(
         band = _best_band((min(ys), max(ys)) if ys else None, bands)
         if band is None:
             continue
-        first = by_band.setdefault(band, index)
-        if first != index:
-            root_first, root_index = find(first), find(index)
-            if root_first != root_index:
-                parent[max(root_first, root_index)] = min(root_first, root_index)
+        pieces = [lines[member] for member in group]
+        clusters = by_band.setdefault(band, [])
+        home = next(
+            (
+                cluster for cluster in clusters
+                if not stacked(
+                    [lines[member] for other in cluster for member in groups[other]], pieces, pitch
+                )
+            ),
+            None,
+        )
+        if home is None:
+            clusters.append([index])
+            continue
+        root_home, root_index = find(home[0]), find(index)
+        if root_home != root_index:
+            parent[max(root_home, root_index)] = min(root_home, root_index)
+        home.append(index)
 
     unioned: dict[int, list[int]] = {}
     for index, group in enumerate(groups):
@@ -936,20 +1052,21 @@ class KrakenRecognizer(HTRRecognizer):
             raise RecognitionError(str(exc)) from exc
 
         try:
-            with _RECOGNITION_LOCK:
-                model, config = self._prepared_model(model_file)
-                decoder = self._build_decoder(model, author_id, word_checker)
-                rescorer = (
-                    self._build_rescorer(word_checker)
-                    if decoder is not None
-                    else None
+            model, config = self._prepared_model(model_file)
+            decoder = self._build_decoder(model, author_id, word_checker)
+            rescorer = (
+                self._build_rescorer(word_checker)
+                if decoder is not None
+                else None
+            )
+            segmentation, merged = self._segment_with_report(image)
+            segmentation = self._merge_split_lines(segmentation, image, merged_in_kraken=merged)
+            if not segmentation.lines:
+                raise RecognitionError(
+                    "No text lines were found on the page; check the scan "
+                    "orientation and quality"
                 )
-                segmentation = self._merge_split_lines(self._segment(image), image)
-                if not segmentation.lines:
-                    raise RecognitionError(
-                        "No text lines were found on the page; check the scan "
-                        "orientation and quality"
-                    )
+            with _RECOGNITION_LOCK:
                 records = list(model.predict(image, segmentation))
             result = self._to_result(
                 image.size,
@@ -1008,6 +1125,7 @@ class KrakenRecognizer(HTRRecognizer):
             )
             return None
         from .beam import BeamSearchConfig, PrefixBeamSearch
+        from .parallel import BeamSpec
 
         config = self.beam_config or BeamSearchConfig()
 
@@ -1020,10 +1138,20 @@ class KrakenRecognizer(HTRRecognizer):
             word_checker is not None,
         )
 
-        return PrefixBeamSearch(
+        checker = word_checker or self._file_lexicon_checker()
+        decoder = PrefixBeamSearch(
             codec=model.codec, lm=lm, config=config,
-            known_word=self._known_word_fn(word_checker),
+            known_word=self._known_word_fn(checker),
         )
+        # what a worker process needs to rebuild this very decoder (see
+        # parallel.decode_lines): the lines of a page are decoded side by side
+        decoder.spec = BeamSpec(
+            graphemes=list(decoder._graphemes),
+            lm_path=self._lm_for(author_id),
+            config=config,
+            checker=checker,
+        )
+        return decoder
 
     def _known_word_fn(self, word_checker: LexiconChecker | None):
         """Vocabulary callable shared by the beam bonus and the rescoring guard."""
@@ -1160,28 +1288,37 @@ class KrakenRecognizer(HTRRecognizer):
         rescore_n: int = 10,
         alternatives_n: int = 0,
         record_index: int = 0,
+        decoded: Any = None,
     ) -> tuple[str, list[Any]]:
         """Beam-search text of a line, falling back to kraken's own decoding.
 
         With a rescorer the beam returns its N best hypotheses and a word-level
         model re-ranks them; the guard inside the rescorer decides whether it is
         allowed to change the winner at all.
+
+        ``decoded`` is the search result a worker process already computed for
+        this line (the text for ``n <= 1``, otherwise the candidates); without
+        it the search runs here.
         """
-        logits = getattr(record, "logits", None)
-        matrix = KrakenRecognizer._logits_matrix(logits, record_index)
-        if matrix is None:
-            logger.warning(
-                "Line %s: no CTC matrix on the record, keeping the greedy text", line_id
-            )
-            return greedy, []
+        n = KrakenRecognizer._nbest_size(rescorer, rescore_n, alternatives_n)
+        if decoded is None:
+            logits = getattr(record, "logits", None)
+            matrix = KrakenRecognizer._logits_matrix(logits, record_index)
+            if matrix is None:
+                logger.warning(
+                    "Line %s: no CTC matrix on the record, keeping the greedy text", line_id
+                )
+                return greedy, []
         try:
             # the N-best list is needed by the second pass and by the per-word
             # alternatives, so it is requested once for both
-            n = max(rescore_n if rescorer is not None else 0, alternatives_n)
             if n <= 1:
-                return normalize_text(decoder.decode(matrix) or greedy), []
-            candidates = decoder.decode_nbest(matrix, n=n)
+                text = decoded if decoded is not None else decoder.decode(matrix)
+                return normalize_text(text or greedy), []
+            candidates = decoded if decoded is not None else decoder.decode_nbest(matrix, n=n)
             if not candidates:
+                if decoded is not None:
+                    return greedy, []
                 return normalize_text(decoder.decode(matrix) or greedy), []
             if rescorer is None:
                 return normalize_text(candidates[0].text or greedy), candidates
@@ -1193,7 +1330,60 @@ class KrakenRecognizer(HTRRecognizer):
             logger.warning("Line %s: beam search failed (%s), keeping greedy", line_id, exc)
             return greedy, []
 
+    @staticmethod
+    def _nbest_size(rescorer: Any | None, rescore_n: int, alternatives_n: int) -> int:
+        return max(rescore_n if rescorer is not None else 0, alternatives_n)
+
+    @classmethod
+    def _decode_in_workers(
+        cls,
+        records: list[Any],
+        decoder,
+        rescorer: Any | None,
+        rescore_n: int,
+        alternatives_n: int,
+    ) -> list[Any] | None:
+        """The beam search of every line in worker processes, or None.
+
+        None means "decode in-process": a decoder without a ``spec`` (a test
+        double), a single CPU, or a failure of the pool that is not worth
+        failing the page for. A line without a usable matrix gets None and keeps
+        its greedy text, exactly like the in-process path.
+        """
+        from . import parallel
+
+        spec = getattr(decoder, "spec", None)
+        if spec is None or parallel.worker_count() <= 1 or len(records) < parallel.MIN_PARALLEL_ITEMS:
+            return None
+        frames: list[Any] = []
+        usable: list[int] = []
+        for index, record in enumerate(records):
+            matrix = cls._logits_matrix(getattr(record, "logits", None), index)
+            if matrix is None:
+                continue
+            try:
+                frames.append(decoder.frame_candidates(decoder.probabilities(matrix)))
+            except Exception as exc:  # pragma: no cover - a bad matrix keeps greedy
+                logger.warning("Line %s: cannot prepare the CTC matrix (%s)", index, exc)
+                continue
+            usable.append(index)
+        try:
+            results = parallel.decode_lines(
+                spec, frames, cls._nbest_size(rescorer, rescore_n, alternatives_n)
+            )
+        except Exception as exc:
+            logger.warning("HTR decoding: worker processes failed (%s), decoding in-process", exc)
+            return None
+        decoded: list[Any] = [None] * len(records)
+        for index, result in zip(usable, results):
+            decoded[index] = result
+        return decoded
+
     def _segment(self, image):
+        return self._segment_with_report(image)[0]
+
+    def _segment_with_report(self, image):
+        """The segmentation, and whether the pieces were glued inside kraken."""
         if self.segmentation_engine == "neural":
             try:
                 return self._neural_segment(image)
@@ -1202,20 +1392,26 @@ class KrakenRecognizer(HTRRecognizer):
                     "Neural line segmentation unavailable (%s); falling back to the "
                     "classical projection-profile segmenter", exc,
                 )
-        return self._classical_segment(image)
+        return self._classical_segment(image), False
 
-    def _merge_split_lines(self, segmentation, image=None):
+    def _merge_split_lines(self, segmentation, image=None, merged_in_kraken: bool = False):
         """Re-join the pieces of one line and number the lines in reading order.
 
-        The geometric merge is the base; the page's ink rows (``rows.row_bands``)
-        can only add merges to it, never remove one, so a bad profile cannot
-        split a line the geometry already got right. The segmenter's own order is
-        replaced by the reading order either way.
+        The neural path glues the pieces inside kraken, before the outlines are
+        drawn (``vectorize.vec_lines``); this page-level merge — convex hull of
+        the pieces — only runs when that did not happen (kraken could not be
+        hooked). The geometric merge is the base; the page's ink rows
+        (``rows.row_bands``) can only add merges to it, never remove one. The
+        segmenter's own order is replaced by the reading order either way.
         """
         lines = list(getattr(segmentation, "lines", None) or [])
         if len(lines) < 2:
             return segmentation
-        if self.merge_lines and all(getattr(line, "baseline", None) for line in lines):
+        if (
+            self.merge_lines
+            and not merged_in_kraken
+            and all(getattr(line, "baseline", None) for line in lines)
+        ):
             lines = merge_collinear_lines(lines, bands=self._ink_row_bands(image))
         from dataclasses import replace
 
@@ -1239,10 +1435,16 @@ class KrakenRecognizer(HTRRecognizer):
         return bands or None
 
     def _neural_segment(self, image):
-        """Bundled bLLA model: polygons and baselines that follow curved lines."""
-        from kraken.configs import SegmentationInferenceConfig
-        from kraken.tasks import SegmentationTaskModel
+        """Bundled bLLA model: polygons and baselines that follow curved lines.
 
+        Returns the segmentation and whether the split pieces of a line were
+        already glued inside kraken (see :mod:`.vectorize`).
+        """
+        from kraken.configs import SegmentationInferenceConfig
+
+        from .vectorize import SegmentationOptions, install, segmentation_options
+
+        hooked = install()
         model = _segmentation_model()
         accelerator, devices = available_lightning_device(self.device)
         config = SegmentationInferenceConfig(
@@ -1250,7 +1452,21 @@ class KrakenRecognizer(HTRRecognizer):
             device=devices,
             text_direction=self.text_direction,
         )
-        return model.predict(image, config)
+        options = SegmentationOptions(
+            merge_lines=self.merge_lines,
+            rows=self.segmentation_rows,
+            rows_threshold=self.segmentation_rows_threshold,
+            image=image,
+        )
+        with segmentation_options(options):
+            segmentation = model.predict(image, config)
+        # with merging off nothing needs gluing, so the fallback must not run either
+        merged = hooked and (not self.merge_lines or bool(options.report.get("merged_in_kraken")))
+        if options.report.get("glued_pieces"):
+            logger.info(
+                "HTR segmentation: %s pieces glued inside kraken", options.report["glued_pieces"]
+            )
+        return segmentation, merged
 
     def _classical_segment(self, image):
         from kraken.binarization import nlbin
@@ -1354,6 +1570,12 @@ class KrakenRecognizer(HTRRecognizer):
         rescore_n: int = 10,
         alternatives_n: int = 0,
     ) -> RecognitionResult:
+        records = list(records)
+        decoded = (
+            cls._decode_in_workers(records, decoder, rescorer, rescore_n, alternatives_n)
+            if decoder is not None
+            else None
+        )
         lines: list[RecognizedLine] = []
         for order, record in enumerate(records):
             line_id = str(order)
@@ -1365,10 +1587,15 @@ class KrakenRecognizer(HTRRecognizer):
             text = greedy
             candidates: list[Any] = []
             if decoder is not None:
-                text, candidates = cls._decoded_line(
-                    record, decoder, greedy, line_id, rescorer, rescore_n,
-                    alternatives_n, order,
-                )
+                if decoded is not None and decoded[order] is None:
+                    # the worker path found no usable matrix for this line
+                    text, candidates = greedy, []
+                else:
+                    text, candidates = cls._decoded_line(
+                        record, decoder, greedy, line_id, rescorer, rescore_n,
+                        alternatives_n, order,
+                        decoded=decoded[order] if decoded is not None else None,
+                    )
             alternatives = cls._word_alternatives(text, candidates, alternatives_n)
             lines.append(
                 RecognizedLine(

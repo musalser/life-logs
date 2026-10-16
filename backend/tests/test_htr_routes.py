@@ -26,6 +26,14 @@ from app.htr.infrastructure.model_repository import (
 )
 from app.htr.infrastructure.page_repository import SqlAlchemyPageRepository
 from app.htr.infrastructure.storage import HTRStorage, PilLineCropper
+from app.models import (
+    Entity,
+    EntityMention,
+    EntityRelation,
+    Fact,
+    KnowledgeSource,
+    RelationSource,
+)
 from app.routes import htr as htr_routes
 from app.routes.htr import get_page_service, get_training_service
 from tests.htr_fakes import (
@@ -997,3 +1005,145 @@ def test_confirmation_preview_refuses_an_already_confirmed_page(lexicon_api):
 
     assert response.status_code == 409
     assert "CONFIRMED" in response.json()["detail"]
+
+
+def test_deleting_a_page_takes_its_knowledge_with_it(api, db_session, user):
+    """Знания уходят вместе со страницей изображения, а не остаются сиротами.
+
+    ``KnowledgeSource.ref_id`` не имеет внешнего ключа: без явной уборки
+    упоминания, факты и рёбра продолжали бы показываться в «Знаниях» после
+    удаления страницы, из которой они прочитаны.
+    """
+    test_client, _service, author = api
+    page_id = upload(test_client, author.id)
+    source = KnowledgeSource(
+        user_id=user.id,
+        source_type="htr",
+        ref_id=page_id,
+        text="Маша и Пётр",
+        extraction_status="done",
+    )
+    db_session.add(source)
+    db_session.flush()
+    first = Entity(user_id=user.id, entity_type="person", canonical_name="Маша", normalized_name="маша")
+    second = Entity(user_id=user.id, entity_type="person", canonical_name="Пётр", normalized_name="пётр")
+    db_session.add_all([first, second])
+    db_session.flush()
+    db_session.add(EntityMention(entity_id=first.id, source_id=source.id, mention_text="Маша"))
+    db_session.add(
+        Fact(
+            user_id=user.id,
+            source_id=source.id,
+            predicate="видел",
+            source_text="Маша и Пётр",
+            object_entity_id=second.id,
+        )
+    )
+    edge = EntityRelation(
+        user_id=user.id,
+        from_entity_id=first.id,
+        to_entity_id=second.id,
+        relation_type="брат",
+        relation_kind="brother",
+        source_id=source.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    db_session.add(
+        RelationSource(relation_id=edge.id, source_id=source.id, relation_kind="brother", relation_type="брат")
+    )
+    db_session.commit()
+    source_id, edge_id = source.id, edge.id
+
+    response = test_client.delete(f"/htr/pages/{page_id}")
+    assert response.status_code == 204
+
+    db_session.expire_all()
+    assert db_session.query(KnowledgeSource).filter(KnowledgeSource.id == source_id).count() == 0
+    assert db_session.query(EntityMention).filter(EntityMention.source_id == source_id).count() == 0
+    assert db_session.query(Fact).filter(Fact.source_id == source_id).count() == 0
+    assert db_session.query(EntityRelation).filter(EntityRelation.id == edge_id).count() == 0
+    assert db_session.query(RelationSource).filter(RelationSource.source_id == source_id).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Knowledge is extracted by its own button, never by the confirmation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def extraction_calls(monkeypatch):
+    from app.services.knowledge_source_service import KnowledgeSourceService
+
+    calls = []
+
+    def fake_extraction(self, source, *, mode=None):
+        calls.append(source.ref_id)
+        return {"source_id": source.id, "status": "done"}
+
+    monkeypatch.setattr(KnowledgeSourceService, "request_extraction_sync", fake_extraction)
+    return calls
+
+
+def test_confirming_prepares_the_source_but_extracts_nothing(api, db_session, extraction_calls):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    assert client.post(f"/htr/pages/{page_id}/confirm").status_code == 200
+
+    assert extraction_calls == []
+    source = db_session.query(KnowledgeSource).filter_by(source_type="htr", ref_id=page_id).one()
+    assert source.extraction_status == "pending"
+
+
+def test_the_extract_button_runs_the_pipeline_on_a_confirmed_page(api, extraction_calls):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    client.post(f"/htr/pages/{page_id}/confirm")
+
+    response = client.post(f"/htr/pages/{page_id}/knowledge/extract")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "done"
+    assert extraction_calls == [page_id]
+
+
+def test_an_unconfirmed_page_has_no_knowledge_to_extract(api, extraction_calls):
+    client, _, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+
+    response = client.post(f"/htr/pages/{page_id}/knowledge/extract")
+
+    assert response.status_code == 409
+    assert extraction_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Background recognition, as the routes see it
+# ---------------------------------------------------------------------------
+
+
+def test_recognition_status_reports_the_page_and_the_queue(api):
+    client, _, author = api
+    page_id = upload(client, author.id)
+
+    body = client.get(f"/htr/pages/{page_id}/recognition-status").json()
+
+    assert body == {"page_id": page_id, "status": "UPLOADED", "background": "idle"}
+
+
+def test_only_uploaded_does_not_recognize_a_page_twice(api):
+    """The queue (or another tab) got there first: the result is returned as is."""
+    client, service, author = api
+    page_id = upload(client, author.id)
+    client.post(f"/htr/pages/{page_id}/recognize")
+    calls = len(service.recognizer.calls)
+
+    response = client.post(f"/htr/pages/{page_id}/recognize?only_uploaded=true")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "RECOGNIZED"
+    assert len(service.recognizer.calls) == calls

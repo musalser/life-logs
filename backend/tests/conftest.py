@@ -9,8 +9,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.config import settings
 from app.db import Base
 from app.models import HTRAuthor, User
+
+# Tests must never start the background recognition (it opens the real database
+# and runs kraken) nor spawn CPU worker processes behind a fake recognizer.
+settings.htr_background_recognition = False
+settings.htr_cpu_workers = 1
 
 
 @pytest.fixture()
