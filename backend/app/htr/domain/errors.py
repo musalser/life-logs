@@ -18,6 +18,10 @@ class CorruptImageError(HTRError):
     """Image cannot be opened/decoded."""
 
 
+class CorruptPdfError(HTRError):
+    """PDF cannot be opened, or one of its pages cannot be rendered."""
+
+
 class DuplicatePageError(HTRError):
     """A page with this name from this source is already in the author's corpus."""
 

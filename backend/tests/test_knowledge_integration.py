@@ -12,15 +12,13 @@ import json
 import pytest
 
 from app.models import (
+    FactSource,
     DiaryPage,
     Entity,
     EntityMention,
     EntityRelation,
-    Event,
     Fact,
     Goal,
-    Habit,
-    HabitLog,
     HTRAuthor,
     HTRLine,
     HTRPage,
@@ -129,6 +127,15 @@ def run_through_service(db, source, adapter, monkeypatch=None):
     return run(service.run_now(source))
 
 
+def self_fact(predicate, quote, **extra):
+    """Факт об авторе: ответ вызова фактов с пустыми необязательными полями."""
+    return {
+        "subject_kind": "self", "subject_name": "", "predicate": predicate,
+        "object_name": "", "object_text": "", "source_text": quote,
+        "time_text": "", "confidence": 0.9, **extra,
+    }
+
+
 def _pipeline_with(adapter, db, source):
     pipeline = ExtractionPipeline(db, source, adapter=adapter, embeddings=FakeEmbeddings(), service=KnowledgeSourceService(db))
     return pipeline.run()
@@ -154,26 +161,38 @@ def test_full_page_pipeline_writes_every_kind(db_session, user, author):
                         "object_text": "",
                         "source_text": "Моя мама приехала",
                         "time_text": "",
+                        # событие — это факт с важностью
+                        "importance": 0.5,
                         "confidence": 0.9,
-                    }
+                    },
+                    {
+                        "subject_kind": "self", "subject_name": "",
+                        "predicate": "бегал",
+                        "object_name": "",
+                        "object_text": "",
+                        "source_text": "бегал по утрам",
+                        "time_text": "",
+                        # регулярность — сырьё для привычек в аналитике
+                        "recurrence": "по утрам",
+                        "confidence": 0.9,
+                    },
                 ]
             },
             "relations": {"relations": [{"person_name": "мама", "relation_kind": "mother", "source_text": "Моя мама приехала", "confidence": 0.9}]},
-            "events": {"events": [{"title": "Приезд мамы", "description": "", "time_text": "", "importance": 0.5, "source_text": "Моя мама приехала"}]},
-            "habits": {"habits": [{"title": "бег", "note": "утром", "source_text": "бегал по утрам"}]},
         }
     )
     summary = run(run_source(db_session, source, adapter))
 
     assert summary["mentions_kept"] == 1
-    assert summary["facts_created"] == 1
+    assert summary["facts_created"] == 2
     assert summary["relations_created"] == 1
-    assert summary["events_created"] == 1
-    assert summary["habits_created"] == 1
     assert summary["chunks_created"] == 1
+    assert adapter.calls == ["entities", "mentions", "facts", "relations"]
 
     # офсеты указывают в текст источника
-    fact = db_session.query(Fact).one()
+    fact = db_session.query(Fact).filter_by(predicate="приехала").one()
+    assert fact.importance == 0.5
+    assert db_session.query(Fact).filter_by(predicate="бегал").one().recurrence == "по утрам"
     assert source.text[fact.start_offset : fact.end_offset] == fact.source_text
     mention = db_session.query(EntityMention).one()
     assert source.text[mention.start_offset : mention.end_offset] == mention.mention_text
@@ -187,7 +206,7 @@ def test_full_page_pipeline_writes_every_kind(db_session, user, author):
     assert source.extraction_status == "done"
     payload = source_status_payload(db_session, source)
     assert payload["last_run"]["status"] == "succeeded"
-    assert payload["last_run"]["stats"]["facts_created"] == 1
+    assert payload["last_run"]["stats"]["facts_created"] == 2
     assert payload["last_run"]["model"]
 
 
@@ -238,27 +257,24 @@ def test_reextraction_after_the_text_changes_drops_the_old_knowledge(db_session,
     service = KnowledgeSourceService(db_session)
     source, _, _ = service.refresh_from_diary_page(page)
 
-    first = FakeAdapter({"habits": {"habits": [{"title": "бег", "note": "пробежка", "source_text": "бегал по утрам"}]}})
+    first = FakeAdapter({"facts": {"facts": [self_fact("бегал", "бегал по утрам")]}})
     run(run_source(db_session, source, first))
-    assert db_session.query(Habit).count() == 1
-    assert db_session.query(Habit).filter_by(title="бег").count() == 1
+    assert [fact.predicate for fact in db_session.query(Fact).all()] == ["бегал"]
 
-    # текст изменился: привычка теперь называется иначе
+    # текст изменился: на странице теперь другое знание
     page.content = "Сегодня бегал по утрам и выучил английский язык."
     db_session.commit()
     source, created, changed = service.refresh_from_diary_page(page)
     assert changed is True
     assert source.extraction_status == "pending"
 
-    second = FakeAdapter(
-        {"habits": {"habits": [{"title": "изучение английского", "note": "учил слова", "source_text": "выучил английский язык"}]}}
-    )
+    second = FakeAdapter({"facts": {"facts": [self_fact("выучил", "выучил английский язык")]}})
     result = run_through_service(db_session, source, second)
     assert result["status"] == "done"
     summary = result["summary"]
-    assert summary["habits_created"] == 1
-    titles = {habit.title for habit in db_session.query(Habit).all()}
-    assert titles == {"изучение английского"}  # старой привычки больше нет
+    assert summary["facts_created"] == 1
+    predicates = {fact.predicate for fact in db_session.query(Fact).all()}
+    assert predicates == {"выучил"}  # старого факта больше нет
 
 
 def test_sync_and_async_modes_produce_the_same_result(db_session, user, monkeypatch):
@@ -278,7 +294,7 @@ def test_sync_and_async_modes_produce_the_same_result(db_session, user, monkeypa
 
     service = KnowledgeSourceService(db_session)
     sources = [service.refresh_from_diary_page(page)[0] for page in pages]
-    answers = {"habits": {"habits": [{"title": "бег", "note": "пробежка", "source_text": "бегал по утрам"}]}}
+    answers = {"facts": {"facts": [self_fact("бегал", "бегал по утрам", recurrence="по утрам")]}}
 
     # sync: конвейер выполняется прямо здесь
     sync_result = run_through_service(db_session, sources[0], FakeAdapter(answers))
@@ -307,12 +323,13 @@ def test_sync_and_async_modes_produce_the_same_result(db_session, user, monkeypa
     worker_result = run_through_service(db_session, sources[1], FakeAdapter(answers))
 
     assert worker_result["status"] == "done"
-    assert worker_result["summary"]["habits_created"] == sync_result["summary"]["habits_created"]
+    assert worker_result["summary"]["extracted_facts"] == sync_result["summary"]["extracted_facts"]
     db_session.refresh(sources[1])
     assert sources[1].extraction_status == "done"
-    # обе записи дали одинаковый набор знаний: две привычки-лога (по одному на
-    # источник) и ни одного лишнего прогона
-    assert db_session.query(HabitLog).count() == 2
+    # обе записи дали одно и то же знание: один факт, подтверждённый двумя
+    # источниками (по цитате на каждый), и ни одного лишнего прогона
+    assert db_session.query(Fact).count() == 1
+    assert db_session.query(FactSource).count() == 2
 
 
 def test_perspective_reaches_the_graph_and_analytics(db_session, user, author):
@@ -325,7 +342,7 @@ def test_perspective_reaches_the_graph_and_analytics(db_session, user, author):
         {
             "entities": {"entities": [{"name": "Елена", "entity_type": "person", "description": "", "aliases": []}]},
             "relations": {"relations": [{"person_name": "Елена", "relation_kind": "mother", "source_text": "Моя мама приехала", "confidence": 0.9}]},
-            "events": {"events": [{"title": "Приезд мамы", "description": "гостья", "time_text": "вчера", "importance": 0.6, "source_text": "Моя мама приехала"}]},
+            "facts": {"facts": [self_fact("встретил маму", "Моя мама приехала", importance=0.6, time_text="вчера")]},
         }
     )
     run(run_source(db_session, source, adapter))
@@ -337,11 +354,13 @@ def test_perspective_reaches_the_graph_and_analytics(db_session, user, author):
     assert [edge.relation_type for edge in edges] == ["мать"]
     assert [edge.relation_kind for edge in edges] == ["mother"]
 
-    # агрегат аналитики строится от перспективы автора и видит его событие
-    analytics = AnalyticsService(db_session, adapter=FakeAdapter({"insights": [], "questions": [], "ideas": [], "conclusions": []}))
+    # агрегат аналитики строится от перспективы автора и видит его событие —
+    # факт с пометкой важности
+    analytics = AnalyticsService(db_session, adapter=FakeAdapter({}))
     digest, index = analytics._digest(user.id, author_entity)
-    assert "Приезд мамы" in digest
-    assert index["event"]  # ссылка на событие существует, значит пункт можно сохранить
+    assert "встретил маму" in digest
+    assert "событие, важность 0.6" in digest
+    assert index["fact"]  # ссылка на факт существует, значит пункт можно сохранить
 
 
 def test_analytics_cache_is_invalidated_by_a_pipeline_run(db_session, user, author):

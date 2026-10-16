@@ -42,10 +42,14 @@ from ..models import (
     HTRPage,
     KnowledgeSource,
     KnowledgeState,
+    RelationSource,
     User,
 )
+from ..adapters.cloud_llm import knowledge_model_label
 from .extraction_pipeline import run_extraction
 from .extraction_prompts import CONTEXT_RULE
+from .kinship import aggregate_confirmations
+from .relation_store import apply_aggregate, confirmation_rows
 from .source_text import assemble_lines, manuscript_title, neighbor_context, text_hash
 
 logger = logging.getLogger(__name__)
@@ -97,9 +101,11 @@ WHERE user_id = :user_id
 #: the heads an extraction may create; deleting them keeps orphans from piling up.
 #: ``FactSource`` — подтверждения фактов этого источника: без них повторный
 #: прогон добавил бы к факту вторую цитату того же источника.
-_OWNED_CHILDREN = (
-    EntityMention, Fact, FactSource, GoalProgress, Event, HabitLog, Chunk, EntityRelation
-)
+#:
+#: ``EntityRelation`` здесь намеренно нет: ребро может быть подтверждено
+#: несколькими источниками, и удаление по ``source_id`` унесло бы чужие
+#: подтверждения. Рёбра чистятся отдельно, по ``relation_sources``.
+_OWNED_CHILDREN = (EntityMention, Fact, FactSource, GoalProgress, Event, HabitLog, Chunk)
 
 Pipeline = Callable[[Session, KnowledgeSource], Awaitable[dict[str, Any]]]
 
@@ -313,9 +319,15 @@ class KnowledgeSourceService:
         return removed
 
     def delete_source(self, source: KnowledgeSource) -> dict[str, int]:
-        """Removes a source and everything derived from it (page deleted). Commits."""
+        """Removes a source and everything derived from it (page deleted). Commits.
+
+        Версия знаний растёт и при удалении: иначе граф и кэш аналитики остались
+        бы с прежним ETag и продолжали показывать то, чего уже нет.
+        """
+        user_id = source.user_id
         removed = self.reset_source_knowledge(source)
         self.db.delete(source)
+        self._bump_knowledge_version(user_id)
         self.db.commit()
         return removed
 
@@ -341,6 +353,8 @@ class KnowledgeSourceService:
             )
             removed[model.__tablename__] = int(deleted or 0)
 
+        removed["entity_relations"] = self._reset_relations(source)
+
         removed["goals"] = int(
             self.db.query(Goal)
             .filter(
@@ -361,6 +375,68 @@ class KnowledgeSourceService:
         # the entities were deleted by raw SQL, so the session still holds them
         self.db.expire_all()
         return removed
+
+    def _reset_relations(self, source: KnowledgeSource) -> int:
+        """Убирает подтверждения этого источника и пересчитывает затронутые рёбра.
+
+        Удалять рёбра по ``source_id`` нельзя: после слияния ребро подтверждено
+        несколькими источниками, и перепрогон одной страницы унёс бы и чужие
+        подтверждения. Поэтому чистим только строки подтверждений, а ребро
+        удаляем, лишь когда подтверждений не осталось. Уверенность и цитата
+        пересчитываются из оставшихся — иначе они устаревают. Ребро прежнего
+        образца (источник в строке, подтверждений нет) принадлежит только этому
+        источнику и удаляется вместе с ним.
+        """
+        # рёбра прежнего образца: источник записан в самой строке, а строк
+        # подтверждений нет — такое ребро принадлежит только этому источнику
+        legacy_ids = [
+            row[0]
+            for row in self.db.query(EntityRelation.id)
+            .outerjoin(RelationSource, RelationSource.relation_id == EntityRelation.id)
+            .filter(EntityRelation.source_id == source.id, RelationSource.id.is_(None))
+            .all()
+        ]
+        affected = [
+            row[0]
+            for row in self.db.query(RelationSource.relation_id)
+            .filter(RelationSource.source_id == source.id)
+            .distinct()
+            .all()
+        ]
+        if not affected and not legacy_ids:
+            return 0
+        (
+            self.db.query(RelationSource)
+            .filter(RelationSource.source_id == source.id)
+            .delete(synchronize_session="fetch")
+        )
+        self.db.flush()
+        dropped = 0
+        for relation_id in legacy_ids:
+            edge = (
+                self.db.query(EntityRelation)
+                .filter(EntityRelation.id == relation_id)
+                .first()
+            )
+            if edge is not None:
+                self.db.delete(edge)
+                dropped += 1
+        for relation_id in affected:
+            relation = (
+                self.db.query(EntityRelation)
+                .filter(EntityRelation.id == relation_id)
+                .first()
+            )
+            if relation is None:
+                continue
+            aggregate = aggregate_confirmations(confirmation_rows(self.db, relation_id))
+            if aggregate is None:
+                self.db.delete(relation)
+                dropped += 1
+                continue
+            apply_aggregate(relation, aggregate)
+        self.db.flush()
+        return dropped
 
     # ------------------------------------------------------------------
     # Neighbour context (6.2)
@@ -447,7 +523,7 @@ class KnowledgeSourceService:
                 error="у источника нет автора-объекта: привяжите автора рукописи к объекту",
             )
 
-        run = ExtractionRun(source_id=source_id, status=RUN_RUNNING, model=settings.llm_model)
+        run = ExtractionRun(source_id=source_id, status=RUN_RUNNING, model=knowledge_model_label())
         self.db.add(run)
         self.db.commit()
         run_id = run.id

@@ -30,8 +30,11 @@ from ..models import (
     KnowledgeInsight,
     KnowledgeSource,
     KnowledgeState,
+    RelationSource,
     User,
 )
+from .kinship import aggregate_confirmations
+from .relation_store import apply_aggregate, canonical_fields, confirmation_rows
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +66,14 @@ def _bump_version(db: Session, user_id: int) -> None:
 
 
 def _merge_edges(db: Session, user: User, source: Entity, target: Entity) -> None:
-    """Re-points the graph edges of ``source`` at ``target``, deduping collisions.
+    """Re-points the graph edges of ``source`` at ``target``, recomputing canon.
 
-    Reassigning can make two edges identical (``target -> X, "друг"`` from both
-    the source's and the target's own text), which would violate
-    ``uq_entity_relation_edge``. Every edge touching either object is therefore
-    folded onto its post-merge identity first, and only the best one survives.
+    Переписывание концов меняет каноническую пару и токен, а они хранятся
+    колонками: без пересчёта той же функцией, что и при записи, уникальность
+    упадёт на первом же слиянии. Рёбра, ставшие одинаковыми по каноническому
+    ключу, склеиваются вместе с подтверждениями, петли (автор → автор)
+    удаляются, а концы переносятся **после** удаления дублей — SQLAlchemy
+    выполняет обновления раньше удалений, и иначе flush упал бы на уникальности.
     """
     edges = (
         db.query(EntityRelation)
@@ -81,29 +86,62 @@ def _merge_edges(db: Session, user: User, source: Entity, target: Entity) -> Non
         )
         .all()
     )
-    groups: dict[tuple[int, int, str], list[EntityRelation]] = {}
+    planned: list[tuple[EntityRelation, int, int, dict]] = []
     for edge in edges:
         from_id = target.id if edge.from_entity_id in (source.id, target.id) else edge.from_entity_id
         to_id = target.id if edge.to_entity_id in (source.id, target.id) else edge.to_entity_id
         if from_id == to_id:
-            # a self-loop has no meaning on the graph: drop it
             db.delete(edge)
             continue
-        groups.setdefault((from_id, to_id, edge.relation_type), []).append(edge)
+        fields = canonical_fields(
+            kind=edge.relation_kind,
+            generations=edge.generations,
+            via_marriage=edge.via_marriage,
+            bond=edge.bond,
+            from_id=from_id,
+            to_id=to_id,
+            relation_type=edge.relation_type,
+        )
+        planned.append((edge, from_id, to_id, fields))
 
-    for (from_id, to_id, relation_type), group in groups.items():
-        group.sort(key=lambda e: (0 if e.confidence is not None else 1, -(e.confidence or 0.0), e.id))
-        for duplicate in group[1:]:
-            db.delete(duplicate)
-    # Deletes must land before the surviving edge is moved onto the now-freed
-    # identity: SQLAlchemy runs updates before deletes, so moving a keeper onto
-    # the same (from, to, type) a duplicate still occupies would trip the unique
-    # constraint mid-flush.
+    groups: dict[tuple[int, int, str], list[tuple[EntityRelation, int, int, dict]]] = {}
+    for item in planned:
+        fields = item[3]
+        key = (fields["canon_from"], fields["canon_to"], fields["canon_key"])
+        groups.setdefault(key, []).append(item)
+
+    keepers: list[tuple[EntityRelation, int, int, dict]] = []
+    for group in groups.values():
+        group.sort(key=lambda item: (0 if item[0].confidence is not None else 1, -(item[0].confidence or 0.0), item[0].id))
+        keeper = group[0]
+        keepers.append(keeper)
+        for _edge, _from, _to, _fields in group[1:]:
+            loser = _edge
+            for row in list(loser.confirmations):
+                duplicate = (
+                    db.query(RelationSource)
+                    .filter(
+                        RelationSource.relation_id == keeper[0].id,
+                        RelationSource.source_id == row.source_id,
+                    )
+                    .first()
+                )
+                if duplicate is None:
+                    loser.confirmations.remove(row)
+                    keeper[0].confirmations.append(row)
+                else:
+                    db.delete(row)
+            db.delete(loser)
     db.flush()
-    for (from_id, to_id, relation_type), group in groups.items():
-        keep = group[0]
-        keep.from_entity_id = from_id
-        keep.to_entity_id = to_id
+
+    for edge, from_id, to_id, fields in keepers:
+        edge.from_entity_id = from_id
+        edge.to_entity_id = to_id
+        for name, value in fields.items():
+            setattr(edge, name, value)
+        aggregate = aggregate_confirmations(confirmation_rows(db, edge.id))
+        if aggregate is not None:
+            apply_aggregate(edge, aggregate)
     db.flush()
 
 

@@ -12,6 +12,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
+from sqlalchemy import event
 from pgvector.sqlalchemy import Vector
 
 from .db import Base
@@ -261,6 +262,14 @@ class Fact(Base):
     emotion_label = Column(String(32), nullable=True, index=True)
     sentiment_score = Column(Float, nullable=True)
     confidence = Column(Float, nullable=True)
+    #: насколько факт меняет жизнь субъекта (0..1). Событие — это факт с
+    #: важностью: переезд, свадьба, болезнь. Отдельного вызова и таблицы для
+    #: событий нет, иначе у них не было бы ни субъекта, ни подтверждений.
+    importance = Column(Float, nullable=True, index=True)
+    #: как текст говорит о регулярности («каждое утро», «по выходным»). Привычку
+    #: по одной странице не установить: это сырьё для аналитики, которая
+    #: сопоставляет накопленные факты.
+    recurrence = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="facts")
@@ -417,13 +426,17 @@ class EntityRelation(Base):
     """
 
     __tablename__ = "entity_relations"
+    #: уникальность по канонической паре, а не по направлению источника:
+    #: «A → B, отец» и «B → A, ребёнок» — один факт, а «A → B, отец» и
+    #: «B → A, отец» — разные (родительский цикл), и он обязан попасть в
+    #: диагностику, а не склеиться
     __table_args__ = (
         UniqueConstraint(
             "user_id",
-            "from_entity_id",
-            "to_entity_id",
-            "relation_type",
-            name="uq_entity_relation_edge",
+            "canon_from",
+            "canon_to",
+            "canon_key",
+            name="uq_entity_relation_canonical",
         ),
     )
 
@@ -438,8 +451,23 @@ class EntityRelation(Base):
     # sister, friend, colleague, mother, ... — подпись для интерфейса
     relation_type = Column(String(64), nullable=False)
     #: канонический ключ отношения из закрытого списка (father, mother, …) —
-    #: по нему ищется якорная сущность и сравниваются рёбра
+    #: по нему ищется якорная сущность и сравниваются рёбра. Источник истины:
+    #: пара (up, down) в базе не хранится, она выводится из вида таблицей
+    #: app.services.kinship
     relation_kind = Column(String(32), nullable=True, index=True)
+    #: глубина для прадеда и дальше (3..6); NULL — вид задаёт её сам
+    generations = Column(Integer, nullable=True)
+    #: свойство́: отношение проходит через брак («тесть» = parent + брак)
+    via_marriage = Column(Boolean, nullable=True)
+    #: blood | half | step | adoptive | ritual — подразумевается видом
+    bond = Column(String(16), nullable=True)
+    #: каноническая пара без направления источника и токен вида: по ним
+    #: сравниваются рёбра и строится уникальность
+    #: индексов по отдельности нет: они ищутся вместе с user_id, а это префикс
+    #: уникального ограничения ниже
+    canon_from = Column(Integer, nullable=False)
+    canon_to = Column(Integer, nullable=False)
+    canon_key = Column(String(64), nullable=False)
     confidence = Column(Float, nullable=True)
     evidence_text = Column(Text, nullable=True)
     #: where the edge was read (NULL for edges migrated from the old
@@ -458,9 +486,82 @@ class EntityRelation(Base):
     )
     to_entity = relationship("Entity", foreign_keys=[to_entity_id], back_populates="to_relations")
     source = relationship("KnowledgeSource")
+    #: подтверждения по источникам: жизненный цикл ребра ведётся по ним, а не по
+    #: ``source_id`` — иначе перепрогон одной страницы удалил бы ребро, которое
+    #: подтверждает и другая
+    confirmations = relationship(
+        "RelationSource", back_populates="relation", cascade="all, delete-orphan"
+    )
+
+
+class RelationSource(Base):
+    """Одно подтверждение ребра в конкретном источнике.
+
+    Ребро может быть прочитано на нескольких страницах, и каждая — со своим
+    видом, словом, цитатой и уверенностью. Очистка источника удаляет только его
+    подтверждения; ребро исчезает, лишь когда подтверждений не осталось, а его
+    уверенность и цитата пересчитываются из оставшихся.
+    """
+
+    __tablename__ = "relation_sources"
+    __table_args__ = (
+        UniqueConstraint("relation_id", "source_id", name="uq_relation_source_relation_source"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    relation_id = Column(
+        Integer, ForeignKey("entity_relations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_id = Column(
+        Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: вид и слово так, как их назвал этот источник (для диагностики расхождений)
+    relation_kind = Column(String(32), nullable=True)
+    relation_type = Column(String(64), nullable=True)
+    generations = Column(Integer, nullable=True)
+    via_marriage = Column(Boolean, nullable=True)
+    bond = Column(String(16), nullable=True)
+    confidence = Column(Float, nullable=True)
+    evidence_text = Column(Text, nullable=True)
+    start_offset = Column(Integer, nullable=True)
+    end_offset = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    relation = relationship("EntityRelation", back_populates="confirmations")
+    source = relationship("KnowledgeSource", back_populates="relation_quotes")
+
+
+@event.listens_for(EntityRelation, "before_insert")
+@event.listens_for(EntityRelation, "before_update")
+def _ensure_canonical_pair(_mapper, _connection, target) -> None:
+    """Каноническая пара считается при любой записи ребра, а не только вызывающим.
+
+    Иначе второй путь записи (или тест) молча получил бы ключ, расходящийся с
+    данными, и уникальность перестала бы ловить дубли. Функция та же, что у
+    уровней, — app.services.relation_store.
+    """
+    from .services.relation_store import canonical_fields
+
+    fields = canonical_fields(
+        kind=target.relation_kind,
+        generations=target.generations,
+        via_marriage=target.via_marriage,
+        bond=target.bond,
+        from_id=target.from_entity_id,
+        to_id=target.to_entity_id,
+        relation_type=target.relation_type,
+    )
+    for name, value in fields.items():
+        setattr(target, name, value)
 
 
 class Event(Base):
+    """Устарело: события теперь факты с ``Fact.importance``.
+
+    Таблица сохранена, чтобы миграция 6f7a8b9c0d1e была обратимой; конвейер
+    её не пишет, а интерфейс и аналитика не читают.
+    """
+
     __tablename__ = "events"
     __table_args__ = (
         Index(
@@ -497,6 +598,12 @@ class Event(Base):
 
 
 class Habit(Base):
+    """Устарело: привычки выводит аналитика из накопленных фактов.
+
+    По одной странице регулярность не установить, поэтому конвейер больше не
+    извлекает привычки; таблица оставлена ради старых данных.
+    """
+
     __tablename__ = "habits"
     __table_args__ = (
         Index(
@@ -592,6 +699,9 @@ class KnowledgeSource(Base):
     facts = relationship("Fact", back_populates="source", cascade="all, delete-orphan")
     fact_quotes = relationship(
         "FactSource", back_populates="source", cascade="all, delete-orphan"
+    )
+    relation_quotes = relationship(
+        "RelationSource", back_populates="source", cascade="all, delete-orphan"
     )
     goal_progress = relationship(
         "GoalProgress", back_populates="source", cascade="all, delete-orphan"

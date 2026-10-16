@@ -16,4 +16,10 @@ dependencies = [
 	"sentence-transformers>=6.1.0",
 	# vector columns (pgvector/pgvector:pg16 ships the extension)
 	"pgvector>=0.5.1",
+	# PDF import: one scanned PDF becomes one page per sheet; the wheel carries
+	# PDFium, so no poppler/ghostscript is needed (see app/htr/README.md)
+	"pypdfium2>=5.0.0",
+	# cloud models for knowledge extraction (app/adapters/cloud_llm.py)
+	"anthropic>=1.15.0",
+	"openai>=3.31.0",
 ]

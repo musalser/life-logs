@@ -41,9 +41,12 @@ def _first_json_object(raw: str | None) -> str | None:
 
 
 class OllamaAdapter:
-    def __init__(self) -> None:
+    provider = "ollama"
+
+    def __init__(self, model: str | None = None) -> None:
         self.client = ollama.AsyncClient(host=settings.ollama_url)
-        self.model = settings.llm_model
+        #: модель знаний может отличаться от модели чата (knowledge_llm_model)
+        self.model = model or settings.llm_model
         self.keep_alive = KEEP_ALIVE
 
     async def warmup(self) -> None:

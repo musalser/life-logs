@@ -5,10 +5,15 @@
 
 Как это устроено и почему так:
 
-* **Каждый вызов независим.** Семь обращений к модели (сущности, упоминания,
-  факты, связи, цели, события, привычки) идут последовательно, и падение одного
-  не отменяет остальные: текст, из которого не извлеклись привычки, всё равно
-  даёт цели и связи. Ошибки собираются в статистику прогона.
+* **Каждый вызов независим.** Четыре обращения к модели (сущности, упоминания,
+  факты, связи) идут последовательно, и падение одного не отменяет остальные:
+  текст, из которого не извлеклись связи, всё равно даёт факты. Ошибки
+  собираются в статистику прогона.
+* **События и цели — это факты.** Событие — факт с важностью (``importance``),
+  цель — факт с ``goal_title`` (только дневник). Отдельных вызовов нет: у факта
+  уже есть разрешение субъекта, подтверждения и дедуп. Привычки не извлекаются:
+  по одной странице регулярность не установить, их выводит аналитика по
+  накопленным фактам (``recurrence`` — её сырьё).
 * **Резолюция батчами.** Сопоставление «новое ↔ существующее» — самый дорогой
   шаг (он видит все головы пользователя), поэтому реляционные типы проходят его
   один раз на прогон, а не по элементу.
@@ -31,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
@@ -43,18 +49,15 @@ from ..models import (
     Entity,
     EntityMention,
     EntityRelation,
-    Event,
     Fact,
     FactConflict,
     FactSource,
     Goal,
     GoalProgress,
-    Habit,
-    HabitLog,
     KnowledgeSource,
     User,
 )
-from ..adapters.ollama_adapter import OllamaAdapter
+from ..adapters.cloud_llm import StructuredLLM, knowledge_adapter
 from . import extraction_prompts as prompts
 from .embedding_service import EmbeddingError, EmbeddingService, get_embedding_service
 from .predicate_kinds import (
@@ -63,18 +66,26 @@ from .predicate_kinds import (
     is_functional as is_functional_predicate,
     normalize_predicate_kind,
 )
+from .kinship import aggregate_confirmations
 from .relation_kinds import (
     anchor_display_name,
     is_functional,
     normalize_relation,
     relation_label,
 )
+from .relation_store import (
+    apply_aggregate,
+    canonical_fields,
+    confirmation_payload,
+    confirmation_rows,
+    upsert_confirmation,
+)
 from .source_text import chunk_text
 
 logger = logging.getLogger(__name__)
 
 #: реляционные типы, которые проходят резолюцию батчем
-RESOLUTION_KINDS = ("entities", "goals", "habits", "events")
+RESOLUTION_KINDS = ("entities", "goals")
 
 #: сколько символов цитаты показывать в логах
 LOG_QUOTE = 80
@@ -269,6 +280,64 @@ def _fact_value(
     return _normalize(time_text or object_text or object_name)
 
 
+def _dates_differ(
+    left_text: str | None, left_iso: str | None, right_text: str | None, right_iso: str | None
+) -> bool:
+    """Две даты факта точно разные (у одной из сторон даты нет — не разные).
+
+    Приведённые даты сравниваются терпимо к точности («1910» и «1910-08-20» —
+    одна дата), иначе сравниваются числа из текста.
+    """
+    a, b = _clean(left_iso), _clean(right_iso)
+    if a and b:
+        return not (a.startswith(b) or b.startswith(a))
+    left_digits, right_digits = _digits(left_text), _digits(right_text)
+    if left_digits and right_digits:
+        return left_digits != right_digits
+    return False
+
+
+def _name_words(value: str | None) -> list[str]:
+    return [word for word in re.split(r"[^\w]+", _normalize(value)) if word]
+
+
+def _word_matches(a: str, b: str) -> bool:
+    """Одно слово имени: равенство или общий корень («Виталии» ~ «Виталий»).
+
+    Корень — общий префикс не короче 4 букв и без хвоста длиннее 2 букв, поэтому
+    падежи и описки рукописи совпадают, а «Лена» с «Еленой» — нет.
+    """
+    if a == b:
+        return True
+    common = len(os.path.commonprefix([a, b]))
+    return common >= 4 and common >= min(len(a), len(b)) - 2
+
+
+def _name_matches(hint: str | None, name: str | None) -> bool:
+    """Каждое слово подсказки находится в имени: «Павел» ~ «Павел Фредорович»."""
+    hint_words, name_words = _name_words(hint), _name_words(name)
+    if not hint_words or not name_words:
+        return False
+    return all(any(_word_matches(h, w) for w in name_words) for h in hint_words)
+
+
+def _entity_names(entity: Entity) -> list[str]:
+    try:
+        aliases = json.loads(entity.aliases_json) if entity.aliases_json else []
+    except (json.JSONDecodeError, TypeError):
+        aliases = []
+    return [entity.canonical_name] + [str(alias) for alias in aliases if alias]
+
+
+def _is_goal(item: dict[str, Any]) -> bool:
+    """Факт о цели: есть название цели и статус не «none»."""
+    return bool(_clean(item.get("goal_title"))) and _normalize(item.get("goal_status")) != "none"
+
+
+def _goal_items(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in facts if _is_goal(item)]
+
+
 def _date_body(value: str) -> str:
     """Значение даты без пометки источника: ``iso:1910-08-20`` -> ``1910-08-20``."""
     _prefix, _sep, body = value.partition(":")
@@ -310,13 +379,17 @@ class ExtractionPipeline:
         db: Session,
         source: KnowledgeSource,
         *,
-        adapter: OllamaAdapter | None = None,
+        adapter: StructuredLLM | None = None,
         embeddings: EmbeddingService | None = None,
         service: Any | None = None,
     ) -> None:
         self.db = db
         self.source = source
-        self.adapter = adapter or OllamaAdapter()
+        # Ollama по умолчанию; Claude/OpenAI/DeepSeek — по KNOWLEDGE_LLM_PROVIDER.
+        # Свой адаптер конвейер закрывает сам: иначе HTTP-клиент облака закрывает
+        # сборщик мусора уже после asyncio.run (воркер, скрипты) — «Event loop is closed»
+        self._owns_adapter = adapter is None
+        self.adapter = adapter or knowledge_adapter()
         self.embeddings = embeddings or get_embedding_service()
         #: KnowledgeSourceService — за автором-объектом и контекстом соседних страниц
         self.service = service
@@ -353,6 +426,13 @@ class ExtractionPipeline:
     # ------------------------------------------------------------------
 
     async def run(self) -> dict[str, Any]:
+        try:
+            return await self._run()
+        finally:
+            if self._owns_adapter and hasattr(self.adapter, "aclose"):
+                await self.adapter.aclose()
+
+    async def _run(self) -> dict[str, Any]:
         if not self.text.strip():
             self.stats["skipped"] = "empty source text"
             return self.stats
@@ -374,19 +454,28 @@ class ExtractionPipeline:
         for kind, items in raw.items():
             self.stats[f"{prefix}_{kind}"] = len(items)
 
+    @property
+    def with_goals(self) -> bool:
+        """Цели извлекаются только из дневника: в рукописях архива их почти нет."""
+        return self.source.source_type == "diary"
+
     async def _extract_all(self) -> dict[str, list[dict[str, Any]]]:
-        """Вызовы A–E: каждый сам по себе, сбой одного не отменяет остальные."""
+        """Четыре вызова; каждый сам по себе, сбой одного не отменяет остальные.
+
+        Промпты начинаются с одного и того же блока документа, поэтому Ollama
+        переиспользует KV-кэш текста страницы между вызовами.
+        """
         raw: dict[str, list[dict[str, Any]]] = {
             "entities": [],
             "mentions": [],
             "facts": [],
             "relations": [],
-            "goals": [],
-            "events": [],
-            "habits": [],
         }
+        author = self.author_name
 
-        raw["entities"] = await self._call("entities", prompts.ENTITIES_SCHEMA, lambda: prompts.entities_prompt(self.text, self.context))
+        raw["entities"] = await self._call(
+            "entities", prompts.ENTITIES_SCHEMA, lambda: prompts.entities_prompt(self.text, self.context, author)
+        )
         names = [_clean(item.get("name")) for item in raw["entities"] if _clean(item.get("name"))]
         known = [entity.canonical_name for entity in self._known_people(limit=40)]
         for name in known:
@@ -394,29 +483,22 @@ class ExtractionPipeline:
                 names.append(name)
 
         raw["mentions"] = await self._call(
-            "mentions", prompts.MENTIONS_SCHEMA, lambda: prompts.mentions_prompt(self.text, self.context, names)
+            "mentions",
+            prompts.MENTIONS_SCHEMA,
+            lambda: prompts.mentions_prompt(self.text, self.context, names, author),
         )
         # граф известных близких: модель ссылается на уже заведённого человека
         # по id, а не заводит его заново под другим написанием имени
         graph = prompts.graph_block(self._author_relatives())
         raw["facts"] = await self._call(
             "facts",
-            prompts.FACTS_SCHEMA,
-            lambda: prompts.facts_prompt(self.text, self.context, self.author_name, graph),
+            prompts.facts_schema(with_goals=self.with_goals),
+            lambda: prompts.facts_prompt(self.text, self.context, author, graph, with_goals=self.with_goals),
         )
         raw["relations"] = await self._call(
             "relations",
             prompts.RELATIONS_SCHEMA,
-            lambda: prompts.relations_prompt(self.text, self.context, self.author_name, known, graph),
-        )
-        raw["goals"] = await self._call(
-            "goals", prompts.GOALS_SCHEMA, lambda: prompts.goals_prompt(self.text, self.context, self.author_name)
-        )
-        raw["events"] = await self._call(
-            "events", prompts.EVENTS_SCHEMA, lambda: prompts.events_prompt(self.text, self.context, self.author_name)
-        )
-        raw["habits"] = await self._call(
-            "habits", prompts.HABITS_SCHEMA, lambda: prompts.habits_prompt(self.text, self.context, self.author_name)
+            lambda: prompts.relations_prompt(self.text, self.context, author, known, graph),
         )
         return raw
 
@@ -493,26 +575,22 @@ class ExtractionPipeline:
         )
 
     def _existing(self, kind: str, limit: int = prompts.EXISTING_LIMIT) -> list[tuple[int, str]]:
-        model = {"goals": Goal, "habits": Habit, "events": Event}.get(kind)
-        if model is None:
+        if kind != "goals":
             return [(entity.id, entity.canonical_name) for entity in self._known_people(limit)]
-        query = self.db.query(model).filter(model.user_id == self.source.user_id)
-        if kind in ("habits", "events") and self.author is not None:
-            query = query.filter(model.subject_entity_id == self.author.id)
-        order = model.updated_at.desc() if hasattr(model, "updated_at") else model.id.desc()
-        rows = query.order_by(order).limit(limit).all()
-        labels = {
-            "goals": lambda row: row.title,
-            "habits": lambda row: row.title,
-            "events": lambda row: f"{row.title} ({row.time_text})" if row.time_text else row.title,
-        }[kind]
-        return [(row.id, labels(row)) for row in rows]
+        rows = (
+            self.db.query(Goal)
+            .filter(Goal.user_id == self.source.user_id)
+            .order_by(Goal.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [(row.id, row.title) for row in rows]
 
     def _existing_by_id(self, kind: str, ids: Iterable[int]) -> dict[int, Any]:
         ids = [record_id for record_id in ids if record_id and record_id > 0]
         if not ids:
             return {}
-        model = {"entities": Entity, "goals": Goal, "habits": Habit, "events": Event}[kind]
+        model = {"entities": Entity, "goals": Goal}[kind]
         rows = self.db.query(model).filter(model.id.in_(ids)).all()
         return {row.id: row for row in rows}
 
@@ -522,46 +600,71 @@ class ExtractionPipeline:
 
     async def _resolve(self, raw: dict[str, list[dict[str, Any]]]) -> None:
         await self._resolve_entities(raw["entities"])
-        await self._resolve_labels("goals", raw["goals"], lambda item: _clean(item.get("title")))
-        await self._resolve_labels("habits", raw["habits"], lambda item: _clean(item.get("title")))
-        self._resolve_events(raw["events"])
+        # цель — факт с названием цели: резолвер решает, та ли это цель, что уже есть
+        if self.with_goals:
+            await self._resolve_labels(
+                "goals", _goal_items(raw["facts"]), lambda item: _clean(item.get("goal_title"))
+            )
         await self._resolve_relatives(raw["facts"])
 
     async def _resolve_relatives(self, facts: list[dict[str, Any]]) -> None:
-        """Роль с несколькими кандидатами (два брата) — решает резолвер.
+        """Роль с несколькими кандидатами (два брата) — решает резолвер, одним вызовом.
 
         Якорная сущность одна на роль только для «одного отца»: братьев,
         друзей, внуков может быть много. Если на роль уже есть несколько
         человек, выбор между ними — вопрос смысла, а не структуры, и его решает
-        та же LLM-резолюция, что и для имён. Не выбрала — в записи создастся
-        новая якорная сущность (слияние остаётся пользователю).
+        та же LLM-резолюция, что и для имён. Все такие роли страницы уходят в
+        резолвер одним вызовом, а одинаковые упоминания («брат Павел» в пяти
+        фактах) — одним кандидатом: раньше это был отдельный вызов на факт.
+        Не выбрала — в записи создастся новая якорная сущность (слияние
+        остаётся пользователю).
         """
         if self.author is None:
             return
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        candidates_of: dict[tuple[str, str], list[Entity]] = {}
         for item in facts:
             if _normalize(item.get("subject_kind")) != "relative":
                 continue
             if _normalize(item.get("subject_of")) not in ("", "self"):
                 continue  # вложенный якорь разрешается структурно при записи
             kind = normalize_relation(item.get("subject_relation"))
-            candidates = self._relative_candidates(kind)
+            if kind not in candidates_of:
+                candidates_of[kind] = self._relative_candidates(kind)
+            candidates = candidates_of[kind]
             if len(candidates) == 1:
                 item["_relative_id"] = candidates[0].id
                 continue
             if len(candidates) < 2:
                 continue
             label = _clean(item.get("subject_name")) or f"мой {relation_label(kind)}"
-            existing = [(entity.id, entity.canonical_name) for entity in candidates]
-            neighbours = {
-                0: [(entity.id, entity.canonical_name, 1.0) for entity in candidates]
-            }
-            matches = await self._ask_resolver("entities", [(0, label)], existing, neighbours)
-            chosen = matches.get(0)
-            if chosen is not None:
-                item["_relative_id"] = chosen
-                self._count("relative_resolved")
-            else:
-                self._count("relative_unresolved")
+            groups.setdefault((kind, label), []).append(item)
+        if not groups:
+            return
+
+        keys = list(groups)
+        existing: dict[int, str] = {}
+        neighbours: dict[int, list[tuple[int, str, float]]] = {}
+        for index, (kind, _label) in enumerate(keys):
+            neighbours[index] = [(entity.id, entity.canonical_name, 1.0) for entity in candidates_of[kind]]
+            for entity in candidates_of[kind]:
+                existing[entity.id] = entity.canonical_name
+        matches = await self._ask_resolver(
+            "entities",
+            [(index, f"{label} ({relation_label(kind)} автора)") for index, (kind, label) in enumerate(keys)],
+            list(existing.items()),
+            neighbours,
+        )
+        for index, key in enumerate(keys):
+            chosen = matches.get(index)
+            # резолвер видит соседей всех кандидатов: выбор вне своей роли не принимаем
+            allowed = {entity_id for entity_id, _, _ in neighbours[index]}
+            for item in groups[key]:
+                if chosen in allowed:
+                    item["_relative_id"] = chosen
+                    self._count("relative_resolved")
+                else:
+                    self._count("relative_unresolved")
 
     def _relative_candidates(self, kind: str) -> list[Entity]:
         """Кто из уже известных людей может быть этим родственником автора."""
@@ -594,7 +697,21 @@ class ExtractionPipeline:
                 found[entity.id] = entity
         return list(found.values())
 
-    async def _resolve_labels(self, kind: str, items: list[dict[str, Any]], label_of) -> None:
+    async def _resolve_labels(
+        self,
+        kind: str,
+        items: list[dict[str, Any]],
+        label_of,
+        *,
+        describe=None,
+        existing_described: dict[int, str] | None = None,
+    ) -> None:
+        """Кандидаты отбираются по ``label_of``, а резолвер видит ``describe``.
+
+        Эмбеддинг считается по голому имени (описание сдвинуло бы косинус), но
+        решать «тот же ли человек» по одному имени нельзя: «Лена» (дочь
+        Виталия) и «Елена Юрьевна» (мама автора) — разные люди.
+        """
         if not items:
             return
         existing = self._existing(kind)
@@ -617,10 +734,16 @@ class ExtractionPipeline:
         for index in pending_indexes:
             items[index]["_neighbours"] = neighbours[index]
 
+        shown = describe or label_of
+        shown_existing = (
+            [(record_id, existing_described.get(record_id, label)) for record_id, label in existing]
+            if existing_described
+            else existing
+        )
         matches = await self._ask_resolver(
             kind,
-            [(index, label_of(items[index])) for index in pending_indexes],
-            existing,
+            [(index, shown(items[index])) for index in pending_indexes],
+            shown_existing,
             neighbours,
         )
         hits = 0
@@ -631,28 +754,27 @@ class ExtractionPipeline:
         self.stats[f"{kind}_matched"] = hits
 
     async def _resolve_entities(self, items: list[dict[str, Any]]) -> None:
-        """Сущности: кандидаты и запросы идут одним батчем, ключ — имя."""
-        await self._resolve_labels("entities", items, lambda item: _clean(item.get("name")))
+        """Сущности: кандидаты и запросы идут одним батчем, ключ — имя.
 
-    def _resolve_events(self, items: list[dict[str, Any]]) -> None:
-        """События решает LLM, но разные даты запрещают слияние.
-
-        Эмбеддинг «день рождения сына 2023» и «…2024» — почти один вектор
-        (0.955), поэтому предохранитель по датам стоит до всякой модели.
+        Резолвер видит имя вместе с описанием: у нового — что о нём сказано на
+        странице, у известного — его описание в базе.
         """
-        if not items:
-            return
-        existing = self._existing("events")
-        for item in items:
-            item["_match_id"] = -1
-            item_time = _digits(item.get("time_text"))
-            for record_id, label in existing:
-                if not item_time:
-                    continue
-                row = self._existing_by_id("events", [record_id]).get(record_id)
-                if row is not None and _digits(row.time_text) and _digits(row.time_text) != item_time:
-                    item.setdefault("_blocked", set()).add(record_id)
-        self.stats["events_guarded"] = sum(len(item.get("_blocked", ())) for item in items)
+
+        def described(name: str, description: str | None) -> str:
+            description = _clean(description)
+            return f"{name} — {description}" if description else name
+
+        existing_described = {
+            entity.id: described(entity.canonical_name, entity.description)
+            for entity in self._known_people(prompts.EXISTING_LIMIT)
+        }
+        await self._resolve_labels(
+            "entities",
+            items,
+            lambda item: _clean(item.get("name")),
+            describe=lambda item: described(_clean(item.get("name")), item.get("description")),
+            existing_described=existing_described,
+        )
 
     async def _embedding_candidates(
         self,
@@ -741,9 +863,6 @@ class ExtractionPipeline:
         known = {**entities, **{entity.canonical_name: entity for entity in self._known_people(200)}}
         self._write_facts(raw["facts"], known)
         self._write_relations(raw["relations"], known)
-        self._write_goals(raw["goals"])
-        self._write_events(raw["events"])
-        self._write_habits(raw["habits"])
         self.db.flush()
 
     def _get_or_create_entity(
@@ -934,13 +1053,17 @@ class ExtractionPipeline:
         """
         # Явный id из графа сильнее любого имени: модель выбрала человека,
         # которого мы ей показали
+        kind = _normalize(item.get("subject_kind"))
         subject_id = item.get("subject_id")
         if isinstance(subject_id, int) and not isinstance(subject_id, bool) and subject_id > 0:
             entity = self._entity_by_id(subject_id)
-            if entity is not None:
+            if entity is not None and self._subject_id_agrees(item, kind, entity, known):
                 self._count("facts_subject_graph")
                 return entity, "graph"
-        kind = _normalize(item.get("subject_kind"))
+            if entity is not None:
+                # id противоречит тому, что модель сама сказала о субъекте
+                # («Лена, дочь Виталия» с id мамы автора): решает структура
+                self._count("facts_subject_id_rejected")
         if kind == "self":
             if self.author is None:
                 return None, None
@@ -973,6 +1096,79 @@ class ExtractionPipeline:
         self._count("facts_subject_invalid")
         return None, None
 
+    def _subject_id_agrees(
+        self, item: dict[str, Any], kind: str, entity: Entity, known: dict[str, Entity]
+    ) -> bool:
+        """Совпадает ли выбранный по id человек с описанием субъекта.
+
+        Для родственника — родство с якорем (``_kin_consistent``); для
+        названного по имени — имя (каноническое или алиас). Без описания id
+        принимается как есть: противоречить нечему.
+        """
+        name = _clean(item.get("subject_name"))
+        if kind == "relative":
+            anchor = self._relative_anchor(known, item.get("subject_of"))
+            if anchor is None:
+                return False
+            relation = normalize_relation(item.get("subject_relation"))
+            if not self._kin_consistent(anchor, entity, relation, name):
+                return False
+            if relation != "other":
+                self._ensure_relation(anchor, entity, relation)
+            return True
+        if kind == "named" and name:
+            return any(_name_matches(name, value) for value in _entity_names(entity))
+        return True
+
+    def _relative_anchor(self, known: dict[str, Entity], of: Any) -> Entity | None:
+        """К кому относится родство: автор, вложенный родственник или человек по имени.
+
+        Модель пишет в ``subject_of`` и ключ родства («father» — отец автора), и
+        имя («Виталий»). Имя раньше читалось как вид родства «other», и «дочь
+        Виталия» становилась родственницей безымянного «другого» автора.
+        """
+        value = _normalize(of)
+        if value in ("", "self", "автор", "я"):
+            return self.author
+        if normalize_relation(of) != "other":
+            return self._resolve_relative(known, value, "self", "")
+        return self._resolve_entity(known, _clean(of))
+
+    def _kin_consistent(self, anchor: Entity, entity: Entity, kind: str, name_hint: str | None) -> bool:
+        """Может ли ``entity`` быть родственником ``anchor`` вида ``kind``.
+
+        Да — если это уже записано (якорная сущность этой роли или ребро той же
+        канонической пары) или если модель назвала имя и оно совпадает с
+        каноническим именем человека. Алиасы здесь не в счёт: резолвер мог
+        приписать «Лену» Елене Юрьевне в этом же прогоне, и проверка по алиасу
+        подтвердила бы собственную ошибку.
+        """
+        if entity.id == anchor.id:
+            return False
+        if entity.anchor_entity_id == anchor.id and entity.anchor_relation == kind:
+            return True
+        if kind != "other":
+            fields = canonical_fields(
+                kind=kind, generations=None, via_marriage=None, bond=None,
+                from_id=anchor.id, to_id=entity.id,
+            )
+            key = (fields["canon_from"], fields["canon_to"], fields["canon_key"])
+            if key in self._run_edges:
+                return True
+            linked = (
+                self.db.query(EntityRelation.id)
+                .filter(
+                    EntityRelation.user_id == self.source.user_id,
+                    EntityRelation.canon_from == fields["canon_from"],
+                    EntityRelation.canon_to == fields["canon_to"],
+                    EntityRelation.canon_key == fields["canon_key"],
+                )
+                .first()
+            )
+            if linked is not None:
+                return True
+        return bool(name_hint) and _name_matches(name_hint, entity.canonical_name)
+
     def _resolve_relative(
         self,
         known: dict[str, Entity],
@@ -992,30 +1188,42 @@ class ExtractionPipeline:
         if self.author is None:
             return None
         kind = normalize_relation(relation)
-        of_value = _normalize(of) or "self"
-        anchor = (
-            self._resolve_relative(known, of_value, "self", "")
-            if of_value != "self"
-            else self.author
-        )
+        anchor = self._relative_anchor(known, of)
         if anchor is None:
             return None
         anchor_id = anchor.id
 
         # 0) выбор резолвера: кандидатов на роль было несколько, и модель выбрала
+        #    одного из них (кандидаты уже связаны с якорем этой ролью)
         if isinstance(preferred_id, int) and not isinstance(preferred_id, bool) and preferred_id > 0:
             entity = self._entity_by_id(preferred_id)
             if entity is not None and entity.id != anchor_id:
                 self._ensure_relation(anchor, entity, kind)
                 return entity
 
-        # 1) названное имя: «Федосив Александр Михайлович» уже есть объектом
+        # 1) названное имя: «Федосив Александр Михайлович» уже есть объектом —
+        #    но только если родство с ним не противоречит записанному
         hint = _clean(name_hint)
         if hint:
             entity = self._resolve_entity(known, hint)
-            if entity is not None and entity.id != anchor_id:
+            if entity is not None and self._kin_consistent(anchor, entity, kind, hint):
                 self._ensure_relation(anchor, entity, kind)
                 return entity
+            if entity is not None:
+                self._count("relative_name_rejected")
+            # имя есть, но известный носитель — другой человек: заводим носителя
+            # этого имени («Лена» ≠ «Елена Юрьевна»), а не безымянный якорь
+            if not _is_nameless_person(hint) and not _looks_like_a_common_noun(hint):
+                namesake = (
+                    self.db.query(Entity)
+                    .filter_by(user_id=self.source.user_id, entity_type="person", normalized_name=_normalize(hint)[:255])
+                    .first()
+                )
+                if namesake is None or self._kin_consistent(anchor, namesake, kind, hint):
+                    person = namesake or self._get_or_create_entity(hint)
+                    if person is not None and person.id != anchor_id:
+                        self._ensure_relation(anchor, person, kind)
+                        return person
 
         # 2) якорная сущность с той же идентичностью (автор, father)
         anchors = (
@@ -1092,48 +1300,76 @@ class ExtractionPipeline:
         evidence: str | None = None,
         start: int | None = None,
         end: int | None = None,
+        via_marriage: bool | None = None,
+        generations: int | None = None,
     ) -> EntityRelation | None:
-        """Ребро anchor → person с каноническим ключом отношения."""
+        """Ребро anchor → person: каноническая пара, подтверждение, пересчёт.
+
+        Дедуп и уникальность считаются по канонической паре и токену вида, а не
+        по направлению источника: «A → B, отец» и «B → A, ребёнок» — один факт, а
+        «A → B, отец» и «B → A, отец» — разные (родительский цикл). Знак и число
+        поколений считает код по таблице видов, модель их не присылает.
+        """
         if person is None or anchor is None or person.id == anchor.id:
             return None
         label = relation_label(kind, free_label)[:64]
-        key = (anchor.id, person.id, label)
+        fields = canonical_fields(
+            kind=kind,
+            generations=generations,
+            via_marriage=via_marriage,
+            bond=None,
+            from_id=anchor.id,
+            to_id=person.id,
+            relation_type=label,
+        )
+        key = (fields["canon_from"], fields["canon_to"], fields["canon_key"])
         edge = self._run_edges.get(key)
         if edge is None:
             edge = (
                 self.db.query(EntityRelation)
                 .filter_by(
                     user_id=self.source.user_id,
-                    from_entity_id=anchor.id,
-                    to_entity_id=person.id,
-                    relation_type=label,
+                    canon_from=fields["canon_from"],
+                    canon_to=fields["canon_to"],
+                    canon_key=fields["canon_key"],
                 )
                 .first()
             )
+        payload = confirmation_payload(
+            edge,
+            self.source.id,
+            {**fields, "relation_type": label, "confidence": confidence},
+            quote=evidence,
+            start=start,
+            end=end,
+        )
         if edge is None:
             edge = EntityRelation(
                 user_id=self.source.user_id,
                 from_entity_id=anchor.id,
                 to_entity_id=person.id,
                 relation_type=label,
-                relation_kind=kind,
-                confidence=confidence,
-                evidence_text=evidence,
-                source_id=self.source.id,
-                start_offset=start,
-                end_offset=end,
+                relation_kind=fields["relation_kind"],
+                generations=fields["generations"],
+                via_marriage=fields["via_marriage"],
+                bond=fields["bond"],
+                canon_from=fields["canon_from"],
+                canon_to=fields["canon_to"],
+                canon_key=fields["canon_key"],
             )
             self.db.add(edge)
+            # id нужен, чтобы записать подтверждение и увидеть его при пересчёте
+            self.db.flush()
             self._count("relations_created")
         else:
-            if confidence is None or edge.confidence is None or confidence >= edge.confidence:
-                edge.confidence = confidence
-                edge.evidence_text = evidence or edge.evidence_text
-                edge.source_id = self.source.id
-                edge.start_offset = start
-                edge.end_offset = end
-            edge.relation_kind = kind
             self._count("relations_merged")
+        # уверенность и цитата ребра — из всех подтверждений, включая это
+        rows = confirmation_rows(self.db, edge.id, skip_source=self.source.id)
+        upsert_confirmation(self.db, edge, self.source.id, payload)
+        rows.append(payload)
+        aggregate = aggregate_confirmations(rows)
+        if aggregate is not None:
+            apply_aggregate(edge, aggregate)
         self._run_edges[key] = edge
         return edge
 
@@ -1148,6 +1384,10 @@ class ExtractionPipeline:
             subject, subject_source = self._resolve_subject(item, known)
             if subject is None:
                 continue
+            # цель пишется до дедупа и конфликтов факта: повтор того же намерения
+            # на другой странице — это новая отметка прогресса, а не дубль
+            if self.with_goals and _is_goal(item):
+                self._write_goal(item, subject, quote)
             obj = self._resolve_entity(known, item.get("object_name"))
             predicate = _clean(item.get("predicate"))[:100]
             if not predicate:
@@ -1156,6 +1396,8 @@ class ExtractionPipeline:
             object_text = _clean(item.get("object_text")) or None
             time_text = _clean(item.get("time_text")) or None
             time_iso = _clean(item.get("time_iso")) or None
+            importance = _clamp(item.get("importance")) or None  # 0 — не событие
+            recurrence = _clean(item.get("recurrence"))[:64] or None
             # Инвариант функционального предиката стоит ДО дедупа: иначе две
             # разные даты рождения выглядят «одним фактом» по (субъект, предикат,
             # объект) — и вторая молча затирает первую. У человека одно рождение,
@@ -1171,13 +1413,13 @@ class ExtractionPipeline:
                 if not incoming_value:
                     # пустое значение не создаёт второй факт: иначе у человека
                     # окажется две смерти — с датой и без. Оно дополняет известное.
-                    known = self._known_functional_fact(subject, predicate_kind)
-                    if known is not None:
-                        known.confidence = max(
-                            known.confidence or 0.0, _clamp(item.get("confidence"), 0.0) or 0.0
+                    known_fact = self._known_functional_fact(subject, predicate_kind)
+                    if known_fact is not None:
+                        known_fact.confidence = max(
+                            known_fact.confidence or 0.0, _clamp(item.get("confidence"), 0.0) or 0.0
                         )
                         self._remember_quote(
-                            known, quote, start, end, _clamp(item.get("confidence"))
+                            known_fact, quote, start, end, _clamp(item.get("confidence"))
                         )
                         self.stats["facts_merged"] = self.stats.get("facts_merged", 0) + 1
                         continue
@@ -1189,22 +1431,33 @@ class ExtractionPipeline:
                         existing_fact, quote, time_text, _clamp(item.get("confidence")),
                     )
                     continue
-            # дедупликация фактов без эмбеддингов: тот же субъект, предикат и объект
-            duplicate = (
-                self.db.query(Fact)
-                .filter(
-                    Fact.user_id == self.source.user_id,
-                    Fact.subject_entity_id == (subject.id if subject else None),
-                    Fact.predicate == predicate,
-                    Fact.object_entity_id == (obj.id if obj else None),
-                    Fact.object_text == object_text,
-                )
-                .first()
+            # дедупликация фактов без эмбеддингов: тот же субъект, предикат и
+            # объект — и не разные даты: «день рождения сына» 2023 и 2024 — два
+            # события, а не одно (раньше это стерёг отдельный вызов событий)
+            duplicate = next(
+                (
+                    row
+                    for row in self.db.query(Fact)
+                    .filter(
+                        Fact.user_id == self.source.user_id,
+                        Fact.subject_entity_id == (subject.id if subject else None),
+                        Fact.predicate == predicate,
+                        Fact.object_entity_id == (obj.id if obj else None),
+                        Fact.object_text == object_text,
+                    )
+                    .order_by(Fact.id)
+                    .all()
+                    if not _dates_differ(row.time_text, row.time_iso, time_text, time_iso)
+                ),
+                None,
             )
             if duplicate is not None:
                 duplicate.confidence = max(duplicate.confidence or 0.0, _clamp(item.get("confidence"), 0.0) or 0.0)
                 duplicate.subject_source = subject_source or duplicate.subject_source
                 duplicate.time_iso = duplicate.time_iso or time_iso
+                if importance is not None:
+                    duplicate.importance = max(duplicate.importance or 0.0, importance)
+                duplicate.recurrence = duplicate.recurrence or recurrence
                 # Основная цитата не перезаписывается: прежнее подтверждение
                 # остаётся, а новое добавляется отдельной строкой-подтверждением.
                 self._remember_quote(duplicate, quote, start, end, _clamp(item.get("confidence")))
@@ -1224,6 +1477,8 @@ class ExtractionPipeline:
                 end_offset=end,
                 time_text=time_text,
                 time_iso=time_iso,
+                importance=importance,
+                recurrence=recurrence,
                 confidence=_clamp(item.get("confidence")),
             )
             self.db.add(fact)
@@ -1355,8 +1610,8 @@ class ExtractionPipeline:
     def _write_relations(self, items: list[dict[str, Any]], known: dict[str, Entity]) -> None:
         # Модель возвращает одно и то же ребро несколько раз (в одной странице
         # «отец» приходит дважды). Запросы к базе такого дубля не видят — строка
-        # ещё не вставлена, — и flush падает на uq_entity_relation_edge. Поэтому
-        # дубли отсекаются в памяти прогона (`_run_edges`), а не только запросом.
+        # ещё не вставлена, — и flush падает на уникальности. Поэтому дубли
+        # отсекаются в памяти прогона (`_run_edges`) по каноническому ключу.
         for item in items:
             person_name = _clean(item.get("person_name"))
             if not person_name:
@@ -1376,110 +1631,60 @@ class ExtractionPipeline:
                 evidence=evidence,
                 start=start,
                 end=end,
+                via_marriage=bool(item.get("via_marriage")),
+                generations=item.get("generations"),
             )
 
-    def _write_goals(self, items: list[dict[str, Any]]) -> None:
-        for item in items:
-            title = _clean(item.get("title"))
-            if not title:
-                continue
-            found = _quote_and_offset(self.text, _clean(item.get("source_text")))
-            quote, start, end = found if found else (None, None, None)
-            status_update = _clean(item.get("status_update")) or "mentioned"
-            matched_id = item.get("_match_id", -1)
-            goal = (
-                self.db.query(Goal).filter(Goal.id == matched_id, Goal.user_id == self.source.user_id).first()
-                if matched_id and matched_id > 0
-                else None
-            )
-            if goal is None:
-                goal = Goal(
-                    user_id=self.source.user_id,
-                    subject_entity_id=self.author.id if self.author else None,
-                    title=title[:255],
-                    description=_clean(item.get("note")) or None,
-                    status="active",
-                    created_from_source_id=self.source.id,
-                )
-                self.db.add(goal)
-                self.db.flush()
-                self.stats["goals_created"] = self.stats.get("goals_created", 0) + 1
-            else:
-                self.stats["goals_merged"] = self.stats.get("goals_merged", 0) + 1
-            if status_update in ("completed", "abandoned"):
-                goal.status = status_update
-            elif status_update in ("started", "progress"):
-                goal.status = "active"
-            if quote:
-                goal.updated_at = _now()
-            self.db.add(
-                GoalProgress(
-                    goal_id=goal.id,
-                    source_id=self.source.id,
-                    progress_kind=status_update,
-                    note=_clean(item.get("note")) or None,
-                    source_text=quote,
-                    confidence=_clamp(item.get("confidence")),
-                )
-            )
-            self.stats["goal_progress"] = self.stats.get("goal_progress", 0) + 1
+    def _write_goal(self, item: dict[str, Any], subject: Entity, quote: str) -> None:
+        """Цель из факта: новая или найденная резолвером, плюс отметка прогресса.
 
-    def _write_events(self, items: list[dict[str, Any]]) -> None:
-        for item in items:
-            title = _clean(item.get("title"))
-            if not title:
-                continue
-            time_text = _clean(item.get("time_text")) or None
-            found = _quote_and_offset(self.text, _clean(item.get("source_text")))
-            quote, start, end = found if found else (None, None, None)
-            event = Event(
+        Субъект цели — субъект факта, а не всегда автор страницы: «мама решила
+        выучить английский» — цель мамы.
+        """
+        title = _clean(item.get("goal_title"))
+        status_update = _normalize(item.get("goal_status"))
+        if status_update not in prompts.GOAL_STATUSES or status_update == "none":
+            status_update = "mentioned"
+        note = _clean(item.get("object_text")) or _clean(item.get("predicate")) or None
+        matched_id = item.get("_match_id", -1)
+        goal = (
+            self.db.query(Goal).filter(Goal.id == matched_id, Goal.user_id == self.source.user_id).first()
+            if matched_id and matched_id > 0
+            else None
+        )
+        if goal is None:
+            goal = Goal(
                 user_id=self.source.user_id,
-                source_id=self.source.id,
-                subject_entity_id=self.author.id if self.author else None,
+                subject_entity_id=subject.id,
                 title=title[:255],
-                description=_clean(item.get("description")) or None,
-                time_text=time_text,
-                importance=_clamp(item.get("importance")),
+                description=note,
+                status="active",
+                created_from_source_id=self.source.id,
+            )
+            self.db.add(goal)
+            self.db.flush()
+            # резолвер того же прогона мог не видеть только что созданную цель:
+            # второй факт о ней в этой же странице должен попасть в неё же
+            item["_match_id"] = goal.id
+            self.stats["goals_created"] = self.stats.get("goals_created", 0) + 1
+        else:
+            self.stats["goals_merged"] = self.stats.get("goals_merged", 0) + 1
+        if status_update in ("completed", "abandoned"):
+            goal.status = status_update
+        elif status_update in ("started", "progress"):
+            goal.status = "active"
+        goal.updated_at = _now()
+        self.db.add(
+            GoalProgress(
+                goal_id=goal.id,
+                source_id=self.source.id,
+                progress_kind=status_update,
+                note=note,
                 source_text=quote,
-                start_offset=start,
-                end_offset=end,
+                confidence=_clamp(item.get("confidence")),
             )
-            self.db.add(event)
-            self.stats["events_created"] = self.stats.get("events_created", 0) + 1
-
-    def _write_habits(self, items: list[dict[str, Any]]) -> None:
-        for item in items:
-            title = _clean(item.get("title"))
-            if not title:
-                continue
-            found = _quote_and_offset(self.text, _clean(item.get("source_text")))
-            quote, start, end = found if found else (None, None, None)
-            matched_id = item.get("_match_id", -1)
-            habit = (
-                self.db.query(Habit).filter(Habit.id == matched_id, Habit.user_id == self.source.user_id).first()
-                if matched_id and matched_id > 0
-                else None
-            )
-            if habit is None:
-                habit = Habit(
-                    user_id=self.source.user_id,
-                    subject_entity_id=self.author.id if self.author else None,
-                    title=title[:255],
-                )
-                self.db.add(habit)
-                self.db.flush()
-                self.stats["habits_created"] = self.stats.get("habits_created", 0) + 1
-            else:
-                self.stats["habits_merged"] = self.stats.get("habits_merged", 0) + 1
-            self.db.add(
-                HabitLog(
-                    habit_id=habit.id,
-                    source_id=self.source.id,
-                    note=_clean(item.get("note")) or None,
-                    source_text=quote,
-                )
-            )
-            self.stats["habit_logs"] = self.stats.get("habit_logs", 0) + 1
+        )
+        self.stats["goal_progress"] = self.stats.get("goal_progress", 0) + 1
 
     # ------------------------------------------------------------------
     # Чанки для RAG (эмбеддинги считаются здесь же и переиспользуются)

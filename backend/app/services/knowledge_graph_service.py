@@ -14,7 +14,8 @@ from typing import Iterable
 
 from sqlalchemy.orm import Session
 
-from ..models import Entity, EntityRelation
+from ..models import Entity, EntityRelation, KnowledgeState
+from .kinship import canonicalize_relations, levels
 
 logger = logging.getLogger(__name__)
 
@@ -148,3 +149,92 @@ class KnowledgeGraphService:
             .all()
         )
         return {row[0]: row[1] for row in rows}
+
+
+    # ------------------------------------------------------------------
+    # Граф целиком (раздел 9): уровни, конфликты, «вне древа»
+    # ------------------------------------------------------------------
+
+    def relation_graph(self) -> dict:
+        """Весь архив связей сразу — без выбранного объекта.
+
+        Корень выбирает клиент, а уровни считаются внутри компоненты с постоянным
+        сдвигом: смена корня — это вычитание его уровня, а не новый запрос. Узлы
+        без родства (ритуальные, неоднозначные, одинокие) получают ``level=None``
+        и в «Древо» не попадают — интерфейс показывает их отдельным списком, а не
+        ставит на нулевой уровень по умолчанию.
+        """
+        persons = (
+            self.db.query(Entity)
+            .filter(Entity.user_id == self.user_id, Entity.entity_type == "person")
+            .order_by(Entity.canonical_name)
+            .all()
+        )
+        edges = self.all_edges()
+        by_id = {person.id: person for person in persons}
+        for edge in edges:
+            for entity in (edge.from_entity, edge.to_entity):
+                if entity is not None and entity.id not in by_id:
+                    by_id[entity.id] = entity
+        anchors = {entity.id for entity in by_id.values() if entity.anchor_entity_id is not None}
+
+        rows = [
+            {
+                "id": edge.id,
+                "from": edge.from_entity_id,
+                "to": edge.to_entity_id,
+                "relation_kind": edge.relation_kind,
+                "generations": edge.generations,
+                "via_marriage": edge.via_marriage,
+                "bond": edge.bond,
+                "confidence": edge.confidence,
+                "relation_type": edge.relation_type,
+                "sources": [row.source_id for row in edge.confirmations] or (
+                    [edge.source_id] if edge.source_id else []
+                ),
+            }
+            for edge in edges
+        ]
+        result = levels(sorted(by_id), rows, anchors=anchors)
+
+        state = (
+            self.db.query(KnowledgeState)
+            .filter(KnowledgeState.user_id == self.user_id)
+            .first()
+        )
+        canonical = canonicalize_relations(rows)
+        return {
+            "version": state.version if state is not None else 0,
+            "nodes": [
+                {
+                    "id": entity.id,
+                    "name": entity.canonical_name,
+                    "entity_type": entity.entity_type,
+                    "is_anchor": entity.id in anchors,
+                    "anchor_of": entity.anchor_entity_id,
+                    "anchor_relation": entity.anchor_relation,
+                    "level": result.levels.get(entity.id),
+                    "component": result.components.get(entity.id),
+                }
+                for entity in by_id.values()
+            ],
+            "edges": [
+                {
+                    "id": edge.edge_id,
+                    "from_id": edge.from_id,
+                    "to_id": edge.to_id,
+                    "relation_kind": edge.kind,
+                    "relation_type": edge.relation_type,
+                    "delta": edge.delta,
+                    "via_marriage": edge.via_marriage,
+                    "bond": edge.bond,
+                    "canon_key": edge.canon_key,
+                    "confidence": edge.confidence,
+                    "sources": list(edge.sources),
+                }
+                for edge in canonical
+            ],
+            "conflicts": result.conflicts,
+            "unplaced": result.unplaced,
+            "dangling": result.dangling,
+        }

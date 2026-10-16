@@ -34,7 +34,7 @@
         <div v-else class="flex min-h-[50vh] flex-col items-center justify-center gap-2 text-center">
           <p class="text-sm text-app-muted">Выберите страницу в дереве слева</p>
           <p class="text-xs text-app-muted">
-            или создайте запись дневника (✎ у «Я») / загрузите рукопись (↑ у автора)
+            или создайте запись дневника (✎ у «Я») / загрузите страницы или PDF (↑ у автора или папки)
           </p>
         </div>
       </main>

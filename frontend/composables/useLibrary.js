@@ -118,13 +118,33 @@ export const useLibrary = () => {
     await load({ force: true })
   }
 
-  const uploadPage = async (authorId, file) => {
+  const uploadPage = async (authorId, file, folderId = null) => {
     const form = new FormData()
     form.append('file', file)
+    if (folderId != null) form.append('folder_id', String(folderId))
     const response = await api(`/htr/authors/${authorId}/pages`, { method: 'POST', body: form })
     if (!response.ok) {
       const detail = await response.json().catch(() => null)
       throw new Error(detail?.detail || `Не удалось загрузить «${file.name}»`)
+    }
+    const created = await response.json()
+    await load({ force: true })
+    return created
+  }
+
+  /*
+   * PDF: каждая страница файла становится страницей рукописи, а все они —
+   * папкой с именем файла (сервер создаёт её сам). Ответ содержит id страниц
+   * в порядке документа, чтобы сразу открыть первую.
+   */
+  const uploadPdf = async (authorId, file, parentFolderId = null) => {
+    const form = new FormData()
+    form.append('file', file)
+    if (parentFolderId != null) form.append('parent_folder_id', String(parentFolderId))
+    const response = await api(`/htr/authors/${authorId}/pdf`, { method: 'POST', body: form })
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null)
+      throw new Error(detail?.detail || `Не удалось разобрать «${file.name}»`)
     }
     const created = await response.json()
     await load({ force: true })
@@ -143,5 +163,6 @@ export const useLibrary = () => {
     movePage,
     deletePage,
     uploadPage,
+    uploadPdf,
   }
 }

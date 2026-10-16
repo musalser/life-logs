@@ -16,6 +16,8 @@
     </div>
 
     <p v-if="error" class="rounded-lg border border-app-border/40 bg-app-error/10 px-2 py-1.5 text-xs text-app-error">{{ error }}</p>
+    <p v-if="notice" class="rounded-lg border border-app-border/40 bg-app-panel/60 px-2 py-1.5 text-xs text-app-muted">{{ notice }}</p>
+    <p v-if="uploading" class="text-xs text-app-muted">{{ uploading }}</p>
     <p v-if="loading" class="text-xs text-app-muted">Загрузка…</p>
 
     <div v-else class="no-scrollbar -mr-1 flex-1 space-y-2 overflow-y-auto pr-1">
@@ -46,7 +48,7 @@
           <span v-if="author.is_self" class="lib-badge">я</span>
           <div class="lib-actions">
             <button v-if="author.is_self" type="button" title="Новая запись дневника" @click.stop="$emit('select', { type: 'diary', ref_id: null })">✎</button>
-            <button v-if="author.author_id" type="button" title="Загрузить изображение страницы" @click.stop="pickUpload(author)">↑</button>
+            <button v-if="author.author_id" type="button" title="Загрузить страницы или PDF" @click.stop="pickUpload(author, null)">↑</button>
             <button type="button" title="Новая папка" @click.stop="newFolder(author.entity_id, null)">+</button>
           </div>
         </div>
@@ -63,6 +65,7 @@
             @drag-start="onDragStart"
             @drag-end="onDragEnd"
             @drop-page="onDropToFolder"
+            @upload="(folder) => pickUpload(author, folder)"
             @new-subfolder="(folder) => newFolder(author.entity_id, folder.id)"
             @rename="renameFolder"
             @delete-folder="deleteFolder"
@@ -84,7 +87,7 @@
       </section>
     </div>
 
-    <input ref="uploadInput" type="file" accept="image/*" class="hidden" @change="onUpload" />
+    <input ref="uploadInput" type="file" accept="image/*,application/pdf,.pdf" multiple class="hidden" @change="onUpload" />
   </div>
 </template>
 
@@ -108,13 +111,17 @@ const {
   movePage,
   deletePage: apiDeletePage,
   uploadPage,
+  uploadPdf,
 } = useLibrary()
 
 const collapsed = reactive({})
 const draggedPage = ref(null)
 const authorDropTarget = ref(null)
 const uploadInput = ref(null)
-const uploadAuthor = ref(null)
+//: { author, folderId } — куда попадёт выбранный файл (folderId = null → корень)
+const uploadTarget = ref(null)
+const uploading = ref('')
+const notice = ref('')
 
 const authors = computed(() => tree.value.authors || [])
 
@@ -183,25 +190,52 @@ const deletePage = async (page) => {
   }
 }
 
-const pickUpload = (author) => {
-  uploadAuthor.value = author
+const pickUpload = (author, folder) => {
+  uploadTarget.value = { author, folderId: folder ? folder.id : null }
   uploadInput.value?.click()
 }
+
+const PDF_FILE = /\.pdf$/i
+/** PDF picks up whole manuscripts; anything else is a page image. */
+const isPdfFile = (file) => file.type === 'application/pdf' || PDF_FILE.test(file.name)
 
 const onUpload = async (event) => {
   const files = Array.from(event.target.files || [])
   event.target.value = ''
-  const author = uploadAuthor.value
-  uploadAuthor.value = null
-  if (!files.length || !author?.author_id) return
+  const target = uploadTarget.value
+  uploadTarget.value = null
+  if (!files.length || !target?.author?.author_id) return
+  // one import at a time: the picker is not the only way a change event arrives
+  if (uploading.value) return
   clearError()
+  notice.value = ''
+  const { author, folderId } = target
+  let selected = null
+  let pdfPages = 0
   try {
     for (const file of files) {
-      const created = await uploadPage(author.author_id, file)
-      emit('select', { type: 'htr', ref_id: created.page_id })
+      if (isPdfFile(file)) {
+        uploading.value = `Разбираю «${file.name}»…`
+        // каждая страница PDF становится страницей, все они — в папке с именем файла
+        const imported = await uploadPdf(author.author_id, file, folderId)
+        pdfPages += imported.page_count || 0
+        // открываем первую страницу файла: с неё и начинают читать
+        if (imported.page_ids?.length) selected = imported.page_ids[0]
+      } else {
+        uploading.value = `Загружаю «${file.name}»…`
+        const created = await uploadPage(author.author_id, file, folderId)
+        selected = created.page_id
+      }
+    }
+    if (selected != null) emit('select', { type: 'htr', ref_id: selected })
+    if (pdfPages) {
+      const where = folderId != null ? 'в выбранную папку' : 'в папку с именем файла'
+      notice.value = `PDF разобран: страниц — ${pdfPages}, ${where}.`
     }
   } catch (e) {
     error.value = e.message || 'Не удалось загрузить страницу'
+  } finally {
+    uploading.value = ''
   }
 }
 

@@ -14,10 +14,8 @@ import pytest
 from app.models import (
     Entity,
     EntityRelation,
-    Event,
     Fact,
     Goal,
-    Habit,
     KnowledgeInsight,
     KnowledgeSource,
     KnowledgeState,
@@ -160,25 +158,31 @@ def seed_knowledge(db, user):
     user.self_entity_id = me.id
     fact = Fact(user_id=user.id, source_id=source.id, subject_entity_id=me.id, predicate="бегает", source_text="Бегал по утрам")
     goal = Goal(user_id=user.id, subject_entity_id=me.id, title="Выучить английский")
-    habit = Habit(user_id=user.id, subject_entity_id=me.id, title="бег")
-    event = Event(user_id=user.id, source_id=source.id, subject_entity_id=me.id, title="Поездка на море")
-    db.add_all([fact, goal, habit, event])
+    # событие — факт с важностью
+    event = Fact(
+        user_id=user.id, source_id=source.id, subject_entity_id=me.id, predicate="поехал",
+        object_text="на море", source_text="Поездка на море", importance=0.7,
+    )
+    db.add_all([fact, goal, event])
     db.commit()
-    return me, fact, goal, habit, event
+    return me, fact, goal, event
+
+
+EMPTY_PAYLOAD = {"insights": [], "habits": [], "questions": [], "ideas": [], "conclusions": []}
 
 
 def test_analytics_keeps_only_items_with_existing_evidence(db_session, user):
-    me, fact, goal, habit, event = seed_knowledge(db_session, user)
+    me, fact, goal, event = seed_knowledge(db_session, user)
     adapter = FakeAdapter(
         {
             "insights": [
-                {"text": "Бег идёт фоном", "confidence": 0.8, "evidence": [{"kind": "habit", "id": habit.id}]},
+                {"text": "Бег идёт фоном", "confidence": 0.8, "evidence": [{"kind": "fact", "id": fact.id}]},
                 {"text": "Выдумка без ссылок", "confidence": 0.9, "evidence": []},
                 {"text": "Ссылка в пустоту", "confidence": 0.9, "evidence": [{"kind": "fact", "id": 9999}]},
             ],
             "questions": [{"text": "Что дальше?", "confidence": 0.5, "evidence": [{"kind": "goal", "id": goal.id}]}],
             "ideas": [],
-            "conclusions": [{"text": "Есть событие", "confidence": 0.7, "evidence": [{"kind": "event", "id": event.id}]}],
+            "conclusions": [{"text": "Есть событие", "confidence": 0.7, "evidence": [{"kind": "fact", "id": event.id}]}],
         }
     )
     service = AnalyticsService(db_session, adapter=adapter)
@@ -227,7 +231,7 @@ def test_analytics_without_data_returns_empty_lists(db_session, user):
 
     result = run(AnalyticsService(db_session, adapter=adapter).generate(empty_user.id, me.id))
 
-    assert result["payload"] == {"insights": [], "questions": [], "ideas": [], "conclusions": []}
+    assert result["payload"] == EMPTY_PAYLOAD
     assert adapter.prompts == []  # модель не звали: анализировать нечего
 
 
@@ -251,8 +255,77 @@ def test_analytics_survives_a_broken_model_answer(db_session, user):
 
     result = run(service.generate(user.id, me.id))
 
-    assert result["payload"] == {"insights": [], "questions": [], "ideas": [], "conclusions": []}
+    assert result["payload"] == EMPTY_PAYLOAD
 
 
 async def _broken():
     return "это не JSON"
+
+
+# ---------------------------------------------------------------------------
+# Привычки: вывод аналитики по накопленным фактам, а не извлечение страницы
+# ---------------------------------------------------------------------------
+
+
+def habit_answer(*fact_ids):
+    return {"habits": [{"text": "бегает по утрам", "confidence": 0.8, "evidence": [{"kind": "fact", "id": fid} for fid in fact_ids]}]}
+
+
+def add_source(db, user, ref_id):
+    source = KnowledgeSource(user_id=user.id, source_type="diary", ref_id=ref_id, text="Бегал.")
+    db.add(source)
+    db.flush()
+    return source
+
+
+def running_fact(db, user, me, source, **extra):
+    row = Fact(user_id=user.id, source_id=source.id, subject_entity_id=me.id, predicate="бегал", source_text="Бегал.", **extra)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_one_mention_is_not_a_habit(db_session, user):
+    me = person(db_session, user, "Я")
+    single = running_fact(db_session, user, me, add_source(db_session, user, 1))
+    db_session.commit()
+
+    result = run(AnalyticsService(db_session, adapter=FakeAdapter(habit_answer(single.id))).generate(user.id, me.id))
+
+    assert result["payload"]["habits"] == []
+
+
+def test_repeats_across_two_sources_make_a_habit(db_session, user):
+    me = person(db_session, user, "Я")
+    first = running_fact(db_session, user, me, add_source(db_session, user, 1))
+    second = running_fact(db_session, user, me, add_source(db_session, user, 2))
+    db_session.commit()
+
+    result = run(AnalyticsService(db_session, adapter=FakeAdapter(habit_answer(first.id, second.id))).generate(user.id, me.id))
+
+    assert [item["text"] for item in result["payload"]["habits"]] == ["бегает по утрам"]
+
+
+def test_two_facts_of_one_page_are_not_a_repeat(db_session, user):
+    me = person(db_session, user, "Я")
+    source = add_source(db_session, user, 1)
+    first = running_fact(db_session, user, me, source)
+    second = running_fact(db_session, user, me, source, object_text="ещё раз")
+    db_session.commit()
+
+    result = run(AnalyticsService(db_session, adapter=FakeAdapter(habit_answer(first.id, second.id))).generate(user.id, me.id))
+
+    assert result["payload"]["habits"] == []
+
+
+def test_explicit_regularity_is_enough_for_a_habit(db_session, user):
+    me = person(db_session, user, "Я")
+    stated = running_fact(db_session, user, me, add_source(db_session, user, 1), recurrence="каждое утро")
+    db_session.commit()
+    adapter = FakeAdapter(habit_answer(stated.id))
+
+    result = run(AnalyticsService(db_session, adapter=adapter).generate(user.id, me.id))
+
+    assert len(result["payload"]["habits"]) == 1
+    # модель видит пометку регулярности в агрегате
+    assert "регулярно: каждое утро" in adapter.prompts[0]

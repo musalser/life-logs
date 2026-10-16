@@ -1,8 +1,20 @@
-"""Промпты и JSON-схемы извлечения знаний (этап 4 ТЗ, вызовы A–E).
+"""Промпты и JSON-схемы извлечения знаний (этап 4 ТЗ).
 
 Промпты вынесены из сервиса: их читают чаще, чем код вокруг, а тесты проверяют
 именно формулировки — «связь от лица автора текста» и «контекст соседних
 страниц не извлекать» должны сломать тест, а не тихо испортить данные.
+
+**Порядок частей важен для скорости.** Каждый промпт начинается с одного и того
+же блока документа (правила, автор, контекст соседних страниц, текст страницы —
+см. ``document_block``), и только потом идёт задача вызова. Ollama хранит
+KV-кэш общего префикса между запросами к одной модели, поэтому длинный текст
+страницы считается один раз на прогон, а не в каждом вызове. Всё, что
+отличается между вызовами (задача, списки известных людей), стоит после текста.
+
+**Вызовов три, а не семь.** События — это факты с важностью (``importance``),
+цели — факты с ``goal_title`` (только для дневника), привычки не извлекаются
+вовсе: по одной странице регулярность не установить, их выводит аналитика по
+накопленным фактам (``recurrence`` — её сырьё).
 
 Все схемы — плоские (только object/array/string/number/integer), потому что
 Ollama передаёт их в грамматику llama.cpp: непривычные конструкции там
@@ -105,55 +117,67 @@ MENTIONS_SCHEMA: dict[str, Any] = {
     "required": ["mentions"],
 }
 
-FACTS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "facts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    #: субъект указывается явно, см. FACTS_SUBJECT_RULE
-                    "subject_kind": {
-                        "type": "string",
-                        "enum": ["self", "named", "relative", "unknown"],
-                    },
-                    "subject_name": {"type": "string"},
-                    "subject_relation": {"type": "string"},
-                    "subject_of": {"type": "string"},
-                    #: id человека из списка близких автора (0 — не из списка)
-                    "subject_id": {"type": "integer"},
-                    "predicate": {"type": "string"},
-                    #: канонический ключ предиката (birth, death, …) для дедупа
-                    "predicate_kind": {"type": "string", "enum": list(PREDICATE_KINDS)},
-                    "object_name": {"type": "string"},
-                    "object_text": {"type": "string"},
-                    "source_text": {"type": "string"},
-                    "time_text": {"type": "string"},
-                    #: та же дата, приведённая к ГГГГ[-ММ[-ДД]] — для сравнения
-                    "time_iso": {"type": "string"},
-                    "confidence": {"type": "number"},
-                },
-                "required": [
-                    "subject_kind",
-                    "subject_name",
-                    "subject_relation",
-                    "subject_of",
-                    "subject_id",
-                    "predicate",
-                    "predicate_kind",
-                    "object_name",
-                    "object_text",
-                    "source_text",
-                    "time_text",
-                    "time_iso",
-                    "confidence",
-                ],
-            },
-        }
+#: статусы цели в факте; none — факт не о цели
+GOAL_STATUSES = ("none", "started", "progress", "completed", "abandoned", "mentioned")
+
+#: поля, общие для фактов любого источника
+_FACT_PROPERTIES: dict[str, Any] = {
+    #: субъект указывается явно, см. FACTS_SUBJECT_RULE
+    "subject_kind": {
+        "type": "string",
+        "enum": ["self", "named", "relative", "unknown"],
     },
-    "required": ["facts"],
+    "subject_name": {"type": "string"},
+    "subject_relation": {"type": "string"},
+    "subject_of": {"type": "string"},
+    #: id человека из списка близких автора (0 — не из списка)
+    "subject_id": {"type": "integer"},
+    "predicate": {"type": "string"},
+    #: канонический ключ предиката (birth, death, …) для дедупа
+    "predicate_kind": {"type": "string", "enum": list(PREDICATE_KINDS)},
+    "object_name": {"type": "string"},
+    "object_text": {"type": "string"},
+    "source_text": {"type": "string"},
+    "time_text": {"type": "string"},
+    #: та же дата, приведённая к ГГГГ[-ММ[-ДД]] — для сравнения
+    "time_iso": {"type": "string"},
+    #: событие — факт с важностью (0 — обычное утверждение)
+    "importance": {"type": "number"},
+    #: как текст говорит о регулярности; пусто — не сказано
+    "recurrence": {"type": "string"},
+    "confidence": {"type": "number"},
 }
+
+#: цель — тоже факт: название и статус продвижения (только дневник)
+_GOAL_PROPERTIES: dict[str, Any] = {
+    "goal_title": {"type": "string"},
+    "goal_status": {"type": "string", "enum": list(GOAL_STATUSES)},
+}
+
+
+def facts_schema(with_goals: bool = False) -> dict[str, Any]:
+    """Схема вызова фактов; с целями — для дневника, без — для рукописей."""
+    properties = dict(_FACT_PROPERTIES)
+    if with_goals:
+        properties.update(_GOAL_PROPERTIES)
+    return {
+        "type": "object",
+        "properties": {
+            "facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": list(properties),
+                },
+            }
+        },
+        "required": ["facts"],
+    }
+
+
+FACTS_SCHEMA: dict[str, Any] = facts_schema(with_goals=False)
+FACTS_WITH_GOALS_SCHEMA: dict[str, Any] = facts_schema(with_goals=True)
 
 RELATIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -168,6 +192,11 @@ RELATIONS_SCHEMA: dict[str, Any] = {
                     "relation_kind": {"type": "string"},
                     #: свободная подпись — только когда relation_kind = other
                     "relation_label": {"type": "string"},
+                    #: связь проходит через брак (тесть, зять, шурин): знак
+                    #: и число поколений считает код, а не модель
+                    "via_marriage": {"type": "boolean"},
+                    #: глубина для прадеда и дальше (3..6); иначе 0
+                    "generations": {"type": "integer"},
                     "source_text": {"type": "string"},
                     "confidence": {"type": "number"},
                 },
@@ -175,6 +204,8 @@ RELATIONS_SCHEMA: dict[str, Any] = {
                     "person_name",
                     "relation_kind",
                     "relation_label",
+                    "via_marriage",
+                    "generations",
                     "source_text",
                     "confidence",
                 ],
@@ -182,70 +213,6 @@ RELATIONS_SCHEMA: dict[str, Any] = {
         }
     },
     "required": ["relations"],
-}
-
-GOALS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "goals": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "status_update": {
-                        "type": "string",
-                        "enum": ["started", "progress", "completed", "abandoned", "mentioned"],
-                    },
-                    "note": {"type": "string"},
-                    "source_text": {"type": "string"},
-                    "confidence": {"type": "number"},
-                },
-                "required": ["title", "status_update", "note", "source_text", "confidence"],
-            },
-        }
-    },
-    "required": ["goals"],
-}
-
-EVENTS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "events": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
-                    "time_text": {"type": "string"},
-                    "importance": {"type": "number"},
-                    "source_text": {"type": "string"},
-                },
-                "required": ["title", "description", "time_text", "importance", "source_text"],
-            },
-        }
-    },
-    "required": ["events"],
-}
-
-HABITS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "habits": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "note": {"type": "string"},
-                    "source_text": {"type": "string"},
-                },
-                "required": ["title", "note", "source_text"],
-            },
-        }
-    },
-    "required": ["habits"],
 }
 
 #: matched_id = -1 значит «ничего не подошло, создавай новое»
@@ -275,9 +242,13 @@ CONTEXT_RULE = (
 )
 
 SOURCE_RULE = (
-    "source_text — точная цитата ИЗ ОСНОВНОГО ТЕКСТА, скопированная посимвольно, "
-    "без пересказа и без правок. Если точной цитаты нет, элемент не возвращай.\n\n"
+    "Если в задаче есть поле source_text — это точная цитата ИЗ ОСНОВНОГО ТЕКСТА, "
+    "скопированная посимвольно, без пересказа и без правок. Если точной цитаты нет, "
+    "элемент не возвращай.\n\n"
 )
+
+#: граница между общим блоком документа и задачей конкретного вызова
+TASK_HEADER = "=== ЗАДАЧА ===\n"
 
 
 def author_line(author_name: str | None) -> str:
@@ -291,10 +262,25 @@ def author_line(author_name: str | None) -> str:
     )
 
 
-def entities_prompt(text: str, context: str) -> str:
+def document_block(text: str, context: str, author_name: str | None) -> str:
+    """Общий префикс всех вызовов: правила, автор, контекст и текст страницы.
+
+    Он побайтно одинаков во всех вызовах прогона — на этом держится KV-кэш
+    Ollama. Не вставляйте сюда ничего, что зависит от вызова.
+    """
     return (
         CONTEXT_RULE
-        + "Ты выделяешь ИМЕНОВАННЫЕ сущности из текста личного дневника "
+        + SOURCE_RULE
+        + author_line(author_name)
+        + f"{context}Основной текст:\n{text}\n\n"
+        + TASK_HEADER
+    )
+
+
+def entities_prompt(text: str, context: str, author_name: str | None = None) -> str:
+    return (
+        document_block(text, context, author_name)
+        + "Ты выделяешь ИМЕНОВАННЫЕ сущности из основного текста личного дневника "
         "(рукописного или обычного).\n\n"
         "Сущность — это конкретный человек, организация, место, событие или предмет, "
         "у которого есть имя или название: «Баба Галя», «Сочи», «завод Красный Октябрь», "
@@ -313,40 +299,56 @@ def entities_prompt(text: str, context: str) -> str:
         "(«мой отец», «моя мама», «наши соседи»). Связь с таким человеком выражается "
         "в отдельном вызове (relation_type), а не сущностью.\n"
         "- НЕ выделяй время и числа сами по себе: «лет 7», «20 августа 1910 года» — это "
-        "time_text факта или события, а не сущность.\n"
+        "time_text факта, а не сущность.\n"
         "- НЕ выделяй себя словами «я», «мы», «мой».\n"
         "- Если у человека нет имени в тексте — не выделяй его вовсе.\n\n"
         "Пустой массив — правильный ответ для текста без имён. Лучше вернуть меньше "
-        "сущностей, чем добавить в базу слово, которое именем не является.\n\n"
-        f"{context}Основной текст:\n{text}"
+        "сущностей, чем добавить в базу слово, которое именем не является."
     )
 
 
-def mentions_prompt(text: str, context: str, entity_names: list[str]) -> str:
+def mentions_prompt(
+    text: str, context: str, entity_names: list[str], author_name: str | None = None
+) -> str:
     names = ", ".join(entity_names) if entity_names else "—"
     return (
-        CONTEXT_RULE
-        + SOURCE_RULE
-        + "Ты находишь в тексте упоминания уже известных сущностей.\n\n"
+        document_block(text, context, author_name)
+        + "Ты находишь в основном тексте упоминания уже известных сущностей.\n\n"
         f"Сущности: {names}\n\n"
         "Для каждого упоминания укажи:\n"
         "- entity_name: имя сущности из списка\n"
         "- mention_text: ТОЧНАЯ подстрока текста, как она написана в тексте\n"
         "- sentence_text: предложение, в котором стоит упоминание\n"
-        "- confidence: уверенность 0.0-1.0\n\n"
-        f"{context}Основной текст:\n{text}"
+        "- confidence: уверенность 0.0-1.0"
     )
 
 
+#: цели — только в дневнике: в чужих рукописях намерения почти не встречаются,
+#: а лишние поля удлиняют каждый ответ модели
+GOALS_RULE = (
+    "Цель — тоже факт. Если факт — осознанное намерение чего-то достичь или "
+    "продвижение к нему (выучить язык, похудеть, сменить работу, накопить деньги), "
+    "заполни:\n"
+    "- goal_title: краткое название цели (2-6 слов, именительный падеж); иначе пустая строка\n"
+    "- goal_status: started (впервые поставил) | progress (есть продвижение) | "
+    "completed (достиг) | abandoned (отказался) | mentioned (просто упомянул); "
+    "none — факт не о цели\n"
+    "Мимолётные желания и бытовые дела (помыть посуду) целями не считаются.\n\n"
+)
+
+
 def facts_prompt(
-    text: str, context: str, author_name: str | None, graph: str = ""
+    text: str,
+    context: str,
+    author_name: str | None,
+    graph: str = "",
+    with_goals: bool = False,
 ) -> str:
     return (
-        CONTEXT_RULE
-        + SOURCE_RULE
-        + author_line(author_name)
-        + "Ты извлекаешь факты из текста личного дневника.\n"
-        "Факт — это утверждение о мире: кто что сделал, кем кому приходится, что где находится.\n\n"
+        document_block(text, context, author_name)
+        + "Ты извлекаешь факты из основного текста личного дневника.\n"
+        "Факт — это утверждение о мире: кто что сделал, кем кому приходится, что где "
+        "находится, что случилось.\n\n"
         + FACTS_SUBJECT_RULE
         + graph
         + "Для каждого факта укажи:\n"
@@ -361,9 +363,16 @@ def facts_prompt(
         "- time_iso: та же дата в виде ГГГГ, ГГГГ-ММ или ГГГГ-ММ-ДД, если её можно "
         "определить («20 августа 1910 года» -> 1910-08-20); иначе пустая строка. "
         "Точность не выдумывай: «в 1910 году» — это 1910, а не 1910-01-01.\n"
+        "- importance: насколько это событие в жизни субъекта, 0.0-1.0. Событие — "
+        "переезд, свадьба, рождение, смерть, болезнь, смена работы, учёба, служба, "
+        "путешествие, крупная покупка, важная встреча: заметное ~0.5, жизненно важное "
+        "> 0.8. Обычное утверждение, черта характера, рутина (поел, лёг спать) — 0.\n"
+        "- recurrence: если текст прямо говорит, что действие регулярное («каждое утро», "
+        "«по выходным», «всегда», «часто»), — эти слова, как в тексте; иначе пустая "
+        "строка. Из одного упоминания регулярность не выводи.\n"
         "- confidence: уверенность 0.0-1.0\n\n"
-        "Не выдумывай факты и не пересказывай общие рассуждения. Если фактов нет, верни пустой массив.\n\n"
-        f"{context}Основной текст:\n{text}"
+        + (GOALS_RULE if with_goals else "")
+        + "Не выдумывай факты и не пересказывай общие рассуждения. Если фактов нет, верни пустой массив."
     )
 
 
@@ -376,9 +385,7 @@ def relations_prompt(
 ) -> str:
     known = ", ".join(known_people) if known_people else "—"
     return (
-        CONTEXT_RULE
-        + SOURCE_RULE
-        + author_line(author_name)
+        document_block(text, context, author_name)
         + "Ты определяешь круг общения автора текста: родственные, дружеские, "
         "рабочие и социальные связи.\n\n"
         f"Уже известные люди: {known}\n\n"
@@ -390,6 +397,11 @@ def relations_prompt(
         "«мама» — mother. Если ничего не подходит — other.\n"
         "- relation_label: свободная подпись, ТОЛЬКО когда relation_kind=other "
         "(в остальных случаях пустая строка)\n"
+        "- via_marriage: true, если связь идёт через брак (тесть, зять, шурин, "
+        "сват, свояк, отчим). Для кровной родни false. Знак и число поколений "
+        "не указывай — это считает код\n"
+        "- generations: только для прадеда и дальше — сколько поколений (3..6). "
+        "В остальных случаях 0\n"
         "- source_text: точная цитата\n"
         "- confidence: уверенность 0.0-1.0\n\n"
         "Включай человека только если связь явно следует из текста И у человека есть имя \n"
@@ -397,66 +409,7 @@ def relations_prompt(
         "описание без имени («мой отец», «соседи») здесь не годится: роль такого человека \n"
         "относительно автора выражает вызов фактов (subject_kind=relative), а не связь.\n"
         "Не выводи связь через цепочку: если сказано «мама Маши», это связь Маши, а не автора.\n"
-        "Если автор пишет о себе или связи не определяются, верни пустой массив.\n\n"
-        f"{context}Основной текст:\n{text}"
-    )
-
-
-def goals_prompt(text: str, context: str, author_name: str | None) -> str:
-    return (
-        CONTEXT_RULE
-        + SOURCE_RULE
-        + author_line(author_name)
-        + "Ты извлекаешь личные цели автора текста.\n"
-        "Цель — осознанное намерение чего-то достичь (выучить язык, похудеть, "
-        "сменить работу, накопить деньги).\n\n"
-        "Для каждой цели укажи:\n"
-        "- title: краткое название цели (2-6 слов, именительный падеж)\n"
-        "- status_update: started (впервые поставил) | progress (есть продвижение) | "
-        "completed (достиг) | abandoned (отказался) | mentioned (просто упомянул)\n"
-        "- note: краткое описание продвижения или контекста\n"
-        "- source_text: точная цитата\n"
-        "- confidence: уверенность 0.0-1.0\n\n"
-        "Не выдумывай цели: мимолётные желания и бытовые дела (помыть посуду) целями не считаются.\n"
-        "Если целей нет, верни пустой массив.\n\n"
-        f"{context}Основной текст:\n{text}"
-    )
-
-
-def events_prompt(text: str, context: str, author_name: str | None) -> str:
-    return (
-        CONTEXT_RULE
-        + SOURCE_RULE
-        + author_line(author_name)
-        + "Ты извлекаешь важные события из текста.\n"
-        "Важное событие — то, что заметно влияет на жизнь автора: переезд, смена работы, "
-        "экзамен, свадьба, рождение, болезнь, путешествие, крупная покупка, встреча.\n\n"
-        "Для каждого события укажи:\n"
-        "- title: краткое название (2-6 слов)\n"
-        "- description: описание в 1-2 предложениях\n"
-        "- time_text: когда произошло, как написано в тексте (или пустая строка)\n"
-        "- importance: важность 0.0-1.0 (рутина < 0.3, заметное ~0.5, жизненно важное > 0.8)\n"
-        "- source_text: точная цитата\n\n"
-        "Рутинные действия (поел, лёг спать) событиями не считаются. "
-        "Если событий нет, верни пустой массив.\n\n"
-        f"{context}Основной текст:\n{text}"
-    )
-
-
-def habits_prompt(text: str, context: str, author_name: str | None) -> str:
-    return (
-        CONTEXT_RULE
-        + SOURCE_RULE
-        + author_line(author_name)
-        + "Ты извлекаешь регулярные привычки и активности из текста.\n"
-        "Привычка — повторяющееся действие: бег, зарядка, чтение, медитация, "
-        "изучение языка, прогулки.\n\n"
-        "Для каждой привычки, выполнение (или пропуск) которой упомянуто, укажи:\n"
-        "- title: название привычки (1-4 слова, именительный падеж)\n"
-        "- note: что именно сделано (или почему пропущено)\n"
-        "- source_text: точная цитата\n\n"
-        "Только регулярные действия, не разовые дела. Если привычек нет, верни пустой массив.\n\n"
-        f"{context}Основной текст:\n{text}"
+        "Если автор пишет о себе или связи не определяются, верни пустой массив."
     )
 
 

@@ -13,6 +13,10 @@ celery[redis]
 redis
 llama-cpp-python
 ollama
+# Cloud models for knowledge extraction (KNOWLEDGE_LLM_PROVIDER): Claude via the
+# official Anthropic SDK, OpenAI and DeepSeek via the OpenAI SDK
+anthropic>=1.15.0
+openai>=3.31.0
 PyJWT
 # Embeddings (deduplication + RAG) run in-process: google/embeddinggemma-2 is a
 # Hugging Face SentenceTransformer, not an Ollama model. >=6.1.0 is what the
@@ -22,6 +26,9 @@ sentence-transformers>=6.1.0
 transformers>=5.19.0
 torch
 pillow
+# PDF import: one scanned PDF becomes one page per sheet (see app/htr/README.md).
+# The wheel carries PDFium, so there is no poppler/ghostscript to install.
+pypdfium2
 python-multipart
 pytest
 # Optional HTR backend (recognition + fine-tuning). On WSL2/Linux coremltools

@@ -18,3 +18,4 @@ backend/htr_storage/
 # дампы БД перед миграциями (создаются вручную, в репозиторий не попадают)
 backend/backups/
 docs/screenshots/
+frontend/.npm-tmp-cache/

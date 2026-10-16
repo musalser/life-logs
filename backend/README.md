@@ -117,6 +117,42 @@ Alembic, каталог `revisions/`:
 * `app/services/analytics_service.py` — аналитика с проверкой ссылок;
 * `app/services/rag_service.py` — поиск по архиву для чата.
 
+### Модель знаний: Ollama или облако
+
+Извлечение знаний и аналитика могут работать не на локальной qwen3, а на
+облачной модели (`app/adapters/cloud_llm.py`); чат остаётся на Ollama.
+Настройки — в `backend/.env`:
+
+```bash
+KNOWLEDGE_LLM_PROVIDER=anthropic     # ollama (по умолчанию) | anthropic | openai | deepseek
+KNOWLEDGE_LLM_MODEL=                 # пусто: claude-opus-5-5 / deepseek-chat; для openai обязательно
+ANTHROPIC_API_KEY=...                # или OPENAI_API_KEY / DEEPSEEK_API_KEY
+ANTHROPIC_EFFORT=medium              # глубина рассуждений Claude: low … max
+LLM_API_PROXY=http://user:pass@host:port   # только для облачных API; Ollama идёт напрямую
+```
+
+* **Claude** — официальный SDK `anthropic`, JSON по схеме (`output_config.format`).
+  Для `claude-opus-5-5` включён серверный fallback на отказ модели
+  (`fallbacks: "default"`): отклонённый классификатором запрос повторяет другая
+  модель Claude.
+* **OpenAI** — `json_schema` со `strict: true`; модель указывается явно.
+* **DeepSeek** — совместимый с OpenAI API, но только JSON-режим без схемы:
+  схема дописывается в промпт.
+
+Модель записывается в журнал прогонов как `провайдер:модель`
+(`extraction_runs.model`). Отказ модели и ошибки авторизации не роняют прогон:
+вызов попадает в `stats.errors`, как и при недоступной Ollama.
+
+Сравнить модели на одной странице, ничего не записывая в базу (прогон в
+транзакции с откатом):
+
+```bash
+.venv/bin/python -m app.scripts.try_extraction htr 177                      # модель из настроек
+.venv/bin/python -m app.scripts.try_extraction htr 177 --provider anthropic --runs 2
+```
+
+Облачный прогон страницы — 4–6 платных вызовов.
+
 Backfill источников для уже существующих страниц:
 
 ```bash

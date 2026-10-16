@@ -5,7 +5,7 @@
         <div class="min-w-0">
           <h1 class="text-2xl font-semibold">Знания</h1>
           <p class="text-sm text-app-muted">
-            Цели, круг общения, события, привычки и факты — от лица выбранного объекта
+            Цели, круг общения, события и факты — от лица выбранного объекта
           </p>
         </div>
 
@@ -104,6 +104,23 @@
       <section class="rounded-2xl border border-app-border/40 bg-app-panel/50 p-4">
         <p class="mb-3 text-xs uppercase tracking-widest text-app-accent">Круг общения</p>
 
+        <!--
+          Карта строится по всему архиву, а не по выбранному объекту: уровни
+          приходят с бэкенда согласованными внутри компонент родства, поэтому
+          смена «от кого смотрим» — это подсветка и корень древа, а не запрос.
+        -->
+        <RelationGraph
+          class="mb-4"
+          :nodes="graphNodes"
+          :edges="graphEdges"
+          :conflicts="graphConflicts"
+          :unplaced="graphUnplaced"
+          :selected-id="graphSelectedId ?? selectedId"
+          :empty="!graphNodes.length"
+          @select="graphSelectedId = $event"
+          @refresh="loadGraph({ force: true })"
+        />
+
         <p v-if="!knowledge.relations.length" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
           Связи пока не определены. Упоминайте людей в дневнике — карта связей построится сама.
         </p>
@@ -154,16 +171,16 @@
         </p>
 
         <div v-else class="space-y-2">
+          <!-- событие — это факт с важностью: заголовок собирается из сказуемого и дополнения -->
           <article
             v-for="event in knowledge.events"
             :key="event.id"
             class="rounded-xl border border-app-border/40 bg-app-panel/30 p-4"
           >
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <h3 class="text-sm font-semibold text-app-text">{{ event.title }}</h3>
+              <h3 class="text-sm font-semibold text-app-text">{{ factObject(event) }}</h3>
               <div class="flex items-center gap-2 text-[11px] text-app-muted">
                 <span v-if="event.time_text">{{ event.time_text }}</span>
-                <span>{{ formatDate(event.created_at) }}</span>
                 <span
                   v-if="event.importance != null"
                   class="rounded-full bg-app-primary/15 px-2 py-0.5 font-semibold text-app-accent"
@@ -172,7 +189,6 @@
                 </span>
               </div>
             </div>
-            <p v-if="event.description" class="mt-1 text-sm text-app-muted">{{ event.description }}</p>
             <button
               v-if="event.source_text"
               type="button"
@@ -182,36 +198,6 @@
             >
               «{{ event.source_text }}»
             </button>
-          </article>
-        </div>
-      </section>
-
-      <!-- Привычки -->
-      <section class="rounded-2xl border border-app-border/40 bg-app-panel/50 p-4">
-        <p class="mb-3 text-xs uppercase tracking-widest text-app-accent">Привычки</p>
-
-        <p v-if="!knowledge.habits.length" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
-          Привычек пока нет.
-        </p>
-
-        <div v-else class="grid gap-3 md:grid-cols-2">
-          <article
-            v-for="habit in knowledge.habits"
-            :key="habit.id"
-            class="rounded-xl border border-app-border/40 bg-app-panel/30 p-4"
-          >
-            <div class="flex items-center justify-between gap-2">
-              <h3 class="text-sm font-semibold text-app-text">{{ habit.title }}</h3>
-              <span class="rounded-full bg-app-primary/15 px-2.5 py-0.5 text-[11px] font-semibold text-app-accent">
-                {{ habit.logs.length }} отметок
-              </span>
-            </div>
-            <div v-if="habit.logs.length" class="mt-2 space-y-1">
-              <p v-for="log in habit.logs.slice(-3).reverse()" :key="log.id" class="text-xs text-app-muted">
-                <span class="text-app-text">{{ formatDate(log.created_at) }}</span>
-                <template v-if="log.note"> — {{ log.note }}</template>
-              </p>
-            </div>
           </article>
         </div>
       </section>
@@ -268,8 +254,9 @@
             <button
               type="button"
               class="flex items-center gap-2 rounded-full border border-app-border/40 px-3 py-1.5 text-sm transition hover:border-app-primary/60 hover:bg-app-input/40"
-              :title="person.aliases.length ? `Ещё имена: ${person.aliases.join(', ')}` : 'Показать знания этого человека'"
-              @click="selectSubject(person.id)"
+              :class="selectedPerson?.id === person.id ? 'border-app-primary bg-app-input/60' : ''"
+              :title="person.aliases.length ? `Ещё имена: ${person.aliases.join(', ')}` : 'Показать факты об этом объекте'"
+              @click="selectPerson(person)"
             >
               <span class="font-semibold text-app-text">{{ person.name }}</span>
               <span v-if="person.aliases.length" class="text-[11px] text-app-muted">
@@ -286,6 +273,77 @@
               ⤴
             </button>
           </div>
+        </div>
+      </section>
+
+      <!-- Факты об объекте: клик по персоне в блоке выше -->
+      <section v-if="selectedPerson" class="rounded-2xl border border-app-border/40 bg-app-panel/50 p-4">
+        <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <p class="text-xs uppercase tracking-widest text-app-accent">Факты: {{ selectedPerson.name }}</p>
+          <div class="flex items-center gap-3">
+            <button
+              type="button"
+              class="text-xs text-app-accent transition hover:underline"
+              @click="selectSubject(selectedPerson.id)"
+            >
+              сделать перспективой
+            </button>
+            <button type="button" class="text-xs text-app-muted transition hover:text-app-text" @click="closePerson">
+              закрыть
+            </button>
+          </div>
+        </div>
+
+        <p v-if="personFactsLoading" class="text-sm text-app-muted">Ищем факты...</p>
+        <p v-else-if="personFactsError" class="text-sm text-app-error">{{ personFactsError }}</p>
+        <p v-else-if="!personFacts.length" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
+          Фактов с этим объектом не найдено.
+        </p>
+
+        <div v-else class="space-y-2">
+          <article
+            v-for="fact in personFacts"
+            :key="fact.id"
+            class="rounded-xl border border-app-border/40 bg-app-panel/30 p-3"
+          >
+            <p class="text-sm text-app-text">
+              <span class="font-semibold">{{ fact.subject_name || '—' }}</span>
+              {{ fact.predicate }}{{ fact.object_text ? ` ${fact.object_text}` : '' }}
+              <span v-if="fact.object_name && fact.object_name !== selectedPerson.name" class="text-app-muted">
+                · {{ fact.object_name }}
+              </span>
+              <span v-if="fact.time_text" class="text-app-muted"> · {{ fact.time_text }}</span>
+            </p>
+            <div class="mt-1.5 flex flex-wrap gap-1.5">
+              <span
+                v-if="fact.importance != null && fact.importance >= EVENT_MIN_IMPORTANCE"
+                class="rounded-full bg-app-primary/15 px-2 py-0.5 text-[10px] font-semibold text-app-accent"
+              >
+                событие
+              </span>
+              <span
+                v-if="fact.recurrence"
+                class="rounded-full bg-app-primary/15 px-2 py-0.5 text-[10px] text-app-accent"
+              >
+                регулярно: {{ fact.recurrence }}
+              </span>
+              <span
+                v-for="reason in fact.match_reasons"
+                :key="reason"
+                class="rounded-full bg-app-input/60 px-2 py-0.5 text-[10px] text-app-muted"
+              >
+                {{ matchReasonLabel(reason) }}
+              </span>
+            </div>
+            <button
+              type="button"
+              class="mt-1 block text-left text-xs italic text-app-muted transition hover:text-app-accent"
+              :title="sourceTitle(fact.source_id)"
+              @click="openSource(fact.source_id)"
+            >
+              «{{ fact.source_text }}»
+            </button>
+          </article>
         </div>
       </section>
 
@@ -366,8 +424,8 @@
           {{ analyticsError }}
         </p>
         <p v-else-if="!analyticsHasItems" class="rounded-xl border border-dashed border-app-border/40 px-3 py-3 text-sm text-app-muted">
-          Аналитики пока нет. Нажмите «Сгенерировать»: модель найдёт закономерности, вопросы и идеи
-          по этим знаниям — каждый пункт со ссылками на записи.
+          Аналитики пока нет. Нажмите «Сгенерировать»: модель найдёт закономерности, привычки, вопросы
+          и идеи по этим знаниям — каждый пункт со ссылками на записи.
         </p>
         <div v-else class="space-y-4">
           <div v-for="section in ANALYTICS_SECTIONS" :key="section.key">
@@ -405,6 +463,7 @@
 <script setup>
 import { authFetch } from '~/utils/auth-fetch'
 import { useKnowledgeSubjects } from '~/composables/useKnowledge'
+import { useRelationGraph } from '~/composables/useRelationGraph'
 
 const { public: { apiBaseUrl } } = useRuntimeConfig()
 const router = useRouter()
@@ -420,7 +479,23 @@ const {
   request
 } = useKnowledgeSubjects()
 
-const knowledge = ref({ goals: [], relations: [], events: [], habits: [], facts: [], entities: [] })
+const {
+  nodes: graphNodes,
+  edges: graphEdges,
+  conflicts: graphConflicts,
+  unplaced: graphUnplaced,
+  load: loadGraph
+} = useRelationGraph()
+
+//: выбранный на карте человек: корень древа и подсветка. Сбрасывается при смене
+//: объекта, чтобы древо снова строилось от него
+const graphSelectedId = ref(null)
+
+watch(selectedId, () => {
+  graphSelectedId.value = null
+})
+
+const knowledge = ref({ goals: [], relations: [], events: [], facts: [], entities: [] })
 const stats = ref(null)
 const subjectName = ref('')
 const loading = ref(false)
@@ -433,10 +508,63 @@ const analyticsError = ref('')
 
 const ANALYTICS_SECTIONS = [
   { key: 'insights', title: 'Инсайты' },
+  // привычки выводятся из повторов в накопленных фактах, а не из одной страницы
+  { key: 'habits', title: 'Привычки' },
   { key: 'questions', title: 'Вопросы' },
   { key: 'ideas', title: 'Идеи' },
   { key: 'conclusions', title: 'Выводы' }
 ]
+
+// --- факты об объекте (клик по персоне) ---
+
+const selectedPerson = ref(null)
+const personFacts = ref([])
+const personFactsLoading = ref(false)
+const personFactsError = ref('')
+
+const MATCH_REASON_LABELS = {
+  subject: 'субъект',
+  object: 'дополнение',
+  mention: 'упоминание в цитате',
+  text: 'имя в тексте'
+}
+
+const matchReasonLabel = (reason) => MATCH_REASON_LABELS[reason] || reason
+
+//: тот же порог, что settings.knowledge_event_min_importance на бэкенде
+const EVENT_MIN_IMPORTANCE = 0.4
+
+const selectPerson = async (person) => {
+  // повторный клик по той же персоне закрывает панель
+  if (selectedPerson.value?.id === person.id) {
+    closePerson()
+    return
+  }
+  selectedPerson.value = person
+  personFacts.value = []
+  personFactsError.value = ''
+  personFactsLoading.value = true
+  try {
+    const response = await api(`/knowledge/objects/${person.id}/facts`)
+    if (!response.ok) throw new Error('Не удалось загрузить факты')
+    // быстрый клик по другой персоне не должен перетереть её результат
+    if (selectedPerson.value?.id !== person.id) return
+    personFacts.value = await response.json()
+  } catch (err) {
+    if (selectedPerson.value?.id === person.id) {
+      personFactsError.value = err.message || 'Ошибка загрузки фактов'
+    }
+  } finally {
+    if (selectedPerson.value?.id === person.id) personFactsLoading.value = false
+  }
+}
+
+const closePerson = () => {
+  selectedPerson.value = null
+  personFacts.value = []
+  personFactsError.value = ''
+  personFactsLoading.value = false
+}
 
 const loadingObjects = computed(() => subjectsLoading.value)
 
@@ -451,6 +579,7 @@ const api = (path, init) => request(path, init)
 const loadKnowledge = async () => {
   loading.value = true
   error.value = ''
+  loadGraph()
   try {
     const query = selectedId.value ? `?subject_entity_id=${selectedId.value}` : ''
     const response = await api(`/knowledge${query}`)
@@ -613,11 +742,12 @@ const openEvidence = (evidence) => {
     return
   }
   // other kinds open the section they belong to; the label is the anchor
+  // event и habit встречаются только в старом кэше аналитики: события теперь
+  // факты, а блока привычек на странице нет — они живут в самой аналитике
   const target = evidence.kind === 'goal' ? 'Цели'
     : evidence.kind === 'event' ? 'Важные события'
-      : evidence.kind === 'habit' ? 'Привычки'
-        : evidence.kind === 'fact' ? 'Факты'
-          : 'Круг общения'
+      : evidence.kind === 'fact' ? 'Факты'
+        : 'Круг общения'
   const element = [...document.querySelectorAll('section p')].find(
     (node) => node.textContent.trim().toUpperCase().startsWith(target.slice(0, 8).toUpperCase())
   )

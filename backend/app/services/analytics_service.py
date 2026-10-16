@@ -7,6 +7,12 @@
 
 Кэш живёт в ``knowledge_insights`` и привязан к ``knowledge_state.version``:
 после любого успешного извлечения версия растёт, и кэш становится ``stale``.
+
+**Привычки выводятся здесь, а не при извлечении.** По одной странице
+регулярность не установить, поэтому конвейер привычек не ищет; аналитика видит
+все накопленные факты и называет повторяющееся. Код не верит ей на слово:
+привычка обязана ссылаться либо на факт, где текст прямо говорит о регулярности
+(``recurrence``), либо на факты из двух разных источников (``_habit_supported``).
 """
 from __future__ import annotations
 
@@ -17,17 +23,14 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..adapters.ollama_adapter import OllamaAdapter
+from ..adapters.cloud_llm import StructuredLLM, knowledge_adapter, knowledge_model_label
 from ..config import settings
 from ..models import (
     Entity,
     EntityRelation,
-    Event,
     Fact,
     Goal,
     GoalProgress,
-    Habit,
-    HabitLog,
     KnowledgeInsight,
     KnowledgeState,
 )
@@ -39,112 +42,48 @@ AGGREGATE_LIMITS = {
     "facts": 200,
     "goals": 50,
     "goal_progress": 100,
-    "events": 50,
-    "habits": 50,
-    "habit_logs": 100,
     "relations": 50,
     "entities": 50,
 }
 
-ANALYTICS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "insights": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {"type": "string"},
-                                "id": {"type": "integer"},
-                            },
-                            "required": ["kind", "id"],
-                        },
+_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "confidence": {"type": "number"},
+            "evidence": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "id": {"type": "integer"},
                     },
+                    "required": ["kind", "id"],
                 },
-                "required": ["text", "confidence", "evidence"],
             },
         },
-        "questions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {"type": "string"},
-                                "id": {"type": "integer"},
-                            },
-                            "required": ["kind", "id"],
-                        },
-                    },
-                },
-                "required": ["text", "confidence", "evidence"],
-            },
-        },
-        "ideas": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {"type": "string"},
-                                "id": {"type": "integer"},
-                            },
-                            "required": ["kind", "id"],
-                        },
-                    },
-                },
-                "required": ["text", "confidence", "evidence"],
-            },
-        },
-        "conclusions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {"type": "string"},
-                                "id": {"type": "integer"},
-                            },
-                            "required": ["kind", "id"],
-                        },
-                    },
-                },
-                "required": ["text", "confidence", "evidence"],
-            },
-        },
+        "required": ["text", "confidence", "evidence"],
     },
-    "required": ["insights", "questions", "ideas", "conclusions"],
 }
 
-SECTIONS = ("insights", "questions", "ideas", "conclusions")
+SECTIONS = ("insights", "habits", "questions", "ideas", "conclusions")
+
+ANALYTICS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {section: _ITEM_SCHEMA for section in SECTIONS},
+    "required": list(SECTIONS),
+}
 
 SECTION_TITLES = {
     "insights": "инсайты — нетривиальные закономерности в записях",
+    "habits": (
+        "привычки — регулярные занятия, которые видны по фактам: одно и то же "
+        "действие на разных страницах или факт с пометкой «регулярно». Ссылайся "
+        "на сами факты (kind=fact); одно упоминание без пометки — не привычка"
+    ),
     "questions": "вопросы — что стоит выяснить; ответа в данных пока нет",
     "ideas": "идеи — что из этих закономерностей следует сделать",
     "conclusions": "выводы — короткие обобщения по темам",
@@ -160,7 +99,7 @@ def build_prompt(subject_name: str, digest: str) -> str:
         "2. Если данных мало для какого-то раздела — верни для него пустой массив. "
         "Пустой раздел лучше выдуманного.\n"
         "3. Каждый пункт обязан ссылаться на записи: evidence — массив объектов "
-        "{kind, id}, где kind — одно из fact, goal, event, habit, relation, entity, "
+        "{kind, id}, где kind — одно из fact, goal, relation, entity, "
         "а id — идентификатор из списка. Пункт без ссылок будет отброшен.\n"
         "4. Пиши по-русски, коротко и по делу, без общих слов.\n\n"
         f"Что нужно вернуть:\n"
@@ -170,9 +109,10 @@ def build_prompt(subject_name: str, digest: str) -> str:
 
 
 class AnalyticsService:
-    def __init__(self, db: Session, adapter: OllamaAdapter | None = None) -> None:
+    def __init__(self, db: Session, adapter: StructuredLLM | None = None) -> None:
         self.db = db
-        self.adapter = adapter or OllamaAdapter()
+        self._owns_adapter = adapter is None
+        self.adapter = adapter or knowledge_adapter()
 
     # ------------------------------------------------------------------
     # Чтение
@@ -228,7 +168,11 @@ class AnalyticsService:
             return self.get_cached(user_id, subject_entity_id)
 
         prompt = build_prompt(subject.canonical_name if subject else "я", digest)
-        raw = await self.adapter.generate_structured(prompt, ANALYTICS_SCHEMA)
+        try:
+            raw = await self.adapter.generate_structured(prompt, ANALYTICS_SCHEMA)
+        finally:
+            if self._owns_adapter and hasattr(self.adapter, "aclose"):
+                await self.adapter.aclose()
         payload = self._validate(self._parse(raw), index)
         self._save(user_id, subject_entity_id, payload)
         return self.get_cached(user_id, subject_entity_id)
@@ -260,7 +204,9 @@ class AnalyticsService:
         """
         subject_id = subject.id if subject else None
         lines: list[str] = []
-        index: dict[str, dict[int, str]] = {key: {} for key in ("fact", "goal", "event", "habit", "relation", "entity")}
+        index: dict[str, dict[int, str]] = {key: {} for key in ("fact", "goal", "relation", "entity")}
+        #: id факта -> (источник, сказано ли о регулярности): чем проверяются привычки
+        self._fact_meta: dict[int, tuple[int, bool]] = {}
 
         def add(kind: str, record_id: int, label: str) -> None:
             index[kind][record_id] = label
@@ -295,7 +241,14 @@ class AnalyticsService:
             subject_name = fact.subject_entity.canonical_name if fact.subject_entity else "автор"
             obj = fact.object_entity.canonical_name if fact.object_entity else (fact.object_text or "")
             when = f" ({fact.time_text})" if fact.time_text else ""
-            add("fact", fact.id, f"{subject_name}: {fact.predicate} {obj}{when}".strip())
+            marks = []
+            if fact.importance and fact.importance >= settings.knowledge_event_min_importance:
+                marks.append(f"событие, важность {fact.importance:.1f}")
+            if fact.recurrence:
+                marks.append(f"регулярно: {fact.recurrence}")
+            tail = f" [{'; '.join(marks)}]" if marks else ""
+            add("fact", fact.id, f"{subject_name}: {fact.predicate} {obj}{when}{tail}".strip())
+            self._fact_meta[fact.id] = (fact.source_id, bool(fact.recurrence))
 
         goals_query = self.db.query(Goal).filter(Goal.user_id == user_id)
         if subject_id is not None:
@@ -315,32 +268,7 @@ class AnalyticsService:
             for note in progress:
                 add("goal", note.goal_id, f"цель: {note.progress_kind} — {note.note or ''}".strip())
 
-        events_query = self.db.query(Event).filter(Event.user_id == user_id)
-        if subject_id is not None:
-            events_query = events_query.filter(Event.subject_entity_id == subject_id)
-        for event in events_query.order_by(Event.id.desc()).limit(AGGREGATE_LIMITS["events"]).all():
-            when = f" ({event.time_text})" if event.time_text else ""
-            add("event", event.id, f"событие «{event.title}»{when}: {event.description or ''}".strip())
-
-        habits_query = self.db.query(Habit).filter(Habit.user_id == user_id)
-        if subject_id is not None:
-            habits_query = habits_query.filter(Habit.subject_entity_id == subject_id)
-        habits = habits_query.order_by(Habit.id.desc()).limit(AGGREGATE_LIMITS["habits"]).all()
-        for habit in habits:
-            add("habit", habit.id, f"привычка «{habit.title}»")
-        habit_ids = [habit.id for habit in habits]
-        if habit_ids:
-            logs = (
-                self.db.query(HabitLog)
-                .filter(HabitLog.habit_id.in_(habit_ids))
-                .order_by(HabitLog.id.desc())
-                .limit(AGGREGATE_LIMITS["habit_logs"])
-                .all()
-            )
-            for log in logs:
-                add("habit", log.habit_id, f"привычка: {log.note or 'отметка'}".strip())
-
-        if not index["fact"] and not index["goal"] and not index["event"] and not index["habit"]:
+        if not index["fact"] and not index["goal"]:
             # одни имена без записей — анализировать нечего
             return "", {}
         return "\n".join(lines), index
@@ -385,6 +313,9 @@ class AnalyticsService:
                     if not evidence:
                         dropped += 1
                         continue
+                    if section == "habits" and not self._habit_supported(evidence):
+                        dropped += 1
+                        continue
                     kept.append(
                         {
                             "text": text[:1000],
@@ -396,6 +327,14 @@ class AnalyticsService:
         if dropped:
             logger.info("Analytics: dropped %s items without valid evidence", dropped)
         return result
+
+    def _habit_supported(self, evidence: list[dict]) -> bool:
+        """Привычка — это повтор: факт с «регулярно» или факты двух источников."""
+        meta = getattr(self, "_fact_meta", {})
+        facts = [meta[link["id"]] for link in evidence if link["kind"] == "fact" and link["id"] in meta]
+        if any(recurrent for _, recurrent in facts):
+            return True
+        return len({source_id for source_id, _ in facts}) >= 2
 
     @staticmethod
     def _clamp(value: Any) -> float | None:
@@ -421,12 +360,12 @@ class AnalyticsService:
                 subject_entity_id=subject_entity_id,
                 version=version,
                 payload=text,
-                model=settings.llm_model,
+                model=knowledge_model_label(),
             )
             self.db.add(row)
         else:
             row.version = version
             row.payload = text
-            row.model = settings.llm_model
+            row.model = knowledge_model_label()
             row.generated_at = datetime.now(timezone.utc)
         self.db.commit()

@@ -1,20 +1,19 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session, joinedload
 
+from ..config import settings
 from ..deps import get_current_user, get_db, get_knowledge_source_service
 from ..models import (
     DiaryPage,
     Entity,
     EntityMention,
     EntityRelation,
-    Event,
     Fact,
     FactConflict,
     Goal,
-    Habit,
     HTRPage,
     KnowledgeSource,
     User,
@@ -22,20 +21,21 @@ from ..models import (
 from ..schemas import (
     AnalyticsRefreshRequest,
     AnalyticsResponse,
-    EventResponse,
+    EntityFactResponse,
     FactConflictResponse,
     FactResponse,
     GoalResponse,
-    HabitResponse,
     KnowledgeObjectCreateRequest,
     KnowledgeObjectResponse,
     KnowledgeObjectUpdateRequest,
     KnowledgeResponse,
     KnowledgeStatsResponse,
     ObjectMergeRequest,
+    RelationGraphResponse,
     RelationWithPath,
 )
 from ..services.analytics_service import AnalyticsService
+from ..services.entity_facts import facts_for_entity
 from ..services.entity_merge import MergeError, merge_entities
 from ..services.knowledge_graph_service import KnowledgeGraphService
 from ..services.knowledge_source_service import (
@@ -206,6 +206,40 @@ async def update_object(
     return _object_payload(entity, self_entity_id=self_entity.id)
 
 
+@router.get("/objects/{entity_id}/facts", response_model=list[EntityFactResponse])
+async def object_facts(
+    entity_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Факты, в которых участвует объект: субъект, дополнение или упоминание в цитате."""
+    user = _get_user_by_username(db, username)
+    entity = (
+        db.query(Entity)
+        .filter(Entity.id == entity_id, Entity.user_id == user.id)
+        .first()
+    )
+    if entity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge object not found")
+    rows = facts_for_entity(db, user.id, entity)
+    party_ids = {row.fact.subject_entity_id for row in rows} | {row.fact.object_entity_id for row in rows}
+    party_ids.discard(None)
+    names = (
+        {e.id: e.canonical_name for e in db.query(Entity).filter(Entity.id.in_(party_ids)).all()}
+        if party_ids
+        else {}
+    )
+    return [
+        EntityFactResponse(
+            **FactResponse.model_validate(row.fact).model_dump(),
+            match_reasons=row.reasons,
+            subject_name=names.get(row.fact.subject_entity_id),
+            object_name=names.get(row.fact.object_entity_id),
+        )
+        for row in rows
+    ]
+
+
 @router.post("/objects/merge", response_model=KnowledgeObjectResponse)
 async def merge_objects(
     request: ObjectMergeRequest,
@@ -289,23 +323,18 @@ async def get_knowledge(
         .order_by(Goal.updated_at.desc())
         .all()
     )
+    # Событие — факт с важностью: показывается в своём блоке по дате, а не
+    # второй раз среди фактов. Привычки выводит аналитика (раздел «habits»).
+    threshold = settings.knowledge_event_min_importance
+    subject_facts = db.query(Fact).filter(Fact.user_id == user.id, Fact.subject_entity_id == subject.id)
     events = (
-        db.query(Event)
-        .filter(Event.user_id == user.id, Event.subject_entity_id == subject.id)
-        .order_by(Event.id.desc())
+        subject_facts.filter(Fact.importance >= threshold)
+        .order_by(Fact.time_iso.asc().nullslast(), Fact.id.desc())
         .limit(200)
         .all()
     )
-    habits = (
-        db.query(Habit)
-        .options(joinedload(Habit.logs))
-        .filter(Habit.user_id == user.id, Habit.subject_entity_id == subject.id)
-        .order_by(Habit.id.desc())
-        .all()
-    )
     facts = (
-        db.query(Fact)
-        .filter(Fact.user_id == user.id, Fact.subject_entity_id == subject.id)
+        subject_facts.filter((Fact.importance.is_(None)) | (Fact.importance < threshold))
         .order_by(Fact.id.desc())
         .limit(200)
         .all()
@@ -327,8 +356,7 @@ async def get_knowledge(
         subject_name=subject.canonical_name,
         goals=[GoalResponse.model_validate(goal) for goal in goals],
         relations=relations,
-        events=[EventResponse.model_validate(event) for event in events],
-        habits=[HabitResponse.model_validate(habit) for habit in habits],
+        events=[FactResponse.model_validate(event) for event in events],
         facts=[FactResponse.model_validate(fact) for fact in facts],
         entities=[
             _object_payload(entity, self_entity_id=subject.id)
@@ -339,7 +367,6 @@ async def get_knowledge(
             facts=len(facts),
             goals=len(goals),
             events=len(events),
-            habits=len(habits),
             relations=len(direct),
             people=len({**direct, **paths}),
             sources=source_count,
@@ -387,6 +414,30 @@ async def list_conflicts(
         )
         for row in rows
     ]
+
+
+@router.get("/graph", response_model=RelationGraphResponse)
+async def relation_graph(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    username: str = Depends(get_current_user),
+):
+    """Граф связей целиком: корень и режим выбирает клиент.
+
+    Отдаём весь архив сразу, а не окружение выбранного объекта: уровни считаются
+    внутри компоненты родства с постоянным сдвигом, поэтому смена корня — это
+    вычитание его уровня на клиенте, а не новый запрос. ``ETag`` — версия знаний:
+    после перепрогона или слияния она меняется, и клиент забирает граф заново, а
+    без изменений получает 304.
+    """
+    user = _get_user_by_username(db, username)
+    payload = KnowledgeGraphService(db, user.id).relation_graph()
+    etag = f'W/"{payload["version"]}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    return RelationGraphResponse(**payload)
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@
       <span class="lib-folder__name">{{ folder.name }}</span>
       <span class="lib-count">{{ folder.pages.length }}</span>
       <div class="lib-actions">
+        <button type="button" title="Загрузить страницы или PDF в эту папку" @click.stop="$emit('upload', folder)">↑</button>
         <button type="button" title="Новая подпапка" @click.stop="$emit('new-subfolder', folder)">+</button>
         <button type="button" title="Переименовать" @click.stop="$emit('rename', folder)">✎</button>
         <button type="button" title="Удалить папку (содержимое останется)" @click.stop="$emit('delete-folder', folder)">✕</button>
@@ -41,6 +42,7 @@
         @drag-start="$emit('drag-start', $event)"
         @drag-end="$emit('drag-end', $event)"
         @drop-page="$emit('drop-page', $event)"
+        @upload="$emit('upload', $event)"
         @new-subfolder="$emit('new-subfolder', $event)"
         @rename="$emit('rename', $event)"
         @delete-folder="$emit('delete-folder', $event)"
@@ -70,7 +72,7 @@ const props = defineProps({
 })
 const emit = defineEmits([
   'select', 'delete', 'drag-start', 'drag-end', 'drop-page',
-  'new-subfolder', 'rename', 'delete-folder',
+  'upload', 'new-subfolder', 'rename', 'delete-folder',
 ])
 
 const isDropTarget = ref(false)

@@ -28,6 +28,7 @@ from app.models import (
     HTRPage,
     KnowledgeSource,
     KnowledgeState,
+    RelationSource,
     User,
 )
 from app.services import knowledge_source_service as module
@@ -531,3 +532,109 @@ def test_status_payload_reports_the_last_run(db_session, user):
     assert payload["last_run"]["stats"]["facts_created"] == 1
     assert payload["error"] is None
     assert module.STATUS_PENDING == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Жизненный цикл рёбер: подтверждения важнее source_id
+# ---------------------------------------------------------------------------
+
+
+def _person(db_session, user, name):
+    row = Entity(user_id=user.id, entity_type="person", canonical_name=name, normalized_name=name.lower())
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+def test_reset_keeps_edge_confirmed_by_another_source(db_session, user):
+    """Очистка источника А не трогает ребро, подтверждённое ещё и источником Б."""
+    service = KnowledgeSourceService(db_session)
+    source, _, _ = service.refresh_from_diary_page(make_diary_page(db_session, user))
+    self_entity = service.ensure_self_entity(user.id)
+    other = KnowledgeSource(user_id=user.id, source_type="diary", ref_id=998, text="другое")
+    db_session.add(other)
+    db_session.flush()
+    person = _person(db_session, user, "Маша")
+    edge = EntityRelation(
+        user_id=user.id, from_entity_id=self_entity.id, to_entity_id=person.id,
+        relation_type="подруга", relation_kind="friend", source_id=source.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    db_session.add_all([
+        RelationSource(relation_id=edge.id, source_id=source.id, relation_kind="friend",
+                       relation_type="подруга", confidence=0.4, evidence_text="цитата А"),
+        RelationSource(relation_id=edge.id, source_id=other.id, relation_kind="friend",
+                       relation_type="друг", confidence=0.9, evidence_text="цитата Б"),
+    ])
+    db_session.commit()
+
+    removed = service.reset_source_knowledge(source)
+    db_session.commit()
+
+    assert removed["entity_relations"] == 0
+    kept = db_session.query(EntityRelation).filter_by(id=edge.id).one()
+    # уверенность и цитата пересчитаны из оставшегося подтверждения
+    assert kept.confidence == 0.9
+    assert kept.evidence_text == "цитата Б"
+    assert kept.source_id == other.id
+    assert db_session.query(RelationSource).filter_by(relation_id=edge.id).count() == 1
+
+
+def test_reset_drops_edge_without_confirmations(db_session, user):
+    """Не осталось подтверждений — ребро уходит вместе с источником."""
+    service = KnowledgeSourceService(db_session)
+    source, _, _ = service.refresh_from_diary_page(make_diary_page(db_session, user))
+    self_entity = service.ensure_self_entity(user.id)
+    person = _person(db_session, user, "Маша")
+    edge = EntityRelation(
+        user_id=user.id, from_entity_id=self_entity.id, to_entity_id=person.id,
+        relation_type="подруга", relation_kind="friend", source_id=source.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    db_session.add(
+        RelationSource(relation_id=edge.id, source_id=source.id, relation_kind="friend",
+                       relation_type="подруга", confidence=0.7)
+    )
+    db_session.commit()
+
+    removed = service.reset_source_knowledge(source)
+    db_session.commit()
+
+    assert removed["entity_relations"] == 1
+    assert db_session.query(EntityRelation).filter_by(id=edge.id).count() == 0
+
+
+def test_legacy_edge_confirmed_by_a_rerun_survives_the_cleanup(db_session, user):
+    """Ребро без подтверждений своего источника, но с чужим, не удаляется.
+
+    Предикат `source_id IS NULL` удалил бы его вместе с только что полученным
+    подтверждением: после перепрогона legacy-ребро сливается с новым, а
+    ``source_id`` остаётся прежним.
+    """
+    service = KnowledgeSourceService(db_session)
+    source, _, _ = service.refresh_from_diary_page(make_diary_page(db_session, user))
+    self_entity = service.ensure_self_entity(user.id)
+    other = KnowledgeSource(user_id=user.id, source_type="diary", ref_id=997, text="другое")
+    db_session.add(other)
+    db_session.flush()
+    person = _person(db_session, user, "Маша")
+    edge = EntityRelation(
+        user_id=user.id, from_entity_id=self_entity.id, to_entity_id=person.id,
+        relation_type="подруга", relation_kind="friend", source_id=source.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    db_session.add(
+        RelationSource(relation_id=edge.id, source_id=other.id, relation_kind="friend",
+                       relation_type="подруга", confidence=0.8)
+    )
+    db_session.commit()
+
+    removed = service.reset_source_knowledge(source)
+    db_session.commit()
+
+    assert removed["entity_relations"] == 0
+    assert db_session.query(EntityRelation).filter_by(id=edge.id).count() == 1
+    assert db_session.query(RelationSource).filter_by(relation_id=edge.id).count() == 1

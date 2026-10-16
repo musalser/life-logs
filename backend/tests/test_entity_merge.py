@@ -15,6 +15,7 @@ from app.models import (
     Habit,
     HTRAuthor,
     KnowledgeSource,
+    RelationSource,
     User,
 )
 from app.services.entity_merge import MergeError, merge_entities
@@ -161,3 +162,62 @@ def test_merge_rejects_missing(db_session, user, self_entity):
     target = make_entity(db_session, user, "Есть")
     with pytest.raises(MergeError):
         merge_entities(db_session, user, 99999, target.id)
+
+
+# ---------------------------------------------------------------------------
+# Канонический ключ при слиянии
+# ---------------------------------------------------------------------------
+
+
+def test_merge_with_common_neighbour_keeps_one_edge_and_two_confirmations(db_session, user):
+    """Общий сосед после слияния — одно ребро и оба подтверждения."""
+    source = make_entity(db_session, user, "Серёжа")
+    target = make_entity(db_session, user, "Сергей")
+    friend = make_entity(db_session, user, "Маша")
+    first = make_source(db_session, user, ref_id=11)
+    second = make_source(db_session, user, ref_id=12)
+    edge_a = EntityRelation(
+        user_id=user.id, from_entity_id=source.id, to_entity_id=friend.id,
+        relation_type="подруга", relation_kind="friend", source_id=first.id, confidence=0.5,
+    )
+    edge_b = EntityRelation(
+        user_id=user.id, from_entity_id=target.id, to_entity_id=friend.id,
+        relation_type="друг", relation_kind="friend", source_id=second.id, confidence=0.9,
+    )
+    db_session.add_all([edge_a, edge_b])
+    db_session.flush()
+    db_session.add_all([
+        RelationSource(relation_id=edge_a.id, source_id=first.id, relation_kind="friend",
+                       relation_type="подруга", confidence=0.5),
+        RelationSource(relation_id=edge_b.id, source_id=second.id, relation_kind="friend",
+                       relation_type="друг", confidence=0.9),
+    ])
+    db_session.commit()
+
+    merge_entities(db_session, user, source.id, target.id)
+
+    edges = db_session.query(EntityRelation).filter(EntityRelation.to_entity_id == friend.id).all()
+    assert len(edges) == 1
+    assert db_session.query(RelationSource).filter(RelationSource.relation_id == edges[0].id).count() == 2
+
+
+def test_merge_drops_a_self_loop(db_session, user):
+    """Ребро, ставшее петлёй (автор → автор), на графе смысла не имеет."""
+    source = make_entity(db_session, user, "Серёжа")
+    target = make_entity(db_session, user, "Сергей")
+    db_session.add(
+        EntityRelation(
+            user_id=user.id, from_entity_id=source.id, to_entity_id=target.id,
+            relation_type="брат", relation_kind="brother",
+        )
+    )
+    db_session.commit()
+
+    merge_entities(db_session, user, source.id, target.id)
+
+    assert (
+        db_session.query(EntityRelation)
+        .filter(EntityRelation.from_entity_id == target.id, EntityRelation.to_entity_id == target.id)
+        .count()
+        == 0
+    )

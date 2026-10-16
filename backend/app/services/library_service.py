@@ -37,6 +37,11 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def clean_folder_name(name: str | None) -> str:
+    """A folder name as it will be stored: one space between words, capped."""
+    return " ".join((name or "").split())[:255]
+
+
 class LibraryService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -68,7 +73,7 @@ class LibraryService:
                 seen.add(entity.id)
         return ordered
 
-    def _is_author_entity(self, user: User, entity_id: int) -> bool:
+    def _is_author_entity(self, user: User, entity_id: int | None) -> bool:
         if user.self_entity_id == entity_id:
             return True
         return (
@@ -195,7 +200,9 @@ class LibraryService:
             raise LibraryError("Папка не найдена")
         return folder
 
-    def _validate_parent(self, user: User, owner_entity_id: int, parent_id: int | None) -> None:
+    def _validate_parent(
+        self, user: User, owner_entity_id: int | None, parent_id: int | None
+    ) -> None:
         if parent_id is None:
             return
         parent = self._get_folder(user, parent_id)
@@ -213,9 +220,9 @@ class LibraryService:
             node = parent.parent_id if parent is not None else None
 
     def create_folder(
-        self, user: User, name: str, owner_entity_id: int, parent_id: int | None
+        self, user: User, name: str, owner_entity_id: int | None, parent_id: int | None
     ) -> FolderResponse:
-        name = " ".join(name.split())
+        name = clean_folder_name(name)
         if not name:
             raise LibraryError("Имя папки не может быть пустым")
         if not self._is_author_entity(user, owner_entity_id):
@@ -224,7 +231,7 @@ class LibraryService:
         folder = Folder(
             user_id=user.id,
             owner_entity_id=owner_entity_id,
-            name=name[:255],
+            name=name,
             parent_id=parent_id,
         )
         self.db.add(folder)
@@ -232,17 +239,61 @@ class LibraryService:
         self.db.refresh(folder)
         return self._folder_response(folder)
 
+    def ensure_folder(
+        self, user: User, name: str, owner_entity_id: int | None, parent_id: int | None
+    ) -> tuple[FolderResponse, bool]:
+        """The folder of this name, created when it does not exist yet.
+
+        Returns the folder and whether this call created it. A bulk import (a
+        PDF) names its folder after the file, so re-importing the same PDF lands
+        in the same folder instead of piling up «Дневник», «Дневник (2)» … A
+        folder that is already there is reused whatever it holds.
+        """
+        cleaned = clean_folder_name(name)
+        if not cleaned:
+            raise LibraryError("Имя папки не может быть пустым")
+        if not self._is_author_entity(user, owner_entity_id):
+            raise LibraryError("Папку можно создать только для автора (объекта)")
+        self._validate_parent(user, owner_entity_id, parent_id)
+        # Case is compared in Python, not in SQL: `lower()` does not know Cyrillic
+        # in every backend this runs on (SQLite in the tests), and the author's
+        # folders are a handful of rows, exactly like the page names above.
+        siblings = (
+            self.db.query(Folder)
+            .filter(
+                Folder.user_id == user.id,
+                Folder.owner_entity_id == owner_entity_id,
+                Folder.parent_id == parent_id,
+            )
+            .order_by(Folder.id)
+            .all()
+        )
+        wanted = cleaned.casefold()
+        for folder in siblings:
+            if folder.name.casefold() == wanted:
+                return self._folder_response(folder), False
+        return self.create_folder(user, cleaned, owner_entity_id, parent_id), True
+
+    def folder_for_upload(
+        self, user: User, folder_id: int, owner_entity_id: int | None
+    ) -> FolderResponse:
+        """The folder an upload may go into, checked against the author's object."""
+        folder = self._get_folder(user, folder_id)
+        if folder.owner_entity_id != owner_entity_id:
+            raise LibraryError("Страницу можно положить только в папку её автора")
+        return self._folder_response(folder)
+
     def update_folder(
         self, user: User, folder_id: int, name: str | None, parent_id: int | None
     ) -> FolderResponse:
         folder = self._get_folder(user, folder_id)
         if name is not None:
-            cleaned = " ".join(name.split())
+            cleaned = clean_folder_name(name)
             if not cleaned:
                 raise LibraryError("Имя папки не может быть пустым")
-            folder.name = cleaned[:255]
+            folder.name = cleaned
         if parent_id is not None:
-            self._validate_parent(user, folder.owner_entity_id or 0, parent_id)
+            self._validate_parent(user, folder.owner_entity_id, parent_id)
             self._validate_no_cycle(folder, parent_id)
             folder.parent_id = parent_id
         folder.updated_at = _now()
